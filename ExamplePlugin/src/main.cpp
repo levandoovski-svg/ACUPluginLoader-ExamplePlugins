@@ -3,7 +3,7 @@
 
 #include "MyLog.h"
 #include "MainConfig.h"
-#include "DesyncKeybindPlugin.h"
+#include "StunBladePlugin.h"
 
 #include "Common_Plugins/Common_PluginSide.h"
 
@@ -20,16 +20,16 @@ public:
 
         ImGui::Text("Hello from " THIS_DLL_PROJECT_TARGET_FILE_NAME " plugin!");
         ImGui::Separator();
-        m_DesyncKeybind.OnImGuiRender();
+        m_StunBlade.OnImGuiRender();
     }
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        m_DesyncKeybind.OnUpdate();
+        m_StunBlade.OnUpdate();
     }
     virtual uint64 GetThisPluginVersion() override
     {
         // _Your_ plugin version. Currently is for logging only. (In the future, potentially for interplugin communications.)
-        return MAKE_VERSION_NUMBER_UINT64(0, 0, 7, 0);
+        return MAKE_VERSION_NUMBER_UINT64(0, 0, 8, 0);
     }
     virtual void InitStage_WhenPluginAPIDeemedCompatible() override
     {
@@ -39,7 +39,6 @@ public:
 
         g_LogLifetime.emplace(AbsolutePathInThisDLLDirectory(LOG_FILENAME));
         MainConfig::FindAndLoadConfigFileOrCreateDefault(AbsolutePathInThisDLLDirectory(CONFIG_FILENAME));
-        m_DesyncKeybind.LoadSettings();
     }
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
@@ -49,8 +48,9 @@ public:
         // Return `false` to unload the plugin.
 
         LOG_DEBUG(DefaultLogger, "This line of text is written to both ImGui Console and the default log file\n");
+        m_StunBlade.OnBeforeActivate();
         return true;
     }
 
-    DesyncKeybindPlugin m_DesyncKeybind;
+    StunBladePlugin m_StunBlade;
 } g_thisPlugin;

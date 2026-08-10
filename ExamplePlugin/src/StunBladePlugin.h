@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // ---------------------------------------------------------------------------
 // StunBladePlugin (brute-force version)
 // ---------------------------------------------------------------------------
@@ -13,6 +15,11 @@
 // Other throwables (smoke/cherry/poison/moneypouch, pistols, rifle...) are
 // untouched - the rewrite only fires while the field is exactly PhantomBlade.
 // Stun-bomb ammo is consumed (you must own/stack stun bombs).
+//
+// Debug readout refreshes every frame (even while disabled) so a stale/NULL
+// pointer chain is visible in the ImGui section before you turn the plugin
+// on. NULLs are EXPECTED in the main menu (no player entity) - read it in
+// gameplay while aiming the throwblade.
 // ---------------------------------------------------------------------------
 
 class StunBladePlugin
@@ -25,4 +32,10 @@ public:
 
 private:
     bool m_Enabled = true;    // master switch (single checkbox, that's all)
+
+    // ---- debug readout (refreshed every frame, even while disabled) ----
+    bool     m_Debug_HumanStatesValid       = false; // GetForPlayer() != null
+    bool     m_Debug_OwnerEntityValid       = false; // holder->ownerEntity != null
+    bool     m_Debug_OwnerIsPlayer          = false; // ownerEntity == ACU::GetPlayer()
+    uint32_t m_Debug_CurrentEquipmentType   = 0;     // live 0x0D34 field value
 };
