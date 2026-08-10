@@ -3,7 +3,7 @@
 
 #include "MyLog.h"
 #include "MainConfig.h"
-#include "StunBladePlugin.h"
+#include "BombSprintAimPlugin.h"
 
 #include "Common_Plugins/Common_PluginSide.h"
 
@@ -20,11 +20,11 @@ public:
 
         ImGui::Text("Hello from " THIS_DLL_PROJECT_TARGET_FILE_NAME " plugin!");
         ImGui::Separator();
-        m_StunBlade.OnImGuiRender();
+        m_BombSprintAim.OnImGuiRender();
     }
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        m_StunBlade.OnUpdate();
+        m_BombSprintAim.OnUpdate();
     }
     virtual uint64 GetThisPluginVersion() override
     {
@@ -48,9 +48,9 @@ public:
         // Return `false` to unload the plugin.
 
         LOG_DEBUG(DefaultLogger, "This line of text is written to both ImGui Console and the default log file\n");
-        m_StunBlade.OnBeforeActivate();
+        m_BombSprintAim.OnBeforeActivate();
         return true;
     }
 
-    StunBladePlugin m_StunBlade;
-} g_thisPlugin;
+    BombSprintAimPlugin m_BombSprintAim;
+    } g_thisPlugin;
