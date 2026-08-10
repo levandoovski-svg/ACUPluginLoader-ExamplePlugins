@@ -22,6 +22,11 @@ static constexpr float MAX_DISTANCE = 30.0f;
 
 PhotoModePlugin* g_pPhotoMode = nullptr;
 
+PhotoModePlugin::PhotoModePlugin()
+{
+    g_pPhotoMode = this;
+}
+
 // Slow-motion / freeze game function (Steam build; same address used by
 // FreeCameraRotationPlugin and DisableCameraLockPlugin).
 DEFINE_GAME_FUNCTION(World__SetUnpausedGameTimescale_onSlowMotion, 0x141D5E210,

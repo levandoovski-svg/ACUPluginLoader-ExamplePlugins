@@ -28,7 +28,7 @@ class PhotoModePlugin
 public:
     enum class Mode { None, Free, Cinematic };
 
-    PhotoModePlugin() { g_pPhotoMode = this; }
+    PhotoModePlugin();
 
     void LoadSettings();
     void SaveSettings();
