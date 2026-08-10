@@ -75,6 +75,13 @@ private:
     uint32_t m_LastVictimExplicitProperty  = 0;
     int    m_LastVictimSeenFramesAgo     = 10000; // start cold / never seen
 
+    // Mission gate (class-free): allow assassinations while the game has
+    // an active mission/memory running. Story targets only exist inside
+    // missions, so "inside a mission" == "story-relevant kill"; free-roam
+    // assassinations with no active mission are random kills -> desync.
+    // No SubDescriptorType / NPC-class reads are involved.
+    bool m_MissionGateEnabled = true;  // persisted to the INI
+
     // Debug readouts (refreshed every frame, even while disabled).
     bool m_Debug_CameraComponentValid = false;
     bool m_Debug_PlayerEntityValid    = false;
@@ -88,6 +95,10 @@ private:
     uint32_t m_Debug_VictimExplicitProperty  = 0;
     int  m_Debug_AllowedAssassinations  = 0;
     int  m_Debug_DesyncWrites         = 0;
+    bool m_Debug_MissionMgrValid     = false;
+    uint32_t m_Debug_MissionActiveCount = 0; // missions248_active_mb.size
+    uint32_t m_Debug_MissionSteps260    = 0; // missionSteps260.size
+    uint32_t m_Debug_MissionSteps26C    = 0; // missionSteps26C.size
     bool m_Debug_GatePending            = false;
     bool m_Debug_LastTriggerSucceeded = true; // start optimistic
 };

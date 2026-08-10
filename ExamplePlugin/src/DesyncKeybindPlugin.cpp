@@ -4,6 +4,7 @@
 #include "ACU/ACUGetSingletons.h"
 #include "ACU/CSrvPlayerHealth.h"
 #include "ACU/HumanStatesHolder.h"
+#include "ACU/MissionManager.h"
 #include "ACU/Entity.h"
 #include "ACU/BhvAssassin.h"
 #include "ACU/WhenHighlightedNPCChanges.h"
@@ -193,6 +194,52 @@ static void SafeGetVictim(VictimResultPOD& out)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mission state -- the class-free gate signal. Story targets only exist
+// while a mission/memory is live, so the MissionManager's active-mission
+// arrays ARE the "is this a story kill?" answer; no NPC classes involved.
+// SmallArray size is a uint16 at +0xA (see SmallArray.h); all reads are
+// POD inside __try exactly like the other game-memory access.
+// ---------------------------------------------------------------------------
+
+struct MissionStatePOD
+{
+    bool   missionMgrValid;
+    uint32 activeCount;   // missions248_active_mb.size
+    uint32 steps260Count; // missionSteps260.size
+    uint32 steps26CCount; // missionSteps26C.size
+};
+
+static void GetMissionState_raw(MissionStatePOD& out)
+{
+    out.missionMgrValid = false;
+    out.activeCount     = 0;
+    out.steps260Count   = 0;
+    out.steps26CCount   = 0;
+
+    MissionManager* mm = MissionManager::GetSingleton();
+    if (!mm) return;
+    out.missionMgrValid = true;
+    out.activeCount     = mm->missions248_active_mb.size;
+    out.steps260Count   = mm->missionSteps260.size;
+    out.steps26CCount   = mm->missionSteps26C.size;
+}
+
+static void SafeGetMissionState(MissionStatePOD& out)
+{
+    __try
+    {
+        GetMissionState_raw(out);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        out.missionMgrValid = false;
+        out.activeCount     = 0;
+        out.steps260Count   = 0;
+        out.steps26CCount   = 0;
+    }
+}
+
 // CSV of class ids, e.g. "6,33" or "6, 33". Empty string matches nothing.
 static bool IsClassInAllowlist(uint32 sub, const char* csv)
 {
@@ -255,6 +302,9 @@ void DesyncKeybindPlugin::LoadSettings()
     m_OnlyTargetsAllowed =
         GetPrivateProfileIntA("DesyncKeybind", "OnlyTargetsAllowed",
                               m_OnlyTargetsAllowed ? 1 : 0, path) != 0;
+    m_MissionGateEnabled =
+        GetPrivateProfileIntA("DesyncKeybind", "MissionGateEnabled",
+                              m_MissionGateEnabled ? 1 : 0, path) != 0;
     char cls[sizeof(m_AllowedClasses)];
     if (GetPrivateProfileStringA("DesyncKeybind", "AllowedClasses", m_AllowedClasses,
                                  cls, sizeof(cls), path) > 0)
@@ -280,6 +330,8 @@ void DesyncKeybindPlugin::SaveSettings()
     sprintf_s(buf, "%d", m_OnlyTargetsAllowed ? 1 : 0);
     WritePrivateProfileStringA("DesyncKeybind", "OnlyTargetsAllowed", buf, path);
     WritePrivateProfileStringA("DesyncKeybind", "AllowedClasses", m_AllowedClasses, path);
+    sprintf_s(buf, "%d", m_MissionGateEnabled ? 1 : 0);
+    WritePrivateProfileStringA("DesyncKeybind", "MissionGateEnabled", buf, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +376,15 @@ void DesyncKeybindPlugin::OnUpdate()
     m_Debug_VictimDescriptorType    = m_LastVictimDescriptorType;
     m_Debug_VictimSubDescriptorType = m_LastVictimSubDescriptorType;
     m_Debug_VictimExplicitProperty  = m_LastVictimExplicitProperty;
+
+    // Mission state readout (class-free gate signal): refreshed every frame
+    // like the victim readout, and consumed by the assassination gate below.
+    MissionStatePOD mission{};
+    SafeGetMissionState(mission);
+    m_Debug_MissionMgrValid     = mission.missionMgrValid;
+    m_Debug_MissionActiveCount  = mission.activeCount;
+    m_Debug_MissionSteps260     = mission.steps260Count;
+    m_Debug_MissionSteps26C     = mission.steps26CCount;
 
     // Assassination poll: refreshed every frame (even while the hotkey is
     // disabled) so the debug readout always shows the live state.
@@ -379,10 +440,19 @@ void DesyncKeybindPlugin::OnUpdate()
     //     allowlisted class  -> allow, cancel pending desync
     //     any other class    -> desync immediately
     //     still unresolved   -> desync at expiry (pre-gate fallback)
+    // Mission gate (class-free): an active mission/memory means this is a
+    // story kill -> allow outright, no classes needed.
     if (m_AutoDesyncOnAssassination && assassinationEdge)
     {
         m_Debug_AssassinationDetections++;
-        if (!m_OnlyTargetsAllowed)
+        // Mission gate is the class-free discriminator: an active
+        // mission/memory means this is a story kill -> allow outright.
+        if (m_MissionGateEnabled && m_Debug_MissionActiveCount > 0)
+        {
+            m_GateVerdictAllowed = true;
+            m_Debug_AllowedAssassinations++;
+        }
+        else if (!m_OnlyTargetsAllowed)
         {
             // Gate off: instant desync, exactly like the pre-gate build.
             m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
@@ -399,39 +469,51 @@ void DesyncKeybindPlugin::OnUpdate()
     m_Debug_GatePending = m_GatePendingFire;
     if (m_GatePendingFire)
     {
-        // The latch bridges highlight lag: a victim resolved within the last
-        // kGateGraceFrames counts as the current victim even when the live
-        // pointer reads null this frame. Never-seen / cold-latch victim
-        // assassinations stay unresolved and fall through to the desync at
-        // window expiry.
-        const bool latchHot =
-            m_LastVictimValid && m_LastVictimSeenFramesAgo <= kGateGraceFrames;
-        if (victim.victimValid || latchHot)
+        // Mission gate re-checked this frame: the memory may flip to active
+        // a frame after the state edge. If it did, this is a story kill --
+        // allow it without waiting for the class verdict.
+        if (m_MissionGateEnabled && m_Debug_MissionActiveCount > 0)
         {
-            const uint32 sub = victim.victimValid
-                                   ? victim.subDescriptorType
-                                   : m_LastVictimSubDescriptorType;
-            if (IsClassInAllowlist(sub, m_AllowedClasses))
+            m_GateVerdictAllowed = true;
+            m_GatePendingFire    = false;
+            m_Debug_AllowedAssassinations++;
+        }
+        else
+        {
+            // The latch bridges highlight lag: a victim resolved within the
+            // last kGateGraceFrames counts as the current victim even when
+            // the live pointer reads null this frame. Never-seen / cold-latch
+            // victim assassinations stay unresolved and fall through to the
+            // desync at window expiry.
+            const bool latchHot =
+                m_LastVictimValid && m_LastVictimSeenFramesAgo <= kGateGraceFrames;
+            if (victim.victimValid || latchHot)
             {
-                // Story target confirmed -> assassination allowed.
-                m_GateVerdictAllowed = true;
-                m_GatePendingFire    = false;
-                m_Debug_AllowedAssassinations++;
+                const uint32 sub = victim.victimValid
+                                       ? victim.subDescriptorType
+                                       : m_LastVictimSubDescriptorType;
+                if (IsClassInAllowlist(sub, m_AllowedClasses))
+                {
+                    // Story target confirmed -> assassination allowed.
+                    m_GateVerdictAllowed = true;
+                    m_GatePendingFire    = false;
+                    m_Debug_AllowedAssassinations++;
+                }
+                else
+                {
+                    // Enemy class confirmed -> kill it dead, right now.
+                    m_GatePendingFire = false;
+                    m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
+                    if (m_Debug_LastTriggerSucceeded) m_Debug_DesyncWrites++;
+                }
             }
-            else
+            else if (--m_GateGraceRemaining <= 0)
             {
-                // Enemy class confirmed -> kill it dead, right now.
+                // Window expired with no victim -> pre-gate fallback.
                 m_GatePendingFire = false;
                 m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
                 if (m_Debug_LastTriggerSucceeded) m_Debug_DesyncWrites++;
             }
-        }
-        else if (--m_GateGraceRemaining <= 0)
-        {
-            // Window expired with no victim -> pre-gate fallback.
-            m_GatePendingFire = false;
-            m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
-            if (m_Debug_LastTriggerSucceeded) m_Debug_DesyncWrites++;
         }
     }
 }
@@ -475,6 +557,13 @@ void DesyncKeybindPlugin::OnImGuiRender()
     ImGui::SameLine();
     ImGui::TextDisabled("(Assassination_PP / Assassination_P / Assassination_SecondHalf_mb)");
 
+    if (ImGui::Checkbox("Allow assassination while a mission is active", &m_MissionGateEnabled))
+    {
+        SaveSettings();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(class-free: story targets only exist inside missions)");
+
     if (ImGui::Checkbox("Only allow assassination on target-class NPCs", &m_OnlyTargetsAllowed))
     {
         SaveSettings();
@@ -503,6 +592,10 @@ void DesyncKeybindPlugin::OnImGuiRender()
     ImGui::Text("Class latch:       %s", m_LastVictimValid
         ? (m_LastVictimSeenFramesAgo <= kGateGraceFrames ? "hot" : "cold")
         : "empty");
+    ImGui::Text("Mission:           mgr=%s  active=%u  steps260=%u  steps26C=%u",
+        m_Debug_MissionMgrValid ? "OK" : "NULL",
+        m_Debug_MissionActiveCount, m_Debug_MissionSteps260,
+        m_Debug_MissionSteps26C);
     ImGui::Text("Gate verdict:      %s%s",
         m_Debug_GatePending ? "PENDING (" :
             (m_GateVerdictAllowed ? "ALLOWED (target class)" : "FIRED (non-target)"),
