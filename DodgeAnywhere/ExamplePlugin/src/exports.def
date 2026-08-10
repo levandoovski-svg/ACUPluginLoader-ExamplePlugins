@@ -1,0 +1,3 @@
+LIBRARY ExamplePlugin
+EXPORTS
+    ACUPluginStart
