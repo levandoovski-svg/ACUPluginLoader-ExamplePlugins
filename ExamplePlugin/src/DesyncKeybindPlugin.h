@@ -37,11 +37,18 @@ private:
     int  m_KeyCode       = 0x78;   // Windows VK code, default VK_F9
     bool m_WaitingForKey = false;  // rebind capture in progress
 
+    // Auto-desync on assassination: when any tracked assassination human
+    // state is detected in the player's state tree, fire the desync write.
+    bool m_AutoDesyncOnAssassination = true;  // persisted to the INI
+    bool m_PrevInAssassinationState  = false; // rising-edge bookkeeping
+
     // Debug readouts (refreshed every frame, even while disabled).
     bool m_Debug_CameraComponentValid = false;
     bool m_Debug_PlayerEntityValid    = false;
     bool m_Debug_BhvAssassinValid     = false;
     bool m_Debug_HealthValid          = false;
+    bool m_Debug_InAssassinationState = false;
+    int  m_Debug_AssassinationDetections = 0;
     int  m_Debug_DesyncWrites         = 0;
     bool m_Debug_LastTriggerSucceeded = true; // start optimistic
 };
