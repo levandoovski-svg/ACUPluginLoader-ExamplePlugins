@@ -1,0 +1,66 @@
+name: Build ACUFixes + ExamplePlugin
+
+# Builds the ACUFixes plugin (the parkour/filter work, incl. the 'Block' tab)
+# and the ExamplePlugin (which contains ONLY the AssassinationCounterPlugin).
+#
+# NOTE: this workflow keeps the two artifacts SEPARATE - each project's DLL is
+# uploaded under its own artifact. Nothing from ACUFixes is copied into the
+# ExamplePlugin plugins folder, so the ExamplePlugin artifact is guaranteed to
+# contain exactly one plugin: the assassination counter.
+#
+# Why this exists: there is no MSVC toolchain on the dev machine — every
+# DLL that goes into the game is produced by this workflow. Push to any
+# branch to build, or trigger manually from the Actions tab.
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable Long Paths
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Checkout plugin repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        path: 's'
+        submodules: 'recursive'
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build ACUFixes plugin
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\ACUFixes-master\ACUFixes.sln" /p:Configuration=Release /p:Platform=x64 /m
+        if ($LASTEXITCODE -ne 0) { throw "ACUFixes build failed" }
+
+    - name: Build ExamplePlugin (AssassinationCounterPlugin only)
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\ExamplePlugin\ExamplePlugin.vcxproj" /p:Configuration=Release /p:Platform=x64 "/p:ACUFixesInclude=$root\s\ACUFixes-master\ACUFixes\src"
+        if ($LASTEXITCODE -ne 0) { throw "ExamplePlugin build failed" }
+
+    # Separate artifacts - no mixing of plugins.
+    - name: Upload ACUFixes DLLs
+      uses: actions/upload-artifact@v4
+      with:
+        name: acufixes-dlls
+        path: |
+          s/ACUFixes-master/build/x64/Release/plugins/*.dll
+
+    - name: Upload ExamplePlugin DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: assassination-counter-plugin
+        path: |
+          s/ExamplePlugin/build/x64/Release/plugins/ExamplePlugin.dll

@@ -1,0 +1,51 @@
+name: Build Plugin
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable Long Paths
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Checkout plugin repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        path: 's'
+        submodules: 'recursive'
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Checkout ACUFixes repo
+      uses: actions/checkout@v4
+      with:
+        repository: NameTaken3125/ACUFixes
+        fetch-depth: 0
+        path: 'ACUFixes'
+
+    - name: Clean build artifacts
+      shell: pwsh
+      run: |
+        $buildDir = "${{ github.workspace }}\s\ExamplePlugin\build"
+        if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build ExamplePlugin
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\ExamplePlugin\ExamplePlugin.vcxproj" /p:Configuration=Release /p:Platform=x64 "/p:ACUFixesInclude=$root\s\ACUFixes-master\ACUFixes\src"
+
+    - name: Upload DLLs
+      uses: actions/upload-artifact@v4
+      with:
+        name: built-dlls
+        path: |
+          s/ExamplePlugin/build/x64/Release/plugins/ExamplePlugin.dll

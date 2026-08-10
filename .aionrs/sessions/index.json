@@ -1,0 +1,28 @@
+{
+  "sessions": [
+    {
+      "id": "aebf9d80",
+      "created_at": "2026-05-13T10:13:49.193143300Z",
+      "updated_at": "2026-05-13T10:37:48.022120800Z",
+      "model": "llama3.1:8b",
+      "summary": "are we running?",
+      "message_count": 64
+    },
+    {
+      "id": "bf8ff31f",
+      "created_at": "2026-05-13T10:39:06.141203300Z",
+      "updated_at": "2026-05-13T10:43:00.060909100Z",
+      "model": "llama3.1:8b",
+      "summary": "wait i added the code base to the workspace can you confirm access to code base?",
+      "message_count": 8
+    },
+    {
+      "id": "d207b44d",
+      "created_at": "2026-05-13T10:47:27.974356900Z",
+      "updated_at": "2026-05-13T10:57:27.768935Z",
+      "model": "llama3.1:8b",
+      "summary": "i want to build a plugin for Assassin's creed unity using the codebase in the...",
+      "message_count": 21
+    }
+  ]
+}
