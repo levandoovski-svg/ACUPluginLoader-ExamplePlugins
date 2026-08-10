@@ -50,6 +50,18 @@ private:
     bool m_OnlyTargetsAllowed = true;
     char m_AllowedClasses[64] = "6,33";
 
+    // Grace window for the class gate. The highlighted-NPC pointer can
+    // lag a few frames behind the assassination state entry, so the
+    // verdict is deferred up to kGateGraceFrames after the edge:
+    //   - victim resolves to an allowlisted class  -> allowed, no desync
+    //   - victim resolves to any other class       -> desync immediately
+    //   - victim never resolves within the window  -> desync at expiry
+    //     (preserves the pre-gate default behavior)
+    static constexpr int kGateGraceFrames = 20; // ~0.33s at 60 fps
+    int  m_GateGraceRemaining = 0;
+    bool m_GatePendingFire    = false;
+    bool m_GateVerdictAllowed = false; // last window outcome, for debug
+
     // Debug readouts (refreshed every frame, even while disabled).
     bool m_Debug_CameraComponentValid = false;
     bool m_Debug_PlayerEntityValid    = false;
@@ -63,5 +75,6 @@ private:
     uint32_t m_Debug_VictimExplicitProperty  = 0;
     int  m_Debug_AllowedAssassinations  = 0;
     int  m_Debug_DesyncWrites         = 0;
+    bool m_Debug_GatePending            = false;
     bool m_Debug_LastTriggerSucceeded = true; // start optimistic
 };

@@ -353,28 +353,57 @@ void DesyncKeybindPlugin::OnUpdate()
     // Auto-desync on assassination state (rising edge only -- the same edge
     // idiom as the hotkey, so holding the state does NOT re-fire every frame).
     //
-    // Class gate: with "only targets" enabled, the assassination is allowed
-    // when the highlighted victim is a target-class NPC (SubDescriptorType in
-    // m_AllowedClasses). Unknown/invalid victims fall through to the desync,
-    // preserving the default behavior - the gate only ever RELAXES it.
+    // Class gate with grace window. The highlighted-NPC pointer can lag a
+    // few frames behind the state entry (skill pitfall: "highlight can lag"),
+    // so an instant same-frame verdict misreads story targets as "unknown"
+    // and desyncs them before class 6/33 ever resolves. Instead we defer:
+    //   edge -> sample victim every frame for kGateGraceFrames:
+    //     allowlisted class  -> allow, cancel pending desync
+    //     any other class    -> desync immediately
+    //     still unresolved   -> desync at expiry (pre-gate fallback)
     if (m_AutoDesyncOnAssassination && assassinationEdge)
     {
-        const bool allowedClass =
-            m_OnlyTargetsAllowed && victim.victimValid &&
-            IsClassInAllowlist(victim.subDescriptorType, m_AllowedClasses);
-
-        if (allowedClass)
+        m_Debug_AssassinationDetections++;
+        if (!m_OnlyTargetsAllowed)
         {
-            m_Debug_AllowedAssassinations++;
+            // Gate off: instant desync, exactly like the pre-gate build.
+            m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
+            if (m_Debug_LastTriggerSucceeded) m_Debug_DesyncWrites++;
         }
         else
         {
-            m_Debug_AssassinationDetections++;
-            m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
-            if (m_Debug_LastTriggerSucceeded)
+            m_GatePendingFire    = true;
+            m_GateGraceRemaining = kGateGraceFrames;
+            m_GateVerdictAllowed = false;
+        }
+    }
+
+    m_Debug_GatePending = m_GatePendingFire;
+    if (m_GatePendingFire)
+    {
+        if (victim.victimValid)
+        {
+            if (IsClassInAllowlist(victim.subDescriptorType, m_AllowedClasses))
             {
-                m_Debug_DesyncWrites++;
+                // Story target confirmed -> assassination allowed.
+                m_GateVerdictAllowed = true;
+                m_GatePendingFire    = false;
+                m_Debug_AllowedAssassinations++;
             }
+            else
+            {
+                // Enemy class confirmed -> kill it dead, right now.
+                m_GatePendingFire = false;
+                m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
+                if (m_Debug_LastTriggerSucceeded) m_Debug_DesyncWrites++;
+            }
+        }
+        else if (--m_GateGraceRemaining <= 0)
+        {
+            // Window expired with no victim -> pre-gate fallback.
+            m_GatePendingFire = false;
+            m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
+            if (m_Debug_LastTriggerSucceeded) m_Debug_DesyncWrites++;
         }
     }
 }
@@ -443,6 +472,10 @@ void DesyncKeybindPlugin::OnImGuiRender()
         m_Debug_VictimValid ? "OK" : "INVALID",
         m_Debug_VictimDescriptorType, m_Debug_VictimSubDescriptorType,
         m_Debug_VictimExplicitProperty);
+    ImGui::Text("Gate verdict:      %s%s",
+        m_Debug_GatePending ? "PENDING (" :
+            (m_GateVerdictAllowed ? "ALLOWED (target class)" : "FIRED (non-target)"),
+        m_Debug_GatePending ? "sampling victim...)" : "");
     ImGui::Text("Allowed by gate:   %d", m_Debug_AllowedAssassinations);
     ImGui::Text("Desync writes: %d   Last: %s", m_Debug_DesyncWrites,
         m_Debug_LastTriggerSucceeded ? "OK" : "FAILED");
