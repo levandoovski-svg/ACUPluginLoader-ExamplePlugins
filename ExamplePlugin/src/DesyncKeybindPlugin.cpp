@@ -4,6 +4,9 @@
 #include "ACU/ACUGetSingletons.h"
 #include "ACU/CSrvPlayerHealth.h"
 #include "ACU/HumanStatesHolder.h"
+#include "ACU/Entity.h"
+#include "ACU/BhvAssassin.h"
+#include "ACU/WhenHighlightedNPCChanges.h"
 
 #include <shlobj.h>
 #include <cstdio>
@@ -140,6 +143,78 @@ static bool SafeIsInAssassinationState()
 }
 
 // ---------------------------------------------------------------------------
+// Highlighted-NPC class lookup -- EntityDescriptor_ bitfields at Entity+0xD4.
+// SubDescriptorType is the NPC class (EntityDescriptorNPCSubType); the
+// "certain targets" classes are Target(6) and UniqueNPC(33).
+// ---------------------------------------------------------------------------
+
+struct VictimResultPOD
+{
+    bool   victimValid;
+    uint32 descriptorType;
+    uint32 subDescriptorType;
+    uint32 explicitProperty;
+};
+
+static void GetVictim_raw(VictimResultPOD& out)
+{
+    out.victimValid       = false;
+    out.descriptorType    = 0;
+    out.subDescriptorType = 0;
+    out.explicitProperty  = 0;
+
+    BhvAssassin* bhv = ACU::GetPlayerBhvAssassin();
+    if (!bhv) return;
+    WhenHighlightedNPCChanges* toHl = bhv->toHighlightedNPC;
+    if (!toHl) return;
+    SharedPtrNew<Entity>* sp = toHl->highlightedNPC;
+    if (!sp) return;
+    Entity* victim = sp->GetPtr();
+    if (!victim) return;
+
+    out.victimValid       = true;
+    out.descriptorType    = victim->EntityDescriptor_.DescriptorType;
+    out.subDescriptorType = victim->EntityDescriptor_.SubDescriptorType;
+    out.explicitProperty  = victim->EntityDescriptor_.ExplicitProperty;
+}
+
+static void SafeGetVictim(VictimResultPOD& out)
+{
+    __try
+    {
+        GetVictim_raw(out);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        out.victimValid       = false;
+        out.descriptorType    = 0;
+        out.subDescriptorType = 0;
+        out.explicitProperty  = 0;
+    }
+}
+
+// CSV of class ids, e.g. "6,33" or "6, 33". Empty string matches nothing.
+static bool IsClassInAllowlist(uint32 sub, const char* csv)
+{
+    if (!csv) return false;
+    const char* p = csv;
+    while (*p)
+    {
+        while (*p && (*p == ' ' || *p == ',')) ++p;
+        if (!*p) return false;
+        uint32 val = 0;
+        while (*p >= '0' && *p <= '9')
+        {
+            val = val * 10 + (uint32)(*p - '0');
+            ++p;
+        }
+        if (val == sub) return true;
+        while (*p && *p != ',') ++p;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Config file
 // ---------------------------------------------------------------------------
 
@@ -177,6 +252,15 @@ void DesyncKeybindPlugin::LoadSettings()
     m_AutoDesyncOnAssassination =
         GetPrivateProfileIntA("DesyncKeybind", "AutoDesyncOnAssassination",
                               m_AutoDesyncOnAssassination ? 1 : 0, path) != 0;
+    m_OnlyTargetsAllowed =
+        GetPrivateProfileIntA("DesyncKeybind", "OnlyTargetsAllowed",
+                              m_OnlyTargetsAllowed ? 1 : 0, path) != 0;
+    char cls[sizeof(m_AllowedClasses)];
+    if (GetPrivateProfileStringA("DesyncKeybind", "AllowedClasses", m_AllowedClasses,
+                                 cls, sizeof(cls), path) > 0)
+    {
+        sprintf_s(m_AllowedClasses, sizeof(m_AllowedClasses), "%s", cls);
+    }
     m_WaitingForKey = false;
 }
 
@@ -193,6 +277,9 @@ void DesyncKeybindPlugin::SaveSettings()
     WritePrivateProfileStringA("DesyncKeybind", "Key", buf, path);
     sprintf_s(buf, "%d", m_AutoDesyncOnAssassination ? 1 : 0);
     WritePrivateProfileStringA("DesyncKeybind", "AutoDesyncOnAssassination", buf, path);
+    sprintf_s(buf, "%d", m_OnlyTargetsAllowed ? 1 : 0);
+    WritePrivateProfileStringA("DesyncKeybind", "OnlyTargetsAllowed", buf, path);
+    WritePrivateProfileStringA("DesyncKeybind", "AllowedClasses", m_AllowedClasses, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +296,16 @@ void DesyncKeybindPlugin::OnUpdate()
     m_Debug_PlayerEntityValid    = chain.playerEntityValid;
     m_Debug_BhvAssassinValid     = chain.bhvAssassinValid;
     m_Debug_HealthValid          = chain.healthValid;
+
+    // Highlighted-NPC class readout: refreshes every frame like the chain
+    // readout, and the same-frame snapshot feeds the assassination gate
+    // below (the target can change mid-animation, so never reuse a stale one).
+    VictimResultPOD victim{};
+    SafeGetVictim(victim);
+    m_Debug_VictimValid             = victim.victimValid;
+    m_Debug_VictimDescriptorType    = victim.descriptorType;
+    m_Debug_VictimSubDescriptorType = victim.subDescriptorType;
+    m_Debug_VictimExplicitProperty  = victim.explicitProperty;
 
     // Assassination poll: refreshed every frame (even while the hotkey is
     // disabled) so the debug readout always shows the live state.
@@ -255,13 +352,29 @@ void DesyncKeybindPlugin::OnUpdate()
 
     // Auto-desync on assassination state (rising edge only -- the same edge
     // idiom as the hotkey, so holding the state does NOT re-fire every frame).
+    //
+    // Class gate: with "only targets" enabled, the assassination is allowed
+    // when the highlighted victim is a target-class NPC (SubDescriptorType in
+    // m_AllowedClasses). Unknown/invalid victims fall through to the desync,
+    // preserving the default behavior - the gate only ever RELAXES it.
     if (m_AutoDesyncOnAssassination && assassinationEdge)
     {
-        m_Debug_AssassinationDetections++;
-        m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
-        if (m_Debug_LastTriggerSucceeded)
+        const bool allowedClass =
+            m_OnlyTargetsAllowed && victim.victimValid &&
+            IsClassInAllowlist(victim.subDescriptorType, m_AllowedClasses);
+
+        if (allowedClass)
         {
-            m_Debug_DesyncWrites++;
+            m_Debug_AllowedAssassinations++;
+        }
+        else
+        {
+            m_Debug_AssassinationDetections++;
+            m_Debug_LastTriggerSucceeded = SafeTriggerDesync();
+            if (m_Debug_LastTriggerSucceeded)
+            {
+                m_Debug_DesyncWrites++;
+            }
         }
     }
 }
@@ -305,6 +418,17 @@ void DesyncKeybindPlugin::OnImGuiRender()
     ImGui::SameLine();
     ImGui::TextDisabled("(Assassination_PP / Assassination_P / Assassination_SecondHalf_mb)");
 
+    if (ImGui::Checkbox("Only allow assassination on target-class NPCs", &m_OnlyTargetsAllowed))
+    {
+        SaveSettings();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(desyncs assassinations on any other class)");
+    if (ImGui::InputText("Allowed NPC classes (CSV)", m_AllowedClasses, sizeof(m_AllowedClasses)))
+    {
+        SaveSettings();
+    }
+
     ImGui::Separator();
     ImGui::Text("Debug");
     ImGui::Text("GetPlayerHealth() chain:");
@@ -315,6 +439,11 @@ void DesyncKeybindPlugin::OnImGuiRender()
     ImGui::Text("Assassination:     %s   Detections: %d",
         m_Debug_InAssassinationState ? "IN-STATE" : "clear",
         m_Debug_AssassinationDetections);
+    ImGui::Text("Victim NPC:        %s  desc-type=%u  class=%u  prop=%u",
+        m_Debug_VictimValid ? "OK" : "INVALID",
+        m_Debug_VictimDescriptorType, m_Debug_VictimSubDescriptorType,
+        m_Debug_VictimExplicitProperty);
+    ImGui::Text("Allowed by gate:   %d", m_Debug_AllowedAssassinations);
     ImGui::Text("Desync writes: %d   Last: %s", m_Debug_DesyncWrites,
         m_Debug_LastTriggerSucceeded ? "OK" : "FAILED");
 }

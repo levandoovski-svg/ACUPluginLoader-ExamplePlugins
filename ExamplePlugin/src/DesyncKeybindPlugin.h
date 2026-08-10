@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // Hotkey-triggered "instant Animus desync" plugin.
 //
 // Member-plugin pattern (NOT an ACUPluginInterfaceVirtuals subclass):
@@ -42,6 +44,12 @@ private:
     bool m_AutoDesyncOnAssassination = true;  // persisted to the INI
     bool m_PrevInAssassinationState  = false; // rising-edge bookkeeping
 
+    // Class gate: assassination is allowed for highlighted victims whose
+    // EntityDescriptor_ SubDescriptorType is in m_AllowedClasses (CSV of
+    // EntityDescriptorNPCSubType ids; Target=6, UniqueNPC=33 by default).
+    bool m_OnlyTargetsAllowed = true;
+    char m_AllowedClasses[64] = "6,33";
+
     // Debug readouts (refreshed every frame, even while disabled).
     bool m_Debug_CameraComponentValid = false;
     bool m_Debug_PlayerEntityValid    = false;
@@ -49,6 +57,11 @@ private:
     bool m_Debug_HealthValid          = false;
     bool m_Debug_InAssassinationState = false;
     int  m_Debug_AssassinationDetections = 0;
+    bool m_Debug_VictimValid             = false;
+    uint32_t m_Debug_VictimDescriptorType    = 0;
+    uint32_t m_Debug_VictimSubDescriptorType = 0;
+    uint32_t m_Debug_VictimExplicitProperty  = 0;
+    int  m_Debug_AllowedAssassinations  = 0;
     int  m_Debug_DesyncWrites         = 0;
     bool m_Debug_LastTriggerSucceeded = true; // start optimistic
 };
