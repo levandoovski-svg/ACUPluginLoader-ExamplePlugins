@@ -1,0 +1,150 @@
+#include "pch.h"
+#include "Common_Plugins/Common_PluginSide.h"
+#include "imgui/imgui.h"
+
+static ACUPluginInterfaceVirtuals* g_ThisPluginSingletonAsBaseclass = nullptr;
+void** g_PluginInterfaceBaseclassVTable = nullptr;
+ACUPluginInterfaceVirtuals::ACUPluginInterfaceVirtuals()
+{
+    g_PluginInterfaceBaseclassVTable = *(void***)this;
+    g_ThisPluginSingletonAsBaseclass = this;
+}
+void ACUPluginInterfaceVirtuals::EveryFrameWhenMenuIsOpen() {}
+void ACUPluginInterfaceVirtuals::EveryFrameEvenWhenMenuIsClosed() {}
+
+
+
+
+
+
+
+decltype(ACUPluginLoaderInterface::RequestUnloadPlugin) RequestUnloadThisPlugin_fnptr = nullptr;
+decltype(ACUPluginLoaderInterface::GetPluginIfLoaded) GetPluginIfLoaded_fnptr = nullptr;
+void RequestUnloadThisPlugin()
+{
+    RequestUnloadThisPlugin_fnptr(g_ThisDLLHandle);
+}
+#include "Common_Plugins_impl/InputHooks.h"
+#include "Common_Plugins_impl/PluginLoaderSharedGlobals.h"
+#include "Common_Plugins_impl/AnimationModdingInterface.h"
+#include "Common_Plugins_impl/ImGuiConsoleInterface.h"
+void GrabPluginLoaderGlobalVariables(ACUPluginLoaderInterface& pluginLoader)
+{
+    RequestUnloadThisPlugin_fnptr = pluginLoader.RequestUnloadPlugin;
+    GetPluginIfLoaded_fnptr = pluginLoader.GetPluginIfLoaded;
+    ACU::Input::g_InputHooksSingletonPtr = &pluginLoader.m_ImplementationSharedVariables->m_InputHooks;
+    g_AnimationModdingInterface = &pluginLoader.m_ImplementationSharedVariables->m_AnimationModding;
+    g_ImGuiConsoleInterfacePtr = &pluginLoader.m_ImplementationSharedVariables->m_ImGuiConsole;
+}
+
+
+
+
+
+
+
+
+static bool IsPluginInterfaceVirtualFunctionOverridden(int virtualFnIdx)
+{
+    void** pluginVTable = *(void***)g_ThisPluginSingletonAsBaseclass;
+    return g_PluginInterfaceBaseclassVTable[virtualFnIdx] != pluginVTable[virtualFnIdx];
+}
+extern "C" __declspec(dllexport) bool ACUPluginStart(ACUPluginLoaderInterface& pluginLoader, ACUPluginInfo& yourPluginInfo_out)
+{
+    if (pluginLoader.m_PluginLoaderVersion < g_CurrentPluginAPIversion) {
+        return false;
+    }
+    if (!g_ThisPluginSingletonAsBaseclass) {
+        return false;
+    }
+
+
+    yourPluginInfo_out.m_PluginAPIVersion = g_CurrentPluginAPIversion;
+    yourPluginInfo_out.m_PluginVersion = g_ThisPluginSingletonAsBaseclass->GetThisPluginVersion();
+
+
+    constexpr int vfnIdx_EveryFrameWhenMenuIsOpen = 3;
+    constexpr int vfnIdx_EveryFrameEvenWhenMenuIsClosed = 4;
+    if (IsPluginInterfaceVirtualFunctionOverridden(vfnIdx_EveryFrameWhenMenuIsOpen)) {
+        yourPluginInfo_out.m_EveryFrameWhenMenuIsOpen = [](ImGuiShared& readyToUseImGuiContext) {
+            ImGui::SetCurrentContext(&readyToUseImGuiContext.m_ctx);
+            ImGui::SetAllocatorFunctions(readyToUseImGuiContext.alloc_func, readyToUseImGuiContext.free_func, readyToUseImGuiContext.user_data);
+            g_ThisPluginSingletonAsBaseclass->EveryFrameWhenMenuIsOpen();
+            };
+    }
+    if (IsPluginInterfaceVirtualFunctionOverridden(vfnIdx_EveryFrameEvenWhenMenuIsClosed)) {
+        yourPluginInfo_out.m_EveryFrameEvenWhenMenuIsClosed = [](ImGuiShared& readyToUseImGuiContext) {
+            ImGui::SetCurrentContext(&readyToUseImGuiContext.m_ctx);
+            ImGui::SetAllocatorFunctions(readyToUseImGuiContext.alloc_func, readyToUseImGuiContext.free_func, readyToUseImGuiContext.user_data);
+            g_ThisPluginSingletonAsBaseclass->EveryFrameEvenWhenMenuIsClosed();
+            };
+    }
+    yourPluginInfo_out.m_InitStage_WhenVersionsAreDeemedCompatible = [](ACUPluginLoaderInterface& pluginLoader) {
+        GrabPluginLoaderGlobalVariables(pluginLoader);
+        g_ThisPluginSingletonAsBaseclass->InitStage_WhenPluginAPIDeemedCompatible();
+        };
+    yourPluginInfo_out.m_EarlyHook_WhenGameCodeIsUnpacked = []() {
+        g_ThisPluginSingletonAsBaseclass->EarlyHook_WhenGameCodeIsUnpacked();
+        };
+    yourPluginInfo_out.m_InitStage_WhenCodePatchesAreSafeToApply = [](ACUPluginLoaderInterface& pluginLoader) { return g_ThisPluginSingletonAsBaseclass->InitStage_WhenCodePatchesAreSafeToApply(pluginLoader); };;
+    return true;
+}
+
+
+HMODULE g_ThisDLLHandle = nullptr;
+namespace fs = std::filesystem;
+static HMODULE FindThisDLLHandle()
+{
+    static HMODULE dllHandle = []() -> HMODULE {
+        // A static variable within the module.
+        static char dummyChar;
+        HMODULE dllHandle = NULL;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&dummyChar,
+            &dllHandle);
+        return dllHandle;
+        }();
+    return dllHandle;
+}
+const fs::path& GetThisDLLAbsoluteFilepath()
+{
+    static fs::path dllPath = []() -> fs::path {
+        fs::path result;
+        HMODULE dllHandle = FindThisDLLHandle();
+
+        if (dllHandle == NULL) return result;
+        wchar_t path[MAX_PATH];
+
+        GetModuleFileNameW(dllHandle, path, (DWORD)std::size(path));
+        return fs::path(path);
+        }();
+    return dllPath;
+}
+fs::path AbsolutePathInThisDLLDirectory(const fs::path& filenameRel)
+{
+    fs::path result;
+    const fs::path& thisDLLPath = GetThisDLLAbsoluteFilepath();
+    if (thisDLLPath.empty()) return filenameRel;
+    return thisDLLPath.parent_path() / filenameRel;
+}
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
+{
+    switch (dwReason)
+    {
+    case DLL_PROCESS_ATTACH:
+        g_ThisDLLHandle = hModule;
+        DisableThreadLibraryCalls(hModule);
+        break;
+    case DLL_PROCESS_DETACH:
+        break;
+    case DLL_THREAD_ATTACH:
+        break;
+    case DLL_THREAD_DETACH:
+        break;
+    default:
+        break;
+    }
+    return TRUE;
+}
