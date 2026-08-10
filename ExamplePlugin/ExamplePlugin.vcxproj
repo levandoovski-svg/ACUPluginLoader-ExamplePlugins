@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -203,6 +203,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\DesyncKeybindPlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\MainConfig.cpp" />
     <ClCompile Include="src\MyLog.cpp" />
@@ -214,6 +215,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\DesyncKeybindPlugin.h" />
     <ClInclude Include="src\MainConfig.h" />
     <ClInclude Include="src\MyLog.h" />
     <ClInclude Include="src\pch.h" />

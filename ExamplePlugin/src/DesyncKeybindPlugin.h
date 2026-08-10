@@ -1,0 +1,47 @@
+#pragma once
+
+// Hotkey-triggered "instant Animus desync" plugin.
+//
+// Member-plugin pattern (NOT an ACUPluginInterfaceVirtuals subclass):
+// the ExamplePlugin DLL may only ever have ONE live instance of
+// ACUPluginInterfaceVirtuals (Common_PluginSide's ACUPluginStart dispatches
+// to whatever instance the base-class constructor registered last), so this
+// class is aggregated as a member of the host ExamplePlugin class in
+// main.cpp and driven from that class's virtual callbacks.
+//
+// Trigger logic: writes CSrvPlayerHealth::isDesynchronizationNow (offset
+// 0x22C) to true, which makes the engine play the Animus desync "instant
+// death" sequence. The write is SEH-guarded and POD-only, exactly like
+// AutoDesyncOnAssassinatePlugin, so a stale pointer chain can never take the
+// game down.
+//
+// Hotkey reading uses the Windows GetAsyncKeyState() API (rising-edge via
+// `& 1`), NOT the game's input system -- that keeps the hotkey independent
+// of the game's InputContainer singleton addresses, which are not
+// guaranteed to be correct in this vendored tree. Config is persisted to
+//   <Documents>\Assassin's Creed Unity\DesyncKeybindPlugin.ini
+
+class DesyncKeybindPlugin
+{
+public:
+    void LoadSettings();
+    void SaveSettings();
+
+    // Called every frame, whether the ImGui menu is open or not.
+    void OnUpdate();
+    // Called every frame while the ImGui menu section is visible.
+    void OnImGuiRender();
+
+private:
+    bool m_Enabled       = true;   // hotkey armed
+    int  m_KeyCode       = 0x78;   // Windows VK code, default VK_F9
+    bool m_WaitingForKey = false;  // rebind capture in progress
+
+    // Debug readouts (refreshed every frame, even while disabled).
+    bool m_Debug_CameraComponentValid = false;
+    bool m_Debug_PlayerEntityValid    = false;
+    bool m_Debug_BhvAssassinValid     = false;
+    bool m_Debug_HealthValid          = false;
+    int  m_Debug_DesyncWrites         = 0;
+    bool m_Debug_LastTriggerSucceeded = true; // start optimistic
+};
