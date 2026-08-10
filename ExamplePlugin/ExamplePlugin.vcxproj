@@ -203,7 +203,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\BombSprintAimPlugin.cpp" />
+    <ClCompile Include="src\PhotoModePlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\MainConfig.cpp" />
     <ClCompile Include="src\MyLog.cpp" />
@@ -215,7 +215,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\BombSprintAimPlugin.h" />
+    <ClInclude Include="src\PhotoModePlugin.h" />
     <ClInclude Include="src\MainConfig.h" />
     <ClInclude Include="src\MyLog.h" />
     <ClInclude Include="src\pch.h" />

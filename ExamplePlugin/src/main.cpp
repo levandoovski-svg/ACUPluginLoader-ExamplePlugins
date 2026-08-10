@@ -3,7 +3,7 @@
 
 #include "MyLog.h"
 #include "MainConfig.h"
-#include "BombSprintAimPlugin.h"
+#include "PhotoModePlugin.h"
 
 #include "Common_Plugins/Common_PluginSide.h"
 
@@ -20,11 +20,11 @@ public:
 
         ImGui::Text("Hello from " THIS_DLL_PROJECT_TARGET_FILE_NAME " plugin!");
         ImGui::Separator();
-        m_BombSprintAim.OnImGuiRender();
+        m_PhotoMode.OnImGuiRender();
     }
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        m_BombSprintAim.OnUpdate();
+        m_PhotoMode.OnUpdate();
     }
     virtual uint64 GetThisPluginVersion() override
     {
@@ -48,9 +48,9 @@ public:
         // Return `false` to unload the plugin.
 
         LOG_DEBUG(DefaultLogger, "This line of text is written to both ImGui Console and the default log file\n");
-        m_BombSprintAim.OnBeforeActivate();
+        m_PhotoMode.OnBeforeActivate();
         return true;
     }
 
-    BombSprintAimPlugin m_BombSprintAim;
+    PhotoModePlugin m_PhotoMode;
     } g_thisPlugin;
