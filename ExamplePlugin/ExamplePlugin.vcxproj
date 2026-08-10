@@ -92,7 +92,7 @@
       <Optimization>Disabled</Optimization>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(SolutionDir)CommonLibACU\ACU-RE\vmath;$(SolutionDir)CommonLibACU\ACU-RE\inc;$(SolutionDir)CommonLibACU\DearImGui\inc;$(SolutionDir)CommonLibACU\Serialization\include;$(SolutionDir)CommonLibACU\AutoAssemblerKinda\include;$(SolutionDir)CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)..\CommonLibACU\ACU-RE\vmath;$(ProjectDir)..\CommonLibACU\ACU-RE\inc;$(ProjectDir)..\CommonLibACU\DearImGui\inc;$(ProjectDir)..\CommonLibACU\Serialization\include;$(ProjectDir)..\CommonLibACU\AutoAssemblerKinda\include;$(ProjectDir)..\CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -111,7 +111,7 @@
       <Optimization>Disabled</Optimization>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(SolutionDir)CommonLibACU\ACU-RE\vmath;$(SolutionDir)CommonLibACU\ACU-RE\inc\Handles;$(SolutionDir)CommonLibACU\ACU-RE\inc;$(SolutionDir)CommonLibACU\DearImGui\inc;$(SolutionDir)CommonLibACU\Serialization\include;$(SolutionDir)CommonLibACU\AutoAssemblerKinda\include;$(SolutionDir)CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)..\CommonLibACU\ACU-RE\vmath;$(ProjectDir)..\CommonLibACU\ACU-RE\inc\Handles;$(ProjectDir)..\CommonLibACU\ACU-RE\inc;$(ProjectDir)..\CommonLibACU\DearImGui\inc;$(ProjectDir)..\CommonLibACU\Serialization\include;$(ProjectDir)..\CommonLibACU\AutoAssemblerKinda\include;$(ProjectDir)..\CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -147,7 +147,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(SolutionDir)CommonLibACU\ACU-RE\vmath;$(SolutionDir)CommonLibACU\ACU-RE\inc;$(SolutionDir)CommonLibACU\DearImGui\inc;$(SolutionDir)CommonLibACU\Serialization\include;$(SolutionDir)CommonLibACU\AutoAssemblerKinda\include;$(SolutionDir)CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)..\CommonLibACU\ACU-RE\vmath;$(ProjectDir)..\CommonLibACU\ACU-RE\inc;$(ProjectDir)..\CommonLibACU\DearImGui\inc;$(ProjectDir)..\CommonLibACU\Serialization\include;$(ProjectDir)..\CommonLibACU\AutoAssemblerKinda\include;$(ProjectDir)..\CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -171,7 +171,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(SolutionDir)CommonLibACU\ACU-RE\vmath;$(SolutionDir)CommonLibACU\ACU-RE\inc\Handles;$(SolutionDir)CommonLibACU\ACU-RE\inc;$(SolutionDir)CommonLibACU\DearImGui\inc;$(SolutionDir)CommonLibACU\Serialization\include;$(SolutionDir)CommonLibACU\AutoAssemblerKinda\include;$(SolutionDir)CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)..\CommonLibACU\ACU-RE\vmath;$(ProjectDir)..\CommonLibACU\ACU-RE\inc\Handles;$(ProjectDir)..\CommonLibACU\ACU-RE\inc;$(ProjectDir)..\CommonLibACU\DearImGui\inc;$(ProjectDir)..\CommonLibACU\Serialization\include;$(ProjectDir)..\CommonLibACU\AutoAssemblerKinda\include;$(ProjectDir)..\CommonLibACU\Common_PluginSide\public_headers;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp20</LanguageStandard>
