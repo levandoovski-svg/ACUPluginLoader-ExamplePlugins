@@ -62,6 +62,19 @@ private:
     bool m_GatePendingFire    = false;
     bool m_GateVerdictAllowed = false; // last window outcome, for debug
 
+    // Victim class latch: the last successfully-detected highlighted-NPC
+    // class. When the highlight pointer drops (no NPC in sight, or lagging
+    // behind a kill animation) the readout stays on this class instead of
+    // going INVALID. The latch ages with m_LastVictimSeenFramesAgo and only
+    // counts as evidence in the assassination verdict while it is "hot"
+    // (seen within the last kGateGraceFrames) -- a cold latch never allows
+    // a kill.
+    bool   m_LastVictimValid             = false;
+    uint32_t m_LastVictimDescriptorType    = 0;
+    uint32_t m_LastVictimSubDescriptorType = 0;
+    uint32_t m_LastVictimExplicitProperty  = 0;
+    int    m_LastVictimSeenFramesAgo     = 10000; // start cold / never seen
+
     // Debug readouts (refreshed every frame, even while disabled).
     bool m_Debug_CameraComponentValid = false;
     bool m_Debug_PlayerEntityValid    = false;

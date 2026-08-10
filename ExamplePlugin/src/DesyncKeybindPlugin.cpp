@@ -300,12 +300,30 @@ void DesyncKeybindPlugin::OnUpdate()
     // Highlighted-NPC class readout: refreshes every frame like the chain
     // readout, and the same-frame snapshot feeds the assassination gate
     // below (the target can change mid-animation, so never reuse a stale one).
+    //
+    // Victim class latch: successful reads keep the last-detected NPC class;
+    // when the highlight pointer drops (no NPC in sight) the readout stays on
+    // the last class instead of going invalid. The latch ages via
+    // m_LastVictimSeenFramesAgo so a stale class can never secretly gate a
+    // verdict.
     VictimResultPOD victim{};
     SafeGetVictim(victim);
+    if (victim.victimValid)
+    {
+        m_LastVictimSeenFramesAgo     = 0;
+        m_LastVictimValid             = true;
+        m_LastVictimDescriptorType    = victim.descriptorType;
+        m_LastVictimSubDescriptorType = victim.subDescriptorType;
+        m_LastVictimExplicitProperty  = victim.explicitProperty;
+    }
+    else if (m_LastVictimSeenFramesAgo < 10000)
+    {
+        m_LastVictimSeenFramesAgo++;
+    }
     m_Debug_VictimValid             = victim.victimValid;
-    m_Debug_VictimDescriptorType    = victim.descriptorType;
-    m_Debug_VictimSubDescriptorType = victim.subDescriptorType;
-    m_Debug_VictimExplicitProperty  = victim.explicitProperty;
+    m_Debug_VictimDescriptorType    = m_LastVictimDescriptorType;
+    m_Debug_VictimSubDescriptorType = m_LastVictimSubDescriptorType;
+    m_Debug_VictimExplicitProperty  = m_LastVictimExplicitProperty;
 
     // Assassination poll: refreshed every frame (even while the hotkey is
     // disabled) so the debug readout always shows the live state.
@@ -381,9 +399,19 @@ void DesyncKeybindPlugin::OnUpdate()
     m_Debug_GatePending = m_GatePendingFire;
     if (m_GatePendingFire)
     {
-        if (victim.victimValid)
+        // The latch bridges highlight lag: a victim resolved within the last
+        // kGateGraceFrames counts as the current victim even when the live
+        // pointer reads null this frame. Never-seen / cold-latch victim
+        // assassinations stay unresolved and fall through to the desync at
+        // window expiry.
+        const bool latchHot =
+            m_LastVictimValid && m_LastVictimSeenFramesAgo <= kGateGraceFrames;
+        if (victim.victimValid || latchHot)
         {
-            if (IsClassInAllowlist(victim.subDescriptorType, m_AllowedClasses))
+            const uint32 sub = victim.victimValid
+                                   ? victim.subDescriptorType
+                                   : m_LastVictimSubDescriptorType;
+            if (IsClassInAllowlist(sub, m_AllowedClasses))
             {
                 // Story target confirmed -> assassination allowed.
                 m_GateVerdictAllowed = true;
@@ -469,9 +497,12 @@ void DesyncKeybindPlugin::OnImGuiRender()
         m_Debug_InAssassinationState ? "IN-STATE" : "clear",
         m_Debug_AssassinationDetections);
     ImGui::Text("Victim NPC:        %s  desc-type=%u  class=%u  prop=%u",
-        m_Debug_VictimValid ? "OK" : "INVALID",
+        m_Debug_VictimValid ? "OK" : (m_LastVictimValid ? "STALE" : "NEVER"),
         m_Debug_VictimDescriptorType, m_Debug_VictimSubDescriptorType,
         m_Debug_VictimExplicitProperty);
+    ImGui::Text("Class latch:       %s", m_LastVictimValid
+        ? (m_LastVictimSeenFramesAgo <= kGateGraceFrames ? "hot" : "cold")
+        : "empty");
     ImGui::Text("Gate verdict:      %s%s",
         m_Debug_GatePending ? "PENDING (" :
             (m_GateVerdictAllowed ? "ALLOWED (target class)" : "FIRED (non-target)"),

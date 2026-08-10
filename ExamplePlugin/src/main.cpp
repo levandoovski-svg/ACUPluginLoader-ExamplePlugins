@@ -29,7 +29,7 @@ public:
     virtual uint64 GetThisPluginVersion() override
     {
         // _Your_ plugin version. Currently is for logging only. (In the future, potentially for interplugin communications.)
-        return MAKE_VERSION_NUMBER_UINT64(0, 0, 5, 0);
+        return MAKE_VERSION_NUMBER_UINT64(0, 0, 6, 0);
     }
     virtual void InitStage_WhenPluginAPIDeemedCompatible() override
     {
