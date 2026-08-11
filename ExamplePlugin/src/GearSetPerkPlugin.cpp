@@ -6,6 +6,8 @@
 
 #include "ACU/AvatarGearManager.h"
 #include "ACU/AvatarGear.h"
+#include "ACU/LocalizationManager.h"
+#include "ACU/PlayerProgressionManager.h"
 
 // ===========================================================================
 // Catalogs
@@ -58,6 +60,34 @@ static int PerkCatalogCount() { return (int)(sizeof(kPerks) / sizeof(kPerks[0]))
 static int ClampIndex(int v, int count) { return (count <= 0) ? 0 : (v < 0 ? 0 : (v >= count ? count - 1 : v)); }
 
 // ===========================================================================
+// Small helpers (diagnostic readout)
+// ===========================================================================
+
+static char FoldAscii(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+
+static void CopyName(char dst[64], const wchar_t* w)
+{
+    if (!w) { dst[0] = '?'; dst[1] = 0; return; }
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, dst, 63, nullptr, nullptr);
+    if (n <= 0) { dst[0] = '?'; dst[1] = 0; }
+    else { dst[63] = 0; }
+}
+
+static bool TextContainsMusketeer(const char* s)
+{
+    if (!s) { return false; }
+    const char* sub = "musketeer";
+    for (const char* p = s; *p; p++)
+    {
+        const char* a = p;
+        const char* b = sub;
+        while (*a && *b && FoldAscii(*a) == *b) { a++; b++; }
+        if (!*b) { return true; }
+    }
+    return false;
+}
+
+// ===========================================================================
 // AvatarGearModifier layout
 // ===========================================================================
 // Modifier objects are polymorphic. The AnvilToolkit dump serializes every
@@ -97,7 +127,19 @@ void GearSetPerkPlugin::OnBeforeActivate()
     m_Debug_PiecesMatched  = 0;
     m_Debug_WriteCount     = 0;
     m_Debug_LastError      = nullptr;
-    for (int i = 0; i < 6; i++) { m_Debug_SlotLineIds[i] = 0; m_Debug_SlotMatched[i] = false; }
+    m_Debug_LoadoutValid   = false;
+    m_Debug_LoadoutCount   = 0;
+    m_Debug_LoadoutMusketeerCount = 0;
+    for (int i = 0; i < 6; i++)
+    {
+        m_Debug_SlotLineIds[i] = 0;
+        m_Debug_SlotMatched[i] = false;
+        m_Debug_SlotGearType[i] = 0;
+        m_Debug_SlotSettingsLineId[i] = 0;
+        m_Debug_SlotNames[i][0] = 0;
+        m_Debug_SlotSettingsNames[i][0] = 0;
+    }
+    for (int i = 0; i < 10; i++) { m_Debug_LoadoutLineIds[i] = 0; m_Debug_LoadoutNames[i][0] = 0; }
 }
 
 void GearSetPerkPlugin::OnUpdate()
@@ -109,7 +151,19 @@ void GearSetPerkPlugin::OnUpdate()
     m_Debug_WriteApplied  = false;
     m_Debug_PiecesMatched = 0;
     m_Debug_LastError     = nullptr;
-    for (int i = 0; i < 6; i++) { m_Debug_SlotLineIds[i] = 0; m_Debug_SlotMatched[i] = false; }
+    m_Debug_LoadoutValid  = false;
+    m_Debug_LoadoutCount  = 0;
+    m_Debug_LoadoutMusketeerCount = 0;
+    for (int i = 0; i < 6; i++)
+    {
+        m_Debug_SlotLineIds[i] = 0;
+        m_Debug_SlotMatched[i] = false;
+        m_Debug_SlotGearType[i] = 0;
+        m_Debug_SlotSettingsLineId[i] = 0;
+        m_Debug_SlotNames[i][0] = 0;
+        m_Debug_SlotSettingsNames[i][0] = 0;
+    }
+    for (int i = 0; i < 10; i++) { m_Debug_LoadoutLineIds[i] = 0; m_Debug_LoadoutNames[i][0] = 0; }
 
     const int setCount = SetCatalogCount();
     if (setCount <= 0) { m_Debug_LastError = "set catalog empty"; return; }
@@ -135,6 +189,24 @@ void GearSetPerkPlugin::OnUpdate()
             AvatarGear* g = slots[i];
             if (!g) { continue; }
             m_Debug_SlotLineIds[i] = g->uiString_gearName.stringID;
+            m_Debug_SlotGearType[i] = g->gearType;
+
+            // resolved display name of the gear itself
+            ACU_WStringBuffer gearName{ g->uiString_gearName };
+            CopyName(m_Debug_SlotNames[i], gearName.m_buf);
+
+            // the InventoryItemSettings it references (ItemName is a different
+            // UIString - second candidate fingerprint for detection)
+            if (g->inventoryItemSettings)
+            {
+                InventoryItemSettings* settings = g->inventoryItemSettings->GetPtr();
+                if (settings)
+                {
+                    m_Debug_SlotSettingsLineId[i] = settings->ItemName.stringID;
+                    ACU_WStringBuffer settingsName{ settings->ItemName };
+                    CopyName(m_Debug_SlotSettingsNames[i], settingsName.m_buf);
+                }
+            }
 
             for (int slotIdx = 0; slotIdx < 5; slotIdx++)
             {
@@ -147,6 +219,37 @@ void GearSetPerkPlugin::OnUpdate()
                         m_Debug_SlotMatched[i] = true;
                         matchedSlots[i] = slotIdx;
                         piecesMatched++;
+                    }
+                }
+            }
+        }
+
+        // ---- loadout path (diagnostic: PlayerProgressionManager -> AvatarLoadout) ----
+        {
+            PlayerProgressionManager* ppm = PlayerProgressionManager::GetSingleton();
+            if (ppm && ppm->papPlayerProgressionCharacterData.size > 0 && ppm->papPlayerProgressionCharacterData.arr)
+            {
+                PlayerProgressionCharacterData* pcd = ppm->papPlayerProgressionCharacterData.arr[0];
+                if (pcd)
+                {
+                    m_Debug_LoadoutValid = true;
+                    AvatarLoadout* lo = &pcd->loadout;
+                    SharedPtrNew<InventoryItemSettings>* loadoutSlots[10] = {
+                        lo->WaistSlot, lo->ChestSlot, lo->ForearmsSlot, lo->HeadSlot, lo->LegsSlot,
+                        lo->MeleeWeaponSlot, lo->RangedWeaponSlot, lo->shared_invItemSett_LanternDLC,
+                        lo->OutfitSlot, lo->ColorSlot,
+                    };
+                    for (int i = 0; i < 10; i++)
+                    {
+                        SharedPtrNew<InventoryItemSettings>* sp = loadoutSlots[i];
+                        if (!sp) { continue; }
+                        InventoryItemSettings* settings = sp->GetPtr();
+                        if (!settings) { continue; }
+                        m_Debug_LoadoutLineIds[i] = settings->ItemName.stringID;
+                        ACU_WStringBuffer loadoutName{ settings->ItemName };
+                        CopyName(m_Debug_LoadoutNames[i], loadoutName.m_buf);
+                        m_Debug_LoadoutCount++;
+                        if (TextContainsMusketeer(m_Debug_LoadoutNames[i])) { m_Debug_LoadoutMusketeerCount++; }
                     }
                 }
             }
@@ -264,8 +367,35 @@ void GearSetPerkPlugin::OnImGuiRender()
         if (m_Debug_LastError) { ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Last error: %s", m_Debug_LastError); }
         for (int i = 0; i < 6; i++)
         {
-            ImGui::Text("Slot %d: lineID=%6u  %s", i, m_Debug_SlotLineIds[i],
-                m_Debug_SlotMatched[i] ? "[SET]" : "");
+            ImGui::Text("Slot %d: lineID=%6u  gearType=%u  %s%s", i, m_Debug_SlotLineIds[i],
+                m_Debug_SlotGearType[i], m_Debug_SlotMatched[i] ? "[SET] " : "",
+                m_Debug_SlotNames[i][0] ? m_Debug_SlotNames[i] : "?");
+            if (m_Debug_SlotSettingsNames[i][0])
+            {
+                ImGui::Text("    settings: lineID=%6u  %s", m_Debug_SlotSettingsLineIds[i], m_Debug_SlotSettingsNames[i]);
+            }
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Loadout (PlayerProgressionManager)"))
+    {
+        if (!m_Debug_LoadoutValid)
+        {
+            ImGui::Text("loadout not available (are you in gameplay?)");
+        }
+        else
+        {
+            ImGui::Text("valid slots: %d   names containing 'Musketeer': %d",
+                m_Debug_LoadoutCount, m_Debug_LoadoutMusketeerCount);
+            static const char* kLoadoutLabels[10] = {
+                "Waist", "Chest", "Forearms", "Head", "Legs",
+                "Melee", "Ranged", "Lantern", "Outfit", "Color",
+            };
+            for (int i = 0; i < 10; i++)
+            {
+                ImGui::Text("%-9s lineID=%6u  %s", kLoadoutLabels[i], m_Debug_LoadoutLineIds[i],
+                    m_Debug_LoadoutNames[i][0] ? m_Debug_LoadoutNames[i] : "-");
+            }
         }
     }
 }

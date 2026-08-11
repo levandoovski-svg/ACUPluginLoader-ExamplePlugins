@@ -46,6 +46,19 @@ public:
     bool        m_Debug_SlotMatched[6];
     const char* m_Debug_LastError;
 
+    // per-slot resolved details (AvatarGearManager embedded gears)
+    uint32_t m_Debug_SlotGearType[6];
+    uint32_t m_Debug_SlotSettingsLineId[6];
+    char     m_Debug_SlotNames[6][64];
+    char     m_Debug_SlotSettingsNames[6][64];
+
+    // loadout path (PlayerProgressionManager -> AvatarLoadout)
+    bool     m_Debug_LoadoutValid;
+    int      m_Debug_LoadoutCount;          // valid non-null slots found
+    int      m_Debug_LoadoutMusketeerCount; // diagnostic: resolved names containing "musketeer"
+    uint32_t m_Debug_LoadoutLineIds[10];
+    char     m_Debug_LoadoutNames[10][64];
+
 private:
     void SaveConfigToFile();
 };
