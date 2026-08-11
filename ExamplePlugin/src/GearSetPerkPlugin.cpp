@@ -81,11 +81,11 @@ struct GearModifierLayout
 
 void GearSetPerkPlugin::OnBeforeActivate()
 {
-    m_Enabled        = g_Config.gearSetPerk.enabled;
-    m_SetIndex       = g_Config.gearSetPerk.setIndex;
-    m_RequiredPieces = g_Config.gearSetPerk.requiredPieces;
-    m_PerkTypeIndex  = g_Config.gearSetPerk.perkTypeIndex;
-    m_PerkAmount     = g_Config.gearSetPerk.perkAmount;
+    m_Enabled        = g_Config.gearSetPerk->enabled;
+    m_SetIndex       = g_Config.gearSetPerk->setIndex;
+    m_RequiredPieces = g_Config.gearSetPerk->requiredPieces;
+    m_PerkTypeIndex  = g_Config.gearSetPerk->perkTypeIndex;
+    m_PerkAmount     = g_Config.gearSetPerk->perkAmount;
 
     if (m_RequiredPieces < 1) { m_RequiredPieces = 1; }
     if (m_RequiredPieces > 5) { m_RequiredPieces = 5; }
@@ -208,11 +208,11 @@ void GearSetPerkPlugin::OnUpdate()
 
 void GearSetPerkPlugin::SaveConfigToFile()
 {
-    g_Config.gearSetPerk.enabled        = m_Enabled;
-    g_Config.gearSetPerk.setIndex       = m_SetIndex;
-    g_Config.gearSetPerk.requiredPieces = m_RequiredPieces;
-    g_Config.gearSetPerk.perkTypeIndex  = m_PerkTypeIndex;
-    g_Config.gearSetPerk.perkAmount     = m_PerkAmount;
+    g_Config.gearSetPerk->enabled        = m_Enabled;
+    g_Config.gearSetPerk->setIndex       = m_SetIndex;
+    g_Config.gearSetPerk->requiredPieces = m_RequiredPieces;
+    g_Config.gearSetPerk->perkTypeIndex  = m_PerkTypeIndex;
+    g_Config.gearSetPerk->perkAmount     = m_PerkAmount;
     MainConfig::WriteToFile();
 }
 
