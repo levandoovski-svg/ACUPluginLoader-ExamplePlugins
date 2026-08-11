@@ -2,6 +2,7 @@
 
 #include "pch.h"
 #include "vmath/vmath.h"
+#include "ACU/basic_types.h" // uint64 etc. (not provided by pch/vmath)
 
 class ACUPlayerCameraComponent;
 struct PhotoModeCameraHook;
