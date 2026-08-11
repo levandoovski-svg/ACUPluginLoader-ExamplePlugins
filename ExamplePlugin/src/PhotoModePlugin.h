@@ -91,6 +91,7 @@ private:
         float yaw = 0.0f;
         float pitch = 0.45f;
         float fov = 1.0f;
+        float tilt = 0.0f;
     };
     CameraSlot m_Slots[9];
     int m_ActiveSlot = -1;
@@ -109,6 +110,7 @@ private:
     bool m_FreezeWorld = true;          // Free mode: timescale 0.
     bool m_HidePlayer = false;          // Free mode: hide Arno (clean shots).
     bool m_FollowPlayer = false;        // Free mode: camera tracks Arno, world stays live.
+    bool m_FollowAllowMouse = false;    // Follow Player: mouse orbit/FOV allowed; arrows & Q/E stay locked.
     bool m_FreezeCamera = false;        // Free mode: lock camera pose, play without moving it.
     bool m_TiltMode = false;            // Free mode: rolled camera on mouse yaw (quat write).
     float m_TiltAngle = 0.0f;           // Degrees; static roll in normal freecam (carry-over from Tilt Mode).

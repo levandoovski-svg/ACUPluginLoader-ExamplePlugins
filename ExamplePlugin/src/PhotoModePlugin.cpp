@@ -239,6 +239,8 @@ void PhotoModePlugin::LoadSettings()
             m_HidePlayer = (line.substr(11) == "1");
         else if (line.rfind("FollowPlayer=", 0) == 0)
             m_FollowPlayer = (line.substr(13) == "1");
+        else if (line.rfind("FollowAllowMouse=", 0) == 0)
+            m_FollowAllowMouse = (line.substr(17) == "1");
         else if (line.rfind("TiltMode=", 0) == 0)
             m_TiltMode = (line.substr(9) == "1");
         else if (line.rfind("TiltAngle=", 0) == 0)
@@ -269,6 +271,7 @@ void PhotoModePlugin::SaveSettings()
                  << "FreezeWorld=" << (m_FreezeWorld ? 1 : 0) << "\n"
                  << "HidePlayer=" << (m_HidePlayer ? 1 : 0) << "\n"
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
+                 << "FollowAllowMouse=" << (m_FollowAllowMouse ? 1 : 0) << "\n"
                  << "FreezeCamera=" << (m_FreezeCamera ? 1 : 0) << "\n"
                  << "TiltMode=" << (m_TiltMode ? 1 : 0) << "\n"
                  << "TiltAngle=" << m_TiltAngle << "\n"
@@ -437,9 +440,15 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     // below so Arno can be played without nudging the camera. Follow Player
     // takes priority (the camera then tracks Arno instead of freezing).
     const bool frozen = m_FreezeCamera && !m_FollowPlayer;
+    // Follow Player: ALL camera control is blocked by default so Arno's keys
+    // stay free. "Allow Mouse Look" re-enables mouse orbit + FOV wheel; arrow
+    // keys and Q/E remain locked (they'd nudge the camera mid-play).
+    const bool followLocked = m_FollowPlayer && !m_FollowAllowMouse;
+    const bool lookBlocked = followLocked || frozen;
 
-    // Mouse orbit + FOV wheel (ignored while frozen).
-    if (!frozen)
+    // Mouse orbit + FOV wheel (ignored while frozen, or while Following Player
+    // unless "Allow Mouse Look" is on).
+    if (!lookBlocked)
     {
         auto* inp = ACU::Input::Get_InputContainerBig();
         if (inp)
@@ -472,10 +481,11 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
             m_FreeCamPos = player->GetPosition() + m_FollowOffset;
     }
 
-    // Arrow-key / QE fly (ignored while frozen). Movement is along the camera
-    // plane (flat forward/right), independent of the game clock (world may be
-    // frozen at timescale 0).
-    if (!frozen)
+    // Arrow-key / QE fly (ignored while frozen, and always ignored in Follow
+    // Player so the keys stay with Arno). Movement is along the camera plane
+    // (flat forward/right), independent of the game clock (world may be frozen
+    // at timescale 0).
+    if (!frozen && !m_FollowPlayer)
     {
         float speed = m_MoveSpeed;
         if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 10.0f;
@@ -530,6 +540,7 @@ int PhotoModePlugin::SaveCurrentCameraSlot()
     m_Slots[slot].yaw = m_Yaw;
     m_Slots[slot].pitch = m_Pitch;
     m_Slots[slot].fov = m_Fov;
+    m_Slots[slot].tilt = m_TiltAngle;
     m_ActiveSlot = slot;
     return slot;
 }
@@ -541,6 +552,7 @@ void PhotoModePlugin::ApplyCameraSlot(int index)
     m_Yaw = m_Slots[index].yaw;
     m_Pitch = m_Slots[index].pitch;
     m_Fov = m_Slots[index].fov;
+    m_TiltAngle = m_Slots[index].tilt;
     m_ActiveSlot = index;
     if (m_FollowPlayer && m_Mode == Mode::Free)
     {
@@ -674,6 +686,7 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::BulletText("Shift: hold for 10x movement speed");
     ImGui::BulletText(", / .: switch between saved camera poses");
     ImGui::BulletText("Freeze Camera on: mouse & arrows ignored");
+    ImGui::BulletText("Follow Player on: arrows, Q/E & mouse locked (Allow Mouse Look re-enables mouse)");
 
     ImGui::Separator();
 
@@ -720,7 +733,9 @@ void PhotoModePlugin::OnImGuiRender()
     if (m_FollowPlayer)
     {
         ImGui::Indent();
+        if (ImGui::Checkbox("Allow Mouse Look (Follow)", &m_FollowAllowMouse)) SaveSettings();
         ImGui::TextDisabled("Camera tracks Arno as he runs; world stays live.");
+        ImGui::TextDisabled("Arrow keys & Q/E stay locked; the option above unlocks the mouse.");
         ImGui::Unindent();
     }
     if (ImGui::SliderFloat("Move Speed", &m_MoveSpeed, 0.5f, 20.0f, "%.1f")) SaveSettings();
@@ -738,7 +753,7 @@ void PhotoModePlugin::OnImGuiRender()
     if (ImGui::Button("Save Current Pose"))
         SaveCurrentCameraSlot();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Stores the current position/angle/FOV into a free slot (overwrites the active slot when full).");
+        ImGui::SetTooltip("Stores the current position/angle/FOV/tilt into a free slot (overwrites the active slot when full).");
     ImGui::SameLine();
     if (ImGui::Button("Clear All"))
     {
