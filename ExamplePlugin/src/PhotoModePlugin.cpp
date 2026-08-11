@@ -713,7 +713,7 @@ void PhotoModePlugin::OnImGuiRender()
     }
     if (!m_TiltMode)
     {
-        if (ImGui::SliderFloat("Tilt Angle", &m_TiltAngle, -45.0f, 45.0f, "%.1f deg")) SaveSettings();
+        if (ImGui::SliderFloat("Tilt Angle", &m_TiltAngle, -180.0f, 180.0f, "%.1f deg")) SaveSettings();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Static roll around the view axis in normal freecam — dial the angle in Tilt Mode by feel, then turn Tilt Mode off to carry it over.");
     }
