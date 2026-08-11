@@ -78,6 +78,34 @@ static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
     return QuaternionFromBasis(right, up, fwd);
 }
 
+// Level-horizon orientation for the free camera: same look basis as above but
+// keeps the horizon flat for ANY yaw (up stays closest to world up), with an
+// optional static roll around the view axis (degrees). Used in normal freecam
+// so the game's sprint/landing bob is overridden while mouse-yaw still turns
+// horizontally with no tilt.
+static Vector4f BuildLevelFreeCameraQuaternion(float yaw, float pitch, float rollDegrees)
+{
+    const float cp = cosf(pitch), sp = sinf(pitch);
+    const float cy = cosf(yaw), sy = sinf(yaw);
+
+    Vector3f fwd(sy * cp, sp, cy * cp);
+    Vector3f right(cy, 0.0f, -sy);
+    Vector3f up(
+        fwd.y * right.z - fwd.z * right.y,
+        fwd.z * right.x - fwd.x * right.z,
+        fwd.x * right.y - fwd.y * right.x);
+
+    if (rollDegrees != 0.0f)
+    {
+        const float phi = rollDegrees * (PI / 180.0f);
+        const float cr = cosf(phi), sr = sinf(phi);
+        const Vector3f rolledRight = right * cr + up * sr;
+        up = right * (-sr) + up * cr;
+        right = rolledRight;
+    }
+    return QuaternionFromBasis(right, up, fwd);
+}
+
 // Basis for "eye looks toward target" — removed with Cinematic mode (the free
 // camera drives orientation via the game's spinaround solver instead).
 
@@ -153,12 +181,15 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
     cam->fov_mb_pi_4 = m_Fov;
     cam->fovPrecalc = m_Fov * (PI / 4.0f);
 
-    // Tilt Mode (optional): write our own orientation quaternion. The game
-    // reads this quat as the camera's up/roll around the look-at axis, which
-    // gives the "tilting horizon" look when yawing. Default (off): orientation
-    // comes from the spinaround targets below, which yaw horizontally flat.
+    // ALWAYS override the orientation quaternion: the vanilla camera bakes
+    // sprint/landing bob and shake into it, so leaving it alone lets freecam
+    // bounce around (visible in Follow Player / Freeze Camera). Tilt Mode keeps
+    // the old rolled look; normal freecam writes a level-horizon quaternion,
+    // optionally rolled by m_TiltAngle (carry-over from Tilt Mode).
     if (m_TiltMode)
         cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
+    else
+        cam->quaternion_mb = BuildLevelFreeCameraQuaternion(m_Yaw, m_Pitch, m_TiltAngle);
 
     // Spin the game's own mixer to our pose so its next-frame solve can't
     // fight us. Center = one unit ahead along the view ray, distance 1, so the
@@ -210,6 +241,8 @@ void PhotoModePlugin::LoadSettings()
             m_FollowPlayer = (line.substr(13) == "1");
         else if (line.rfind("TiltMode=", 0) == 0)
             m_TiltMode = (line.substr(9) == "1");
+        else if (line.rfind("TiltAngle=", 0) == 0)
+            try { m_TiltAngle = std::stof(line.substr(10)); } catch (...) {}
         else if (line.rfind("FreezeCamera=", 0) == 0)
             m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
@@ -238,6 +271,7 @@ void PhotoModePlugin::SaveSettings()
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
                  << "FreezeCamera=" << (m_FreezeCamera ? 1 : 0) << "\n"
                  << "TiltMode=" << (m_TiltMode ? 1 : 0) << "\n"
+                 << "TiltAngle=" << m_TiltAngle << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
@@ -570,6 +604,18 @@ void PhotoModePlugin::OnImGuiRender()
 
     ImGui::Separator();
 
+    ImGui::TextDisabled("CONTROLS");
+    ImGui::BulletText("F9: toggle free camera");
+    ImGui::BulletText("F11: reset camera to entry pose");
+    ImGui::BulletText("Mouse: look / orbit");
+    ImGui::BulletText("Mouse wheel: FOV zoom");
+    ImGui::BulletText("Arrow keys: move camera (forward/back/left/right)");
+    ImGui::BulletText("Q / E: move camera up / down");
+    ImGui::BulletText("Shift: hold for 10x movement speed");
+    ImGui::BulletText("Freeze Camera on: mouse & arrows ignored");
+
+    ImGui::Separator();
+
     ImGui::TextDisabled("FREE CAMERA (F9)");
     if (m_FollowPlayer || m_FreezeCamera)
         ImGui::BeginDisabled();
@@ -603,6 +649,12 @@ void PhotoModePlugin::OnImGuiRender()
         ImGui::Indent();
         ImGui::TextDisabled("Mouse left/right rolls the camera (old tilted look).");
         ImGui::Unindent();
+    }
+    if (!m_TiltMode)
+    {
+        if (ImGui::SliderFloat("Tilt Angle", &m_TiltAngle, -45.0f, 45.0f, "%.1f deg")) SaveSettings();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Static roll around the view axis in normal freecam — dial the angle in Tilt Mode by feel, then turn Tilt Mode off to carry it over.");
     }
     if (m_FollowPlayer)
     {
