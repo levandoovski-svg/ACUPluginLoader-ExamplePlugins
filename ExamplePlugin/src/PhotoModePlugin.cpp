@@ -45,13 +45,45 @@ static float ClampFloat(float value, float min_, float max_)
     return value;
 }
 
-// Note on quaternion_mb (settled v1.4+): the game reads it as roll around the
-// look-at axis — ANY quat we write yields the tilted look and converts yaw
-// into horizon roll instead of a horizontal turn. So the free camera NEVER
-// writes it; left/right rotation is driven through the game's own spinaround
-// solver in ApplyFreeCamera (which is also why the vanilla acrobatics bob
-// remains visible — suppressing them via the quat costs us rotation, so the
-// correct suppression is a separate source-level fix, not a quat write).
+// Orientation for the free camera — two look modes (toggled by the Orbit
+// checkbox in the panel, or the Orbit key, default 'O'):
+//   TILT (default): write our own orientation quat. The game reads
+//   quaternion_mb as the camera's roll around the look-at axis, which gives
+//   the tilted look AND suppresses the vanilla acrobatics bob/shake. Mouse X
+//   yaw rolls the horizon here — expected; use Orbit for clean turning.
+//   ORBIT: never write quaternion_mb; the game's own spinaround solve (synced
+//   in ApplyFreeCamera) turns yaw into a clean horizontal rotation around the
+//   look target (Arno in Follow Player). Tradeoff: acrobatics bob/shake is
+//   visible again — suppressing them via the quat costs rotation, so the
+//   correct suppression stays a separate source-level fix.
+static Vector4f QuaternionFromBasis(const Vector3f& right, const Vector3f& up, const Vector3f& fwd)
+{
+    const float trace = right.x + up.y + fwd.z;
+    float w = sqrtf(fmaxf(0.0f, 1.0f + trace)) * 0.5f;
+    if (w < 0.05f) w = 0.05f;
+    const float inv = 0.25f / w;
+    const float x = (up.z - fwd.y) * inv;
+    const float y = (fwd.x - right.z) * inv;
+    const float z = (right.y - up.x) * inv;
+    return Vector4f(x, y, z, w);
+}
+
+// Basis for the free-camera look direction. Uses IDENTICAL yaw/pitch math to
+// the forward vector used for movement and look-at, so pose and orientation
+// never disagree (a mismatch is what made the camera shudder in an old build).
+static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
+{
+    const float cp = cosf(pitch), sp = sinf(pitch);
+    const float cy = cosf(yaw), sy = sinf(yaw);
+
+    Vector3f fwd(sy * cp, sp, cy * cp);
+    Vector3f right(cy, 0.0f, -sy);
+    Vector3f up(
+        fwd.y * right.z - fwd.z * right.y,
+        fwd.z * right.x - fwd.x * right.z,
+        fwd.x * right.y - fwd.y * right.x);
+    return QuaternionFromBasis(right, up, fwd);
+}
 
 // ============================================================
 // Camera hook: 0x141F3FE3B ("when setting FOV for frame").
@@ -125,24 +157,32 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
     cam->fov_mb_pi_4 = m_Fov;
     cam->fovPrecalc = m_Fov * (PI / 4.0f);
 
-    // NEVER write quaternion_mb — this is the settled rule. The game reads it
-    // as roll around the look-at axis, so any quat we write tilts the horizon
-    // and turns yaw into roll instead of a horizontal rotation (confirmed in
-    // every build that wrote it; the only builds with working left/right never
-    // touched it). Left/right rotation therefore lives in the game's own
-    // spinaround solve below: yaw/pitch targets + center + distance, which the
-    // game uses to compute its own orientation every frame. We only fix the
-    // pose after the solve (write-after-solve hook), so the renderer consumes
-    // our position/lookat while the orientation stays the game's.
-
     // Spin the game's own mixer to our pose so its next-frame solve can't
-    // fight us. Center = one unit ahead along the view ray, distance 1, so the
-    // game's solver places the camera exactly at our position looking at
-    // lookTarget — using ITS conventions, no quaternion math on our side.
+    // fight us (both look modes). Center = one unit ahead along the view ray,
+    // distance 1, so the game's solver places the camera exactly at our
+    // position looking at lookTarget — using ITS conventions.
     cam->spinaroundAngleZtarget = m_Yaw;
     cam->spinaroundAngleUpDownTarget = ClampFloat(m_Pitch, -VERTICAL_LIMIT, VERTICAL_LIMIT);
     cam->distFromSpinaround_mb = 1.0f;
     cam->locationSpinaround_AA0 = Vector4f(lookTarget, 1.0f);
+
+    if (m_OrbitMode)
+    {
+        // ORBIT MODE (checkbox / Orbit key): ride the game's OWN orientation.
+        // Never write quaternion_mb — the game reads any quat we write as roll
+        // around the look-at axis (tilt + yaw becomes roll, killing L/R
+        // rotation). Leaving it to the game's spinaround solve is the only
+        // configuration with clean horizontal turning (proven builds).
+    }
+    else
+    {
+        // TILT MODE (default free cam): write our own orientation quat. The
+        // game reads it as roll around the look-at axis — the tilted look, and
+        // overwriting it every frame suppresses the vanilla acrobatics
+        // bob/shake. Mouse X yaw rolls the horizon here; toggle Orbit for
+        // clean left/right rotation.
+        cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
+    }
 
     if (m_DisableSmoothing)
         cam->disableCameraSmoothingForThisFrame = 1;
@@ -177,6 +217,10 @@ void PhotoModePlugin::LoadSettings()
             try { m_FreeCamKey = std::stoi(line.substr(11), nullptr, 16); } catch (...) {}
         else if (line.rfind("ResetKey=", 0) == 0)
             try { m_ResetKey = std::stoi(line.substr(9), nullptr, 16); } catch (...) {}
+        else if (line.rfind("OrbitKey=", 0) == 0)
+            try { m_OrbitKey = std::stoi(line.substr(9), nullptr, 16); } catch (...) {}
+        else if (line.rfind("OrbitMode=", 0) == 0)
+            m_OrbitMode = (line.substr(10) == "1");
         else if (line.rfind("FreezeWorld=", 0) == 0)
             m_FreezeWorld = (line.substr(12) == "1");
         else if (line.rfind("HidePlayer=", 0) == 0)
@@ -208,6 +252,8 @@ void PhotoModePlugin::SaveSettings()
         {
             file << "FreeCamKey=" << std::hex << m_FreeCamKey << std::dec << "\n"
                  << "ResetKey=" << std::hex << m_ResetKey << std::dec << "\n"
+                 << "OrbitKey=" << std::hex << m_OrbitKey << std::dec << "\n"
+                 << "OrbitMode=" << (m_OrbitMode ? 1 : 0) << "\n"
                  << "FreezeWorld=" << (m_FreezeWorld ? 1 : 0) << "\n"
                  << "HidePlayer=" << (m_HidePlayer ? 1 : 0) << "\n"
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
@@ -535,6 +581,7 @@ void PhotoModePlugin::OnUpdate()
             if (IsRisingEdgePressed(vk))
             {
                 if (m_RebindTarget == 1) m_FreeCamKey = vk;
+                else if (m_RebindTarget == 2) m_OrbitKey = vk;
                 else if (m_RebindTarget == 3) m_ResetKey = vk;
                 m_WaitingForKey = false;
                 m_RebindTarget = 0;
@@ -557,6 +604,17 @@ void PhotoModePlugin::OnUpdate()
 
     m_PrevFreeDown = freeDown;
     m_PrevResetDown = resetDown;
+
+    // Orbit look-mode toggle (only meaningful inside Free mode): flips between
+    // TILT (default, tilted look, no acrobatic bob) and ORBIT (clean
+    // left/right rotation around the look target / Arno).
+    const bool orbitDown = m_Mode == Mode::Free && (GetAsyncKeyState(m_OrbitKey) & 0x8000) != 0;
+    if (orbitDown && !m_PrevOrbitDown)
+    {
+        m_OrbitMode = !m_OrbitMode;
+        SaveSettings();
+    }
+    m_PrevOrbitDown = orbitDown;
 
     // Saved-camera switching: ',' = previous slot, '.' = next slot.
     const bool commaDown = (GetAsyncKeyState(VK_OEM_COMMA) & 0x8000) != 0;
@@ -616,11 +674,22 @@ void PhotoModePlugin::OnImGuiRender()
         m_RebindTarget = 3;
     }
 
+    ImGui::Text("Orbit Key:");
+    ImGui::SameLine();
+    ImGui::Text("0x%02X", m_OrbitKey);
+    ImGui::SameLine();
+    if (ImGui::Button(m_WaitingForKey && m_RebindTarget == 2 ? "Press any key..." : "Rebind##Orbit"))
+    {
+        m_WaitingForKey = true;
+        m_RebindTarget = 2;
+    }
+
     ImGui::Separator();
 
     ImGui::TextDisabled("CONTROLS");
     ImGui::BulletText("F9: toggle free camera");
     ImGui::BulletText("F11: reset camera to entry pose");
+    ImGui::BulletText("O: toggle Orbit look mode (clean rotation around Arno)");
     ImGui::BulletText("Mouse Y: look up / down");
     ImGui::BulletText("Mouse X: rotate left / right");
     ImGui::BulletText("Mouse wheel: FOV zoom");
@@ -634,6 +703,14 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::Separator();
 
     ImGui::TextDisabled("FREE CAMERA (F9)");
+    if (ImGui::Checkbox("Orbit Rotation (around Arno)", &m_OrbitMode)) SaveSettings();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Off (default): TILT look — our own orientation, no acrobatic bob/shake,\n"
+            "mouse X rolls the horizon.\n"
+            "On: ORBIT look — game-native rotation, clean left/right turning\n"
+            "around the look target (Arno in Follow Player); vanilla bob/shake\n"
+            "can show. Hotkey: Orbit Key (default O), active inside Free mode.");
     if (m_FollowPlayer || m_FreezeCamera)
         ImGui::BeginDisabled();
     if (ImGui::Checkbox("Freeze World", &m_FreezeWorld)) SaveSettings();

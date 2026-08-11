@@ -13,9 +13,12 @@ struct PhotoModeCameraHook;
 // Camera takeover mode for Assassin's Creed Unity:
 //   Mode::Free - "Photo Mode": fly the camera anywhere (arrow keys + Q/E move,
 //                mouse X/Y look, wheel FOV), freeze the world, optional hidden
-//                player. The camera rides the game's own orientation (never
-//                writes quaternion_mb, so left/right rotation works); Follow
-//                Player anchors it to Arno while you play; Freeze Camera locks
+//                player. Two look modes inside Free: TILT (default) writes our
+//                own orientation quat — the tilted look, immune to vanilla
+//                acrobatics; ORBIT (checkbox or the Orbit key, default O)
+//                rides the game's own orientation for clean left/right rotation
+//                around the look target (Arno in Follow Player). Follow Player
+//                anchors the camera to Arno while you play; Freeze Camera locks
 //                the pose (optional mouse look); ',' / '.' switch between
 //                saved camera poses.
 //
@@ -70,13 +73,15 @@ private:
     bool m_Enabled = true;
     Mode m_Mode = Mode::None;
 
-    // Hotkeys (rebindable; F9/F11 defaults).
+    // Hotkeys (rebindable; F9/F11/O defaults).
     int m_FreeCamKey = VK_F9;
     int m_ResetKey = VK_F11;
+    int m_OrbitKey = 'O';
     bool m_WaitingForKey = false;
-    int m_RebindTarget = 0; // 1=FreeCamKey, 3=ResetKey
+    int m_RebindTarget = 0; // 1=FreeCamKey, 2=OrbitKey, 3=ResetKey
     bool m_PrevFreeDown = false;
     bool m_PrevResetDown = false;
+    bool m_PrevOrbitDown = false;
 
     // Plugin-owned camera state.
     Vector3f m_FreeCamPos;   // Free mode: absolute camera position.
@@ -113,6 +118,7 @@ private:
     bool m_FollowPlayer = false;        // Free mode: camera tracks Arno, world stays live.
     bool m_FreezeCamera = false;        // Free mode: lock camera pose, play without moving it.
     bool m_FreezeAllowLook = false;     // Free mode + Freeze Camera: mouse can still look around.
+    bool m_OrbitMode = false;           // Free mode look: false=TILT (quat, no acrobatics), true=ORBIT (clean L/R).
     float m_MoveSpeed = 4.0f;           // Free mode: world units / second.
     float m_MouseSensitivity = 0.003f;  // Same default as FreeCameraRotation.
     bool m_InvertX = false;
