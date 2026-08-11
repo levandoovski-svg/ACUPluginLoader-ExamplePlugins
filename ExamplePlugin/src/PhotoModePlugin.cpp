@@ -18,13 +18,6 @@ static constexpr float VERTICAL_LIMIT = 1.48f;
 static constexpr float MIN_FOV = 0.2f;
 static constexpr float MAX_FOV = 2.0f;
 
-// Yaw rotation keys: hold { / } to rotate left/right. Key-driven instead of
-// mouse X + MMB because the game consumes the mouse deltas while MMB is held
-// (the MMB approach never delivered rotation to the camera).
-static constexpr int YAW_LEFT_KEY = VK_OEM_4;   // {
-static constexpr int YAW_RIGHT_KEY = VK_OEM_6;  // }
-static constexpr float YAW_ROTATE_SPEED = 1.0f; // radians/sec (Shift = 5x)
-
 PhotoModePlugin* g_pPhotoMode = nullptr;
 
 PhotoModePlugin::PhotoModePlugin()
@@ -52,46 +45,13 @@ static float ClampFloat(float value, float min_, float max_)
     return value;
 }
 
-// Convert a camera basis (right, up, fwd — unit, pairwise orthogonal) to the
-// orientation quaternion the game stores in quaternion_mb (Vector4f x,y,z,w).
-// Solved from the rotation-matrix trace / off-diagonal differences.
-static Vector4f QuaternionFromBasis(const Vector3f& right, const Vector3f& up, const Vector3f& fwd)
-{
-    const float trace = right.x + up.y + fwd.z;
-    float w = sqrtf(fmaxf(0.0f, 1.0f + trace)) * 0.5f;
-    if (w < 0.05f) w = 0.05f;
-    const float inv = 0.25f / w;
-    const float x = (up.z - fwd.y) * inv;
-    const float y = (fwd.x - right.z) * inv;
-    const float z = (right.y - up.x) * inv;
-    return Vector4f(x, y, z, w);
-}
-
-// Basis for the free-camera look direction. Uses IDENTICAL yaw/pitch math to
-// the forward vector used for movement and look-at, so pose and orientation
-// never disagree (the old code wrote pose but left the game's own orientation
-// untouched — that mismatch is what made the camera shudder).
-static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
-{
-    const float cp = cosf(pitch), sp = sinf(pitch);
-    const float cy = cosf(yaw), sy = sinf(yaw);
-
-    Vector3f fwd(sy * cp, sp, cy * cp);
-    Vector3f right(cy, 0.0f, -sy);
-    Vector3f up(
-        fwd.y * right.z - fwd.z * right.y,
-        fwd.z * right.x - fwd.x * right.z,
-        fwd.x * right.y - fwd.y * right.x);
-    return QuaternionFromBasis(right, up, fwd);
-}
-
-// Level-horizon orientation for the free camera — removed (v1.4): the game
-// reads quaternion_mb as the camera's roll around the look-at axis, so any
-// quat we write produces the tilted look. We now embrace that: the tilt look
-// IS the freecam look, and left/right rotation is a held-key action instead.
-
-// Basis for "eye looks toward target" — removed with Cinematic mode (the free
-// camera drives orientation via the game's spinaround solver instead).
+// Note on quaternion_mb (settled v1.4+): the game reads it as roll around the
+// look-at axis — ANY quat we write yields the tilted look and converts yaw
+// into horizon roll instead of a horizontal turn. So the free camera NEVER
+// writes it; left/right rotation is driven through the game's own spinaround
+// solver in ApplyFreeCamera (which is also why the vanilla acrobatics bob
+// remains visible — suppressing them via the quat costs us rotation, so the
+// correct suppression is a separate source-level fix, not a quat write).
 
 // ============================================================
 // Camera hook: 0x141F3FE3B ("when setting FOV for frame").
@@ -165,17 +125,15 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
     cam->fov_mb_pi_4 = m_Fov;
     cam->fovPrecalc = m_Fov * (PI / 4.0f);
 
-    // Tilt look by default: write our own orientation quat so the vanilla
-    // bob/shake (sprint/landing acrobatics) never reaches the freecam — the
-    // game reads this quat as the camera's roll around the look-at axis, which
-    // gives the tilted look, and overwriting it every frame kills the acrobatic
-    // shake. While a rotate key ({ / }) is held, leave the game's own quat
-    // alone: its bob/shake comes back AND yaw cleanly turns the camera
-    // left/right (with our quat in control, yaw only rolls the horizon).
-    const bool rotating = (GetAsyncKeyState(YAW_LEFT_KEY) & 0x8000) != 0 ||
-                          (GetAsyncKeyState(YAW_RIGHT_KEY) & 0x8000) != 0;
-    if (!rotating)
-        cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
+    // NEVER write quaternion_mb — this is the settled rule. The game reads it
+    // as roll around the look-at axis, so any quat we write tilts the horizon
+    // and turns yaw into roll instead of a horizontal rotation (confirmed in
+    // every build that wrote it; the only builds with working left/right never
+    // touched it). Left/right rotation therefore lives in the game's own
+    // spinaround solve below: yaw/pitch targets + center + distance, which the
+    // game uses to compute its own orientation every frame. We only fix the
+    // pose after the solve (write-after-solve hook), so the renderer consumes
+    // our position/lookat while the orientation stays the game's.
 
     // Spin the game's own mixer to our pose so its next-frame solve can't
     // fight us. Center = one unit ahead along the view ray, distance 1, so the
@@ -233,6 +191,8 @@ void PhotoModePlugin::LoadSettings()
             try { m_MoveSpeed = std::stof(line.substr(10)); } catch (...) {}
         else if (line.rfind("MouseSensitivity=", 0) == 0)
             try { m_MouseSensitivity = std::stof(line.substr(17)); } catch (...) {}
+        else if (line.rfind("InvertX=", 0) == 0)
+            m_InvertX = (line.substr(8) == "1");
         else if (line.rfind("InvertY=", 0) == 0)
             m_InvertY = (line.substr(8) == "1");
         else if (line.rfind("DisableSmoothing=", 0) == 0)
@@ -255,6 +215,7 @@ void PhotoModePlugin::SaveSettings()
                  << "FreezeAllowLook=" << (m_FreezeAllowLook ? 1 : 0) << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
+                 << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
                  << "InvertY=" << (m_InvertY ? 1 : 0) << "\n"
                  << "DisableSmoothing=" << (m_DisableSmoothing ? 1 : 0) << "\n";
         }
@@ -419,17 +380,19 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     const bool frozen = m_FreezeCamera && !m_FollowPlayer;
     const bool lookBlocked = m_FollowPlayer || (frozen && !m_FreezeAllowLook);
 
-    // Look input: mouse Y = pitch (always when not blocked); yaw rotation is
-    // key-driven — hold { / } to rotate left/right (mouse X + MMB was dropped:
-    // the game swallows the mouse deltas while MMB is held, so rotation never
-    // reached the camera). FOV wheel works unless look is blocked. Blocked
-    // entirely in Follow Player, and in Freeze Camera unless "Allow Mouse
-    // Look" is checked.
+    // Look input: mouse X = yaw, mouse Y = pitch (always when not blocked).
+    // Mouse X is UNGATED — the MMB-gated attempt failed because the game
+    // consumes the mouse deltas while MMB is held, so rotation never reached
+    // yaw. Combined with "never write quaternion_mb" (ApplyFreeCamera), yaw
+    // now turns the camera horizontally — the proven-working mechanism.
+    // FOV wheel works unless look is blocked. Blocked entirely in Follow
+    // Player, and in Freeze Camera unless "Allow Mouse Look" is checked.
     if (!lookBlocked)
     {
         auto* inp = ACU::Input::Get_InputContainerBig();
         if (inp)
         {
+            const int dx = inp->mouseState.mouseDeltaIntForCamera_X;
             const int dy = inp->mouseState.mouseDeltaIntForCamera_Y;
             if (dy != 0)
             {
@@ -438,16 +401,10 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
                 if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
                 if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
             }
-
-            // Yaw: hold { / } to rotate left/right at a fixed rate.
-            const bool rotLeft = (GetAsyncKeyState(YAW_LEFT_KEY) & 0x8000) != 0;
-            const bool rotRight = (GetAsyncKeyState(YAW_RIGHT_KEY) & 0x8000) != 0;
-            if (rotLeft || rotRight)
+            if (dx != 0)
             {
-                float yawSpeed = YAW_ROTATE_SPEED;
-                if (GetAsyncKeyState(VK_SHIFT) & 0x8000) yawSpeed *= 5.0f;
-                m_Yaw += (rotRight ? yawSpeed : 0.0f) * dt;
-                m_Yaw -= (rotLeft ? yawSpeed : 0.0f) * dt;
+                const float xMult = m_InvertX ? 1.0f : -1.0f;
+                m_Yaw += (float)dx * m_MouseSensitivity * xMult;
                 m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
             }
 
@@ -665,7 +622,7 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::BulletText("F9: toggle free camera");
     ImGui::BulletText("F11: reset camera to entry pose");
     ImGui::BulletText("Mouse Y: look up / down");
-    ImGui::BulletText("Hold { / }: rotate left / right (Shift = faster)");
+    ImGui::BulletText("Mouse X: rotate left / right");
     ImGui::BulletText("Mouse wheel: FOV zoom");
     ImGui::BulletText("Arrow keys: move camera (forward/back/left/right)");
     ImGui::BulletText("Q / E: move camera up / down (disabled in Follow Player)");
@@ -715,6 +672,7 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::Separator();
 
     if (ImGui::SliderFloat("FOV", &m_Fov, MIN_FOV, MAX_FOV, "%.2f")) SaveSettings();
+    if (ImGui::Checkbox("Invert X", &m_InvertX)) SaveSettings();
     if (ImGui::Checkbox("Invert Y", &m_InvertY)) SaveSettings();
     if (ImGui::Checkbox("Disable Camera Smoothing", &m_DisableSmoothing)) SaveSettings();
 
