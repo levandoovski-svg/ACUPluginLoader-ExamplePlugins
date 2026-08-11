@@ -114,6 +114,7 @@ private:
     bool m_FreezeCamera = false;        // Free mode: lock camera pose, play without moving it.
     bool m_TiltMode = false;            // Free mode: rolled camera on mouse yaw (quat write).
     float m_TiltAngle = 0.0f;           // Degrees; static roll in normal freecam (carry-over from Tilt Mode).
+    bool m_MouseTilt = false;           // Mouse X adjusts Tilt Angle instead of yaw (dial roll by feel).
     float m_MoveSpeed = 4.0f;           // Free mode: world units / second.
     float m_MouseSensitivity = 0.003f;  // Same default as FreeCameraRotation.
     bool m_InvertX = false;

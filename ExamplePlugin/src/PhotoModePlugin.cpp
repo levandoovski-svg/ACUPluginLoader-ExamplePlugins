@@ -245,6 +245,8 @@ void PhotoModePlugin::LoadSettings()
             m_TiltMode = (line.substr(9) == "1");
         else if (line.rfind("TiltAngle=", 0) == 0)
             try { m_TiltAngle = std::stof(line.substr(10)); } catch (...) {}
+        else if (line.rfind("MouseTilt=", 0) == 0)
+            m_MouseTilt = (line.substr(10) == "1");
         else if (line.rfind("FreezeCamera=", 0) == 0)
             m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
@@ -275,6 +277,7 @@ void PhotoModePlugin::SaveSettings()
                  << "FreezeCamera=" << (m_FreezeCamera ? 1 : 0) << "\n"
                  << "TiltMode=" << (m_TiltMode ? 1 : 0) << "\n"
                  << "TiltAngle=" << m_TiltAngle << "\n"
+                 << "MouseTilt=" << (m_MouseTilt ? 1 : 0) << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
@@ -459,11 +462,25 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
             {
                 const float xMult = m_InvertX ? 1.0f : -1.0f;
                 const float yMult = m_InvertY ? -1.0f : 1.0f;
-                m_Yaw += (float)dx * m_MouseSensitivity * xMult;
-                m_Pitch += (float)dy * m_MouseSensitivity * yMult;
-                m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
-                if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
-                if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+                if (m_MouseTilt)
+                {
+                    // Mouse Tilt: X dials the Tilt Angle (±180) so roll can be
+                    // set by feel; Y still orbits pitch. Yaw is not touched.
+                    m_TiltAngle += (float)dx * m_MouseSensitivity * 3.0f * xMult;
+                    if (m_TiltAngle > 180.0f) m_TiltAngle = 180.0f;
+                    if (m_TiltAngle < -180.0f) m_TiltAngle = -180.0f;
+                    m_Pitch += (float)dy * m_MouseSensitivity * yMult;
+                    if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
+                    if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+                }
+                else
+                {
+                    m_Yaw += (float)dx * m_MouseSensitivity * xMult;
+                    m_Pitch += (float)dy * m_MouseSensitivity * yMult;
+                    m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
+                    if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
+                    if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+                }
             }
 
             const int wheel = inp->mouseState.mouseWheelDeltaInt;
@@ -680,6 +697,7 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::BulletText("F9: toggle free camera");
     ImGui::BulletText("F11: reset camera to entry pose");
     ImGui::BulletText("Mouse: look / orbit");
+    ImGui::BulletText("Mouse Tilt on: mouse X sets Tilt Angle (roll), Y orbits pitch");
     ImGui::BulletText("Mouse wheel: FOV zoom");
     ImGui::BulletText("Arrow keys: move camera (forward/back/left/right)");
     ImGui::BulletText("Q / E: move camera up / down");
@@ -703,7 +721,18 @@ void PhotoModePlugin::OnImGuiRender()
     if (ImGui::Checkbox("Hide Player", &m_HidePlayer)) SaveSettings();
     if (ImGui::Checkbox("Follow Player", &m_FollowPlayer))
     {
-        if (m_FollowPlayer) m_FreezeWorld = false;
+        if (m_FollowPlayer)
+        {
+            m_FreezeWorld = false;
+            // Anchor Follow to the CURRENT freecam pose so enabling it mid-shot
+            // doesn't teleport the camera to player + stale offset.
+            if (m_Mode == Mode::Free)
+            {
+                Entity* player = ACU::GetPlayer();
+                if (player)
+                    m_FollowOffset = m_FreeCamPos - player->GetPosition();
+            }
+        }
         SaveSettings();
     }
     if (ImGui::Checkbox("Freeze Camera", &m_FreezeCamera))
@@ -728,7 +757,16 @@ void PhotoModePlugin::OnImGuiRender()
     {
         if (ImGui::SliderFloat("Tilt Angle", &m_TiltAngle, -180.0f, 180.0f, "%.1f deg")) SaveSettings();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Static roll around the view axis in normal freecam — dial the angle in Tilt Mode by feel, then turn Tilt Mode off to carry it over.");
+            ImGui::SetTooltip("Static roll around the view axis in normal freecam — use Mouse Tilt to dial it by feel, or set it in Tilt Mode and carry the angle over.");
+        if (ImGui::Checkbox("Mouse Tilt", &m_MouseTilt)) SaveSettings();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Mouse left/right adjusts the Tilt Angle instead of yaw (X = roll, Y = pitch). Yaw stays fixed while on.");
+        if (m_MouseTilt)
+        {
+            ImGui::Indent();
+            ImGui::TextDisabled("Mouse X now rolls the camera; use the slider or Y to orbit pitch.");
+            ImGui::Unindent();
+        }
     }
     if (m_FollowPlayer)
     {
