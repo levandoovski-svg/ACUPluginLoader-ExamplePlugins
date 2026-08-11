@@ -158,13 +158,17 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
     cam->fov_mb_pi_4 = m_Fov;
     cam->fovPrecalc = m_Fov * (PI / 4.0f);
 
-    // ALWAYS override the orientation quaternion: the vanilla camera bakes
-    // sprint/landing bob and shake into it, so leaving it alone lets freecam
-    // bounce around (visible in Follow Player / Freeze Camera). The game reads
-    // this quat as the camera's roll around the look-at axis, which gives the
-    // tilted look — that IS the freecam look now; hold the Yaw key (MMB) and
-    // move the mouse to rotate left/right on demand.
-    cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
+    // Tilt look by default: write our own orientation quat so the vanilla
+    // bob/shake (sprint/landing acrobatics) never reaches the freecam — the
+    // game reads this quat as the camera's roll around the look-at axis, which
+    // gives the tilted look, and overwriting it every frame kills the acrobatic
+    // shake. Hold the Yaw key (MMB) to switch to the acrobatic-affected mode:
+    // leave the game's own quat alone so its bob/shake comes back, which is
+    // also what lets mouse X actually turn the camera left/right (yaw only
+    // rolls the horizon while we own the quat).
+    const bool yawing = (GetAsyncKeyState(m_YawKey) & 0x8000) != 0;
+    if (!yawing)
+        cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
 
     // Spin the game's own mixer to our pose so its next-frame solve can't
     // fight us. Center = one unit ahead along the view ray, distance 1, so the
