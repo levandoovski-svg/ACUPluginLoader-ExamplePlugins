@@ -50,7 +50,10 @@ static float ClampFloat(float value, float min_, float max_)
 //   TILT (default): write our own orientation quat. The game reads
 //   quaternion_mb as the camera's roll around the look-at axis, which gives
 //   the tilted look AND suppresses the vanilla acrobatics bob/shake. Mouse X
-//   yaw rolls the horizon here — expected; use Orbit for clean turning.
+//   yaw rolls the horizon here — expected; use Orbit for clean turning. The
+//   roll amount is controllable (TESTOUT "Roll / tilt" slider) and is
+//   re-derived from the game camera at entry so the camera doesn't spawn
+//   sideways.
 //   ORBIT: never write quaternion_mb; the game's own spinaround solve (synced
 //   in ApplyFreeCamera) turns yaw into a clean horizontal rotation around the
 //   look target (Arno in Follow Player). Tradeoff: acrobatics bob/shake is
@@ -71,7 +74,9 @@ static Vector4f QuaternionFromBasis(const Vector3f& right, const Vector3f& up, c
 // Basis for the free-camera look direction. Uses IDENTICAL yaw/pitch math to
 // the forward vector used for movement and look-at, so pose and orientation
 // never disagree (a mismatch is what made the camera shudder in an old build).
-static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
+// `roll` (radians) rotates the basis around the forward axis — the tilt the
+// game shows when it reads our quat as roll around the look-at axis.
+static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch, float roll)
 {
     const float cp = cosf(pitch), sp = sinf(pitch);
     const float cy = cosf(yaw), sy = sinf(yaw);
@@ -82,7 +87,51 @@ static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
         fwd.y * right.z - fwd.z * right.y,
         fwd.z * right.x - fwd.x * right.z,
         fwd.x * right.y - fwd.y * right.x);
-    return QuaternionFromBasis(right, up, fwd);
+
+    // Apply the tilt (roll around the look axis) to the up/right pair.
+    const float cr = cosf(roll), sr = sinf(roll);
+    const float rx = right.x * cr + up.x * sr;
+    const float ry = right.y * cr + up.y * sr;
+    const float rz = right.z * cr + up.z * sr;
+    const float ux = -right.x * sr + up.x * cr;
+    const float uy = -right.y * sr + up.y * cr;
+    const float uz = -right.z * sr + up.z * cr;
+
+    return QuaternionFromBasis(Vector3f(rx, ry, rz), Vector3f(ux, uy, uz), fwd);
+}
+
+// Measure how much the game's own camera orientation is rolled around the look
+// axis relative to OUR level basis for (yaw, pitch). Used at entry so the
+// TILT look starts on the game's actual orientation instead of sideways.
+// Returns 0 for degenerate input.
+static float ExtractRollFromQuat(const Vector4f& quat, float yaw, float pitch)
+{
+    if (!std::isfinite(quat.x) || !std::isfinite(quat.y) ||
+        !std::isfinite(quat.z) || !std::isfinite(quat.w))
+        return 0.0f;
+
+    const float cp = cosf(pitch), sp = sinf(pitch);
+    const float cy = cosf(yaw), sy = sinf(yaw);
+    Vector3f fwd(sy * cp, sp, cy * cp);
+    Vector3f right(cy, 0.0f, -sy);
+    Vector3f up(
+        fwd.y * right.z - fwd.z * right.y,
+        fwd.z * right.x - fwd.x * right.z,
+        fwd.x * right.y - fwd.y * right.x);
+
+    // Camera local up (0,1,0) rotated into world by the game quat:
+    //   t = 2 * (qv x v),  vrot = v + qw*t + qv x t
+    const Vector3f qv(quat.x, quat.y, quat.z);
+    const float tx = -2.0f * quat.z; // qv x (0,1,0) = (-qz, 0, qx)
+    const float tz = 2.0f * quat.x;
+    const float vx = quat.w * tx + (quat.y * tz - quat.z * 0.0f);
+    const float vy = 1.0f + (quat.z * tx - quat.x * tz);
+    const float vz = quat.w * tz + (quat.x * 0.0f - quat.y * tx);
+
+    const float alongUp = vx * up.x + vy * up.y + vz * up.z;
+    const float alongRight = vx * right.x + vy * right.y + vz * right.z;
+    if (alongUp == 0.0f && alongRight == 0.0f) return 0.0f;
+    return atan2f(alongRight, alongUp);
 }
 
 // ============================================================
@@ -152,37 +201,45 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
 
     const Vector3f lookTarget = m_FreeCamPos + fwd;
 
-    cam->positionLookFrom = Vector4f(m_FreeCamPos, 1.0f);
-    cam->locationLookat_A90 = Vector4f(lookTarget, 1.0f);
-    cam->fov_mb_pi_4 = m_Fov;
-    cam->fovPrecalc = m_Fov * (PI / 4.0f);
-
-    // Spin the game's own mixer to our pose so its next-frame solve can't
-    // fight us (both look modes). Center = one unit ahead along the view ray,
-    // distance 1, so the game's solver places the camera exactly at our
-    // position looking at lookTarget — using ITS conventions.
-    cam->spinaroundAngleZtarget = m_Yaw;
-    cam->spinaroundAngleUpDownTarget = ClampFloat(m_Pitch, -VERTICAL_LIMIT, VERTICAL_LIMIT);
-    cam->distFromSpinaround_mb = 1.0f;
-    cam->locationSpinaround_AA0 = Vector4f(lookTarget, 1.0f);
-
-    if (m_OrbitMode)
+    // Every write below is individually toggleable from the TESTOUT section so
+    // you can isolate which component the game is fighting.
+    if (m_WritePose)
     {
-        // ORBIT MODE (checkbox / Orbit key): ride the game's OWN orientation.
-        // Never write quaternion_mb — the game reads any quat we write as roll
-        // around the look-at axis (tilt + yaw becomes roll, killing L/R
-        // rotation). Leaving it to the game's spinaround solve is the only
-        // configuration with clean horizontal turning (proven builds).
+        cam->positionLookFrom = Vector4f(m_FreeCamPos, 1.0f);
+        cam->locationLookat_A90 = Vector4f(lookTarget, 1.0f);
     }
-    else
+
+    if (m_WriteFov)
     {
-        // TILT MODE (default free cam): write our own orientation quat. The
-        // game reads it as roll around the look-at axis — the tilted look, and
-        // overwriting it every frame suppresses the vanilla acrobatics
-        // bob/shake. Mouse X yaw rolls the horizon here; toggle Orbit for
-        // clean left/right rotation.
-        cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
+        cam->fov_mb_pi_4 = m_Fov;
+        cam->fovPrecalc = m_Fov * (PI / 4.0f);
     }
+
+    if (m_SyncSpinaround)
+    {
+        // Feed the game's own spinaround mixer so its next-frame solve can't
+        // fight us. Center = one unit ahead along the view ray, distance 1, so
+        // the game's solver places the camera exactly at our position looking
+        // at lookTarget — using ITS conventions.
+        cam->spinaroundAngleZtarget = m_Yaw;
+        cam->spinaroundAngleUpDownTarget = ClampFloat(m_Pitch, -VERTICAL_LIMIT, VERTICAL_LIMIT);
+        cam->distFromSpinaround_mb = 1.0f;
+        cam->locationSpinaround_AA0 = Vector4f(lookTarget, 1.0f);
+    }
+
+    if (!m_OrbitMode)
+    {
+        // TILT look: write our own orientation quat. The game reads it as roll
+        // around the look-at axis — the tilted look (roll amount from the
+        // TESTOUT slider), and overwriting it every frame suppresses the
+        // vanilla acrobatics bob/shake. Mouse X yaw rolls the horizon here;
+        // toggle Orbit for clean left/right rotation.
+        cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch, m_Roll);
+    }
+    // ORBIT look (checkbox / Orbit key): never write quaternion_mb — any quat
+    // we write is read as roll around the look-at axis (tilt + yaw becomes
+    // roll, killing L/R rotation). Leaving it to the game's spinaround solve
+    // is the only configuration with clean horizontal turning (proven builds).
 
     if (m_DisableSmoothing)
         cam->disableCameraSmoothingForThisFrame = 1;
@@ -221,6 +278,14 @@ void PhotoModePlugin::LoadSettings()
             try { m_OrbitKey = std::stoi(line.substr(9), nullptr, 16); } catch (...) {}
         else if (line.rfind("OrbitMode=", 0) == 0)
             m_OrbitMode = (line.substr(10) == "1");
+        else if (line.rfind("SyncSpinaround=", 0) == 0)
+            m_SyncSpinaround = (line.substr(15) == "1");
+        else if (line.rfind("WritePose=", 0) == 0)
+            m_WritePose = (line.substr(10) == "1");
+        else if (line.rfind("WriteFov=", 0) == 0)
+            m_WriteFov = (line.substr(9) == "1");
+        else if (line.rfind("SnapRollFromGame=", 0) == 0)
+            m_SnapRollFromGame = (line.substr(17) == "1");
         else if (line.rfind("FreezeWorld=", 0) == 0)
             m_FreezeWorld = (line.substr(12) == "1");
         else if (line.rfind("HidePlayer=", 0) == 0)
@@ -263,7 +328,11 @@ void PhotoModePlugin::SaveSettings()
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
                  << "InvertY=" << (m_InvertY ? 1 : 0) << "\n"
-                 << "DisableSmoothing=" << (m_DisableSmoothing ? 1 : 0) << "\n";
+                 << "DisableSmoothing=" << (m_DisableSmoothing ? 1 : 0) << "\n"
+                 << "SyncSpinaround=" << (m_SyncSpinaround ? 1 : 0) << "\n"
+                 << "WritePose=" << (m_WritePose ? 1 : 0) << "\n"
+                 << "WriteFov=" << (m_WriteFov ? 1 : 0) << "\n"
+                 << "SnapRollFromGame=" << (m_SnapRollFromGame ? 1 : 0) << "\n";
         }
     } catch (...) {}
 }
@@ -319,6 +388,8 @@ void PhotoModePlugin::SnapCameraFromGame()
             m_SnapshotPitch = ClampFloat(asinf(look.y / len), -VERTICAL_LIMIT, VERTICAL_LIMIT);
         }
 
+        m_SnapshotRoll = ExtractRollFromQuat(cam->quaternion_mb, m_SnapshotYaw, m_SnapshotPitch);
+
         Entity* player = ACU::GetPlayer();
         if (player && m_SnapshotPos.x == 0.0f && m_SnapshotPos.y == 0.0f && m_SnapshotPos.z == 0.0f)
             m_SnapshotPos = player->GetPosition();
@@ -337,6 +408,7 @@ void PhotoModePlugin::EnterFreeMode()
     m_Yaw = m_SnapshotYaw;
     m_Pitch = m_SnapshotPitch;
     m_Fov = m_SnapshotFov;
+    m_Roll = m_SnapRollFromGame ? m_SnapshotRoll : 0.0f;
 
     if (m_FollowPlayer)
     {
@@ -374,6 +446,7 @@ void PhotoModePlugin::ResetCamera()
         m_Yaw = m_SnapshotYaw;
         m_Pitch = m_SnapshotPitch;
         m_Fov = m_SnapshotFov;
+        m_Roll = m_SnapRollFromGame ? m_SnapshotRoll : 0.0f;
         if (m_FollowPlayer && m_Mode == Mode::Free)
         {
             Entity* player = ACU::GetPlayer();
@@ -529,6 +602,7 @@ int PhotoModePlugin::SaveCurrentCameraSlot()
     m_Slots[slot].pos = m_FreeCamPos;
     m_Slots[slot].yaw = m_Yaw;
     m_Slots[slot].pitch = m_Pitch;
+    m_Slots[slot].roll = m_Roll;
     m_Slots[slot].fov = m_Fov;
     m_ActiveSlot = slot;
     return slot;
@@ -540,6 +614,7 @@ void PhotoModePlugin::ApplyCameraSlot(int index)
     m_FreeCamPos = m_Slots[index].pos;
     m_Yaw = m_Slots[index].yaw;
     m_Pitch = m_Slots[index].pitch;
+    m_Roll = m_Slots[index].roll;
     m_Fov = m_Slots[index].fov;
     m_ActiveSlot = index;
     if (m_FollowPlayer && m_Mode == Mode::Free)
@@ -755,6 +830,36 @@ void PhotoModePlugin::OnImGuiRender()
 
     ImGui::Separator();
 
+    ImGui::TextDisabled("TESTOUT — camera component knobs (diagnostic)");
+    {
+        bool writeQuat = !m_OrbitMode;
+        if (ImGui::Checkbox("Write orientation quat (checked = TILT look)", &writeQuat))
+        {
+            m_OrbitMode = !writeQuat;
+            SaveSettings();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "TILT: we write the orientation every frame — tilted look, no\n"
+                "acrobatic bob, but yaw rolls the horizon.\n"
+                "ORBIT: the game keeps its own orientation — clean left/right\n"
+                "rotation around the look target, bob/shake can show.");
+        if (ImGui::Checkbox("Sync spinaround mixer", &m_SyncSpinaround)) SaveSettings();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Feeds the game's own spinaround solver our yaw/pitch/center\nso its per-frame solve can't fight our pose. Uncheck to isolate.");
+        if (ImGui::Checkbox("Write position & lookat", &m_WritePose)) SaveSettings();
+        if (ImGui::Checkbox("Write FOV", &m_WriteFov)) SaveSettings();
+        if (ImGui::Checkbox("Match game roll at entry", &m_SnapRollFromGame)) SaveSettings();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("On: entering Free mode takes the tilt from the game camera\n(no sideways spawn). Off: start level and dial your own tilt.");
+        if (ImGui::SliderFloat("Roll / tilt (radians)", &m_Roll, -PI, PI, "%.3f"))
+            m_Roll = ClampFloat(m_Roll, -PI, PI);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Tilt around the look axis for the TILT look. Live; re-derived\nfrom the game camera on each entry when Match roll is on.\nSaved camera poses also store this.");
+    }
+
+    ImGui::Separator();
+
     ImGui::TextDisabled("SAVED CAMERAS");
     if (ImGui::Button("Save Current Pose"))
         SaveCurrentCameraSlot();
@@ -813,7 +918,7 @@ void PhotoModePlugin::OnImGuiRender()
             Vector3f p = player->GetPosition();
             ImGui::Text("Player pos: %.1f, %.1f, %.1f", p.x, p.y, p.z);
         }
-        ImGui::Text("Yaw: %.2f  Pitch: %.2f  FOV: %.2f", m_Yaw, m_Pitch, m_Fov);
+        ImGui::Text("Yaw: %.2f  Pitch: %.2f  Roll: %.2f  FOV: %.2f", m_Yaw, m_Pitch, m_Roll, m_Fov);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 
     ImGui::Unindent();

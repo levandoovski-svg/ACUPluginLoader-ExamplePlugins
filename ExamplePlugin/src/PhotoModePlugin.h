@@ -97,6 +97,7 @@ private:
         Vector3f pos;
         float yaw = 0.0f;
         float pitch = 0.45f;
+        float roll = 0.0f;
         float fov = 1.0f;
     };
     CameraSlot m_Slots[9];
@@ -110,6 +111,7 @@ private:
     Vector3f m_SnapshotPos;
     float m_SnapshotYaw = 0.0f;
     float m_SnapshotPitch = 0.45f;
+    float m_SnapshotRoll = 0.0f;   // Extracted from the game quat at entry.
     float m_SnapshotFov = 1.0f;
 
     // Options.
@@ -119,6 +121,11 @@ private:
     bool m_FreezeCamera = false;        // Free mode: lock camera pose, play without moving it.
     bool m_FreezeAllowLook = false;     // Free mode + Freeze Camera: mouse can still look around.
     bool m_OrbitMode = false;           // Free mode look: false=TILT (quat, no acrobatics), true=ORBIT (clean L/R).
+    bool m_SyncSpinaround = true;       // TESTOUT: feed the game's spinaround mixer.
+    bool m_WritePose = true;            // TESTOUT: write position & lookat.
+    bool m_WriteFov = true;             // TESTOUT: write FOV fields.
+    bool m_SnapRollFromGame = true;     // TESTOUT: take entry tilt from the game camera.
+    float m_Roll = 0.0f;                // Tilt around the look axis (radians), TILT look.
     float m_MoveSpeed = 4.0f;           // Free mode: world units / second.
     float m_MouseSensitivity = 0.003f;  // Same default as FreeCameraRotation.
     bool m_InvertX = false;
