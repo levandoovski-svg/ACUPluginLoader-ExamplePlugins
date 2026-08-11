@@ -80,6 +80,7 @@ private:
 
     // Plugin-owned camera state.
     Vector3f m_FreeCamPos;   // Free mode: absolute camera position.
+    Vector3f m_FollowOffset; // Free mode + Follow Player: camera offset from Arno.
     float m_Yaw = 0.0f;      // Horizontal orbit angle (both modes).
     float m_Pitch = 0.45f;   // Vertical orbit angle (both modes).
     float m_Distance = 4.0f; // Cinematic mode: distance from the player.
@@ -93,10 +94,13 @@ private:
     float m_SnapshotPitch = 0.45f;
     float m_SnapshotDistance = 4.0f;
     float m_SnapshotFov = 1.0f;
+    float m_SnapshotSpinZ = 0.0f;
+    float m_SnapshotSpinUpDown = 0.45f;
 
     // Options.
     bool m_FreezeWorld = true;          // Free mode: timescale 0.
     bool m_HidePlayer = false;          // Free mode: hide Arno (clean shots).
+    bool m_FollowPlayer = false;        // Free mode: camera tracks Arno, world stays live.
     bool m_SlowMotion = false;          // Cinematic mode: slow timescale.
     float m_SlowMotionTimescale = 0.30f;
     float m_MoveSpeed = 4.0f;           // Free mode: world units / second.

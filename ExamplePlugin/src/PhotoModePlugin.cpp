@@ -47,6 +47,65 @@ static float ClampFloat(float value, float min_, float max_)
     return value;
 }
 
+// Convert a camera basis (right, up, fwd — unit, pairwise orthogonal) to the
+// orientation quaternion the game stores in quaternion_mb (Vector4f x,y,z,w).
+// Solved from the rotation-matrix trace / off-diagonal differences.
+static Vector4f QuaternionFromBasis(const Vector3f& right, const Vector3f& up, const Vector3f& fwd)
+{
+    const float trace = right.x + up.y + fwd.z;
+    float w = sqrtf(fmaxf(0.0f, 1.0f + trace)) * 0.5f;
+    if (w < 0.05f) w = 0.05f;
+    const float inv = 0.25f / w;
+    const float x = (up.z - fwd.y) * inv;
+    const float y = (fwd.x - right.z) * inv;
+    const float z = (right.y - up.x) * inv;
+    return Vector4f(x, y, z, w);
+}
+
+// Basis for the free-camera look direction. Uses IDENTICAL yaw/pitch math to
+// the forward vector used for movement and look-at, so pose and orientation
+// never disagree (the old code wrote pose but left the game's own orientation
+// untouched — that mismatch is what made the camera shudder).
+static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
+{
+    const float cp = cosf(pitch), sp = sinf(pitch);
+    const float cy = cosf(yaw), sy = sinf(yaw);
+
+    Vector3f fwd(sy * cp, sp, cy * cp);
+    Vector3f right(cy, 0.0f, -sy);
+    Vector3f up(
+        fwd.y * right.z - fwd.z * right.y,
+        fwd.z * right.x - fwd.x * right.z,
+        fwd.x * right.y - fwd.y * right.x);
+    return QuaternionFromBasis(right, up, fwd);
+}
+
+// Basis for "eye looks toward target" (cinematic follow looks INWARD at the
+// player — the orientation must encode the actual view ray, not the orbit
+// angle, or the game's orientation fights ours and the view shakes).
+static Vector4f BuildLookAtQuaternion(const Vector3f& eye, const Vector3f& target)
+{
+    Vector3f fwd = target - eye;
+    const float len = fwd.length();
+    if (len < 0.0001f) return Vector4f(0.0f, 0.0f, 0.0f, 1.0f);
+    fwd = fwd * (1.0f / len);
+
+    const Vector3f worldUp(0.0f, 1.0f, 0.0f);
+    Vector3f right(
+        worldUp.y * fwd.z - worldUp.z * fwd.y,
+        worldUp.z * fwd.x - worldUp.x * fwd.z,
+        worldUp.x * fwd.y - worldUp.y * fwd.x);
+    const float rlen = right.length();
+    if (rlen < 0.0001f) right = Vector3f(1.0f, 0.0f, 0.0f);
+    else right = right * (1.0f / rlen);
+
+    Vector3f up(
+        fwd.y * right.z - fwd.z * right.y,
+        fwd.z * right.x - fwd.x * right.z,
+        fwd.x * right.y - fwd.y * right.x);
+    return QuaternionFromBasis(right, up, fwd);
+}
+
 // ============================================================
 // Camera hook: 0x141F3FE3B ("when setting FOV for frame").
 // ACUFixes FreezeFOV hooks the same site with executeStolenBytes=false.
@@ -115,8 +174,17 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
 
     cam->positionLookFrom = Vector4f(m_FreeCamPos, 1.0f);
     cam->locationLookat_A90 = Vector4f(m_FreeCamPos + fwd, 1.0f);
+    cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
     cam->fov_mb_pi_4 = m_Fov;
     cam->fovPrecalc = m_Fov * (PI / 4.0f);
+
+    // Sync the game's spinaround mixer to our angles so its next-frame solve
+    // (which runs every frame regardless of our override) can't fight us.
+    cam->spinaroundAngleZtarget = m_Yaw;
+    cam->spinaroundAngleUpDownTarget = ClampFloat(m_Pitch, -VERTICAL_LIMIT, VERTICAL_LIMIT);
+    cam->distFromSpinaround_mb = m_Distance;
+    cam->locationSpinaround_AA0 = Vector4f(m_FreeCamPos, 1.0f);
+
     if (m_DisableSmoothing)
         cam->disableCameraSmoothingForThisFrame = 1;
 }
@@ -141,10 +209,21 @@ void PhotoModePlugin::ApplyCinematicCamera(ACUPlayerCameraComponent* cam)
         m_Distance * sinf(m_Pitch),
         m_Distance * cv * cosf(m_Yaw));
 
-    cam->positionLookFrom = Vector4f(playerPos + offset, 1.0f);
-    cam->locationLookat_A90 = Vector4f(playerPos + Vector3f(0.0f, 1.5f, 0.0f), 1.0f);
+    const Vector3f camPos = playerPos + offset;
+    const Vector3f lookTarget = playerPos + Vector3f(0.0f, 1.5f, 0.0f);
+
+    cam->positionLookFrom = Vector4f(camPos, 1.0f);
+    cam->locationLookat_A90 = Vector4f(lookTarget, 1.0f);
+    cam->quaternion_mb = BuildLookAtQuaternion(camPos, lookTarget);
     cam->fov_mb_pi_4 = m_Fov;
     cam->fovPrecalc = m_Fov * (PI / 4.0f);
+
+    // Sync the game's spinaround mixer so its next-frame solve can't fight us.
+    cam->spinaroundAngleZtarget = m_Yaw;
+    cam->spinaroundAngleUpDownTarget = ClampFloat(m_Pitch, -VERTICAL_LIMIT, VERTICAL_LIMIT);
+    cam->distFromSpinaround_mb = m_Distance;
+    cam->locationSpinaround_AA0 = Vector4f(playerPos, 1.0f);
+
     if (m_DisableSmoothing)
         cam->disableCameraSmoothingForThisFrame = 1;
 }
@@ -181,6 +260,8 @@ void PhotoModePlugin::LoadSettings()
             m_FreezeWorld = (line.substr(12) == "1");
         else if (line.rfind("HidePlayer=", 0) == 0)
             m_HidePlayer = (line.substr(11) == "1");
+        else if (line.rfind("FollowPlayer=", 0) == 0)
+            m_FollowPlayer = (line.substr(13) == "1");
         else if (line.rfind("SlowMotion=", 0) == 0)
             m_SlowMotion = (line.substr(11) == "1");
         else if (line.rfind("SlowMotionTimescale=", 0) == 0)
@@ -209,6 +290,7 @@ void PhotoModePlugin::SaveSettings()
                  << "ResetKey=" << std::hex << m_ResetKey << std::dec << "\n"
                  << "FreezeWorld=" << (m_FreezeWorld ? 1 : 0) << "\n"
                  << "HidePlayer=" << (m_HidePlayer ? 1 : 0) << "\n"
+                 << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
                  << "SlowMotion=" << (m_SlowMotion ? 1 : 0) << "\n"
                  << "SlowMotionTimescale=" << m_SlowMotionTimescale << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
@@ -259,6 +341,8 @@ void PhotoModePlugin::SnapCameraFromGame()
     {
         m_SnapshotPos = (Vector3f&)cam->positionLookFrom;
         m_SnapshotFov = cam->fov_mb_pi_4 > 0.2f ? cam->fov_mb_pi_4 : 1.0f;
+        m_SnapshotSpinZ = cam->spinaroundAngleZtarget;
+        m_SnapshotSpinUpDown = cam->spinaroundAngleUpDownTarget;
 
         Vector3f look(
             cam->locationLookat_A90.x - cam->positionLookFrom.x,
@@ -295,6 +379,15 @@ void PhotoModePlugin::EnterFreeMode()
     m_Yaw = m_SnapshotYaw;
     m_Pitch = m_SnapshotPitch;
     m_Fov = m_SnapshotFov;
+
+    if (m_FollowPlayer)
+    {
+        Entity* player = ACU::GetPlayer();
+        if (player)
+            m_FollowOffset = m_FreeCamPos - player->GetPosition();
+        // Follow Player keeps the world live so Arno stays controllable.
+        m_FreezeWorld = false;
+    }
 
     m_Mode = Mode::Free;
     m_LastTick = GetTickCount64();
@@ -339,6 +432,12 @@ void PhotoModePlugin::ResetCamera()
         m_Pitch = m_SnapshotPitch;
         m_Distance = m_SnapshotDistance;
         m_Fov = m_SnapshotFov;
+        if (m_FollowPlayer && m_Mode == Mode::Free)
+        {
+            Entity* player = ACU::GetPlayer();
+            if (player)
+                m_FollowOffset = m_SnapshotPos - player->GetPosition();
+        }
     }
 }
 
@@ -369,9 +468,10 @@ bool PhotoModePlugin::IsRisingEdgePressed(int vkCode)
 
 void PhotoModePlugin::UpdateFreeInput(float dt)
 {
-    // Timescale sync (live "Freeze World" checkbox).
-    if (m_FreezeWorld && !m_TimescaleApplied) { SetWorldTimescale(0.0f); m_TimescaleApplied = true; }
-    else if (!m_FreezeWorld && m_TimescaleApplied) { SetWorldTimescale(1.0f); m_TimescaleApplied = false; }
+    // Timescale sync (live "Freeze World" checkbox). Follow Player keeps the
+    // world live so Arno can be controlled during freecam.
+    if (m_FreezeWorld && !m_FollowPlayer && !m_TimescaleApplied) { SetWorldTimescale(0.0f); m_TimescaleApplied = true; }
+    else if ((!m_FreezeWorld || m_FollowPlayer) && m_TimescaleApplied) { SetWorldTimescale(1.0f); m_TimescaleApplied = false; }
 
     // Player visibility sync (live "Hide Player" checkbox).
     if (m_HidePlayer && !m_PlayerHidden) ApplyHidePlayer();
@@ -399,6 +499,15 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
             m_Fov = ClampFloat(m_Fov + (wheel > 0 ? 0.05f : -0.05f), MIN_FOV, MAX_FOV);
     }
 
+    // Follow Player: re-anchor to Arno (he may have moved since last frame)
+    // BEFORE applying our own movement, using the saved offset.
+    if (m_FollowPlayer)
+    {
+        Entity* player = ACU::GetPlayer();
+        if (player)
+            m_FreeCamPos = player->GetPosition() + m_FollowOffset;
+    }
+
     // WASD/QE fly. Movement is along the camera plane (flat forward/right),
     // independent of the game clock (world may be frozen at timescale 0).
     float speed = m_MoveSpeed;
@@ -424,6 +533,15 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
         m_FreeCamPos.x += moveX * step;
         m_FreeCamPos.y += moveY * step;
         m_FreeCamPos.z += moveZ * step;
+    }
+
+    // Follow Player: capture the new offset so the anchor next frame preserves
+    // where we moved the camera relative to Arno.
+    if (m_FollowPlayer)
+    {
+        Entity* player = ACU::GetPlayer();
+        if (player)
+            m_FollowOffset = m_FreeCamPos - player->GetPosition();
     }
 }
 
@@ -571,8 +689,27 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::Separator();
 
     ImGui::TextDisabled("FREE CAMERA (F9)");
+    if (m_FollowPlayer)
+        ImGui::BeginDisabled();
     if (ImGui::Checkbox("Freeze World", &m_FreezeWorld)) SaveSettings();
+    if (m_FollowPlayer)
+    {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Disabled while Follow Player is on (the world must stay live so Arno can move).");
+    }
     if (ImGui::Checkbox("Hide Player", &m_HidePlayer)) SaveSettings();
+    if (ImGui::Checkbox("Follow Player", &m_FollowPlayer))
+    {
+        if (m_FollowPlayer) m_FreezeWorld = false;
+        SaveSettings();
+    }
+    if (m_FollowPlayer)
+    {
+        ImGui::Indent();
+        ImGui::TextDisabled("Camera tracks Arno as he runs; world stays live.");
+        ImGui::Unindent();
+    }
     if (ImGui::SliderFloat("Move Speed", &m_MoveSpeed, 0.5f, 20.0f, "%.1f")) SaveSettings();
 
     ImGui::Separator();
