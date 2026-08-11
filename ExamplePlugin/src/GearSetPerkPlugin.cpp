@@ -7,6 +7,7 @@
 #include "ACU/AvatarGearManager.h"
 #include "ACU/AvatarGear.h"
 #include "ACU/LocalizationManager.h"
+#include "ACU/Entity.h" // PlayerProgressionManager.h references SharedPtrNew<Entity>
 #include "ACU/PlayerProgressionManager.h"
 
 // ===========================================================================
@@ -71,6 +72,15 @@ static void CopyName(char dst[64], const wchar_t* w)
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, dst, 63, nullptr, nullptr);
     if (n <= 0) { dst[0] = '?'; dst[1] = 0; }
     else { dst[63] = 0; }
+}
+
+// Resolve a UIString to its localized text. The ACU_WStringBuffer must NOT live
+// inside a __try function (C2712: SEH + object unwinding), so it lives here and
+// the __try in the caller catches any fault raised during resolution.
+static void ResolveNameInto(UIString uiString, char dst[64])
+{
+    ACU_WStringBuffer wb{ uiString };
+    CopyName(dst, wb.m_buf);
 }
 
 static bool TextContainsMusketeer(const char* s)
@@ -192,8 +202,7 @@ void GearSetPerkPlugin::OnUpdate()
             m_Debug_SlotGearType[i] = g->gearType;
 
             // resolved display name of the gear itself
-            ACU_WStringBuffer gearName{ g->uiString_gearName };
-            CopyName(m_Debug_SlotNames[i], gearName.m_buf);
+            ResolveNameInto(g->uiString_gearName, m_Debug_SlotNames[i]);
 
             // the InventoryItemSettings it references (ItemName is a different
             // UIString - second candidate fingerprint for detection)
@@ -203,8 +212,7 @@ void GearSetPerkPlugin::OnUpdate()
                 if (settings)
                 {
                     m_Debug_SlotSettingsLineId[i] = settings->ItemName.stringID;
-                    ACU_WStringBuffer settingsName{ settings->ItemName };
-                    CopyName(m_Debug_SlotSettingsNames[i], settingsName.m_buf);
+                    ResolveNameInto(settings->ItemName, m_Debug_SlotSettingsNames[i]);
                 }
             }
 
@@ -246,8 +254,7 @@ void GearSetPerkPlugin::OnUpdate()
                         InventoryItemSettings* settings = sp->GetPtr();
                         if (!settings) { continue; }
                         m_Debug_LoadoutLineIds[i] = settings->ItemName.stringID;
-                        ACU_WStringBuffer loadoutName{ settings->ItemName };
-                        CopyName(m_Debug_LoadoutNames[i], loadoutName.m_buf);
+                        ResolveNameInto(settings->ItemName, m_Debug_LoadoutNames[i]);
                         m_Debug_LoadoutCount++;
                         if (TextContainsMusketeer(m_Debug_LoadoutNames[i])) { m_Debug_LoadoutMusketeerCount++; }
                     }
@@ -372,7 +379,7 @@ void GearSetPerkPlugin::OnImGuiRender()
                 m_Debug_SlotNames[i][0] ? m_Debug_SlotNames[i] : "?");
             if (m_Debug_SlotSettingsNames[i][0])
             {
-                ImGui::Text("    settings: lineID=%6u  %s", m_Debug_SlotSettingsLineIds[i], m_Debug_SlotSettingsNames[i]);
+                ImGui::Text("    settings: lineID=%6u  %s", m_Debug_SlotSettingsLineId[i], m_Debug_SlotSettingsNames[i]);
             }
         }
     }
