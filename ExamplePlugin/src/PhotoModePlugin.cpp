@@ -78,33 +78,10 @@ static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
     return QuaternionFromBasis(right, up, fwd);
 }
 
-// Level-horizon orientation for the free camera: same look basis as above but
-// keeps the horizon flat for ANY yaw (up stays closest to world up), with an
-// optional static roll around the view axis (degrees). Used in normal freecam
-// so the game's sprint/landing bob is overridden while mouse-yaw still turns
-// horizontally with no tilt.
-static Vector4f BuildLevelFreeCameraQuaternion(float yaw, float pitch, float rollDegrees)
-{
-    const float cp = cosf(pitch), sp = sinf(pitch);
-    const float cy = cosf(yaw), sy = sinf(yaw);
-
-    Vector3f fwd(sy * cp, sp, cy * cp);
-    Vector3f right(cy, 0.0f, -sy);
-    Vector3f up(
-        fwd.y * right.z - fwd.z * right.y,
-        fwd.z * right.x - fwd.x * right.z,
-        fwd.x * right.y - fwd.y * right.x);
-
-    if (rollDegrees != 0.0f)
-    {
-        const float phi = rollDegrees * (PI / 180.0f);
-        const float cr = cosf(phi), sr = sinf(phi);
-        const Vector3f rolledRight = right * cr + up * sr;
-        up = right * (-sr) + up * cr;
-        right = rolledRight;
-    }
-    return QuaternionFromBasis(right, up, fwd);
-}
+// Level-horizon orientation for the free camera — removed (v1.4): the game
+// reads quaternion_mb as the camera's roll around the look-at axis, so any
+// quat we write produces the tilted look. We now embrace that: the tilt look
+// IS the freecam look, and left/right rotation is a held-key action instead.
 
 // Basis for "eye looks toward target" — removed with Cinematic mode (the free
 // camera drives orientation via the game's spinaround solver instead).
@@ -183,13 +160,11 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
 
     // ALWAYS override the orientation quaternion: the vanilla camera bakes
     // sprint/landing bob and shake into it, so leaving it alone lets freecam
-    // bounce around (visible in Follow Player / Freeze Camera). Tilt Mode keeps
-    // the old rolled look; normal freecam writes a level-horizon quaternion,
-    // optionally rolled by m_TiltAngle (carry-over from Tilt Mode).
-    if (m_TiltMode)
-        cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
-    else
-        cam->quaternion_mb = BuildLevelFreeCameraQuaternion(m_Yaw, m_Pitch, m_TiltAngle);
+    // bounce around (visible in Follow Player / Freeze Camera). The game reads
+    // this quat as the camera's roll around the look-at axis, which gives the
+    // tilted look — that IS the freecam look now; hold the Yaw key (MMB) and
+    // move the mouse to rotate left/right on demand.
+    cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
 
     // Spin the game's own mixer to our pose so its next-frame solve can't
     // fight us. Center = one unit ahead along the view ray, distance 1, so the
@@ -239,10 +214,10 @@ void PhotoModePlugin::LoadSettings()
             m_HidePlayer = (line.substr(11) == "1");
         else if (line.rfind("FollowPlayer=", 0) == 0)
             m_FollowPlayer = (line.substr(13) == "1");
-        else if (line.rfind("TiltMode=", 0) == 0)
-            m_TiltMode = (line.substr(9) == "1");
-        else if (line.rfind("TiltAngle=", 0) == 0)
-            try { m_TiltAngle = std::stof(line.substr(10)); } catch (...) {}
+        else if (line.rfind("FreezeAllowLook=", 0) == 0)
+            m_FreezeAllowLook = (line.substr(16) == "1");
+        else if (line.rfind("YawKey=", 0) == 0)
+            try { m_YawKey = std::stoi(line.substr(7), nullptr, 16); } catch (...) {}
         else if (line.rfind("FreezeCamera=", 0) == 0)
             m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
@@ -270,8 +245,8 @@ void PhotoModePlugin::SaveSettings()
                  << "HidePlayer=" << (m_HidePlayer ? 1 : 0) << "\n"
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
                  << "FreezeCamera=" << (m_FreezeCamera ? 1 : 0) << "\n"
-                 << "TiltMode=" << (m_TiltMode ? 1 : 0) << "\n"
-                 << "TiltAngle=" << m_TiltAngle << "\n"
+                 << "FreezeAllowLook=" << (m_FreezeAllowLook ? 1 : 0) << "\n"
+                 << "YawKey=" << std::hex << m_YawKey << std::dec << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
@@ -433,28 +408,36 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     if (m_HidePlayer && !m_PlayerHidden) ApplyHidePlayer();
     else if (!m_HidePlayer && m_PlayerHidden) RestorePlayerVisibility();
 
-    // Freeze Camera: lock the pose in place — skip the mouse orbit and movement
-    // below so Arno can be played without nudging the camera. Follow Player
+    // Freeze Camera: lock the pose in place. "Allow Mouse Look" re-enables
+    // looking around (yaw/pitch) while the position stays frozen. Follow Player
     // takes priority (the camera then tracks Arno instead of freezing).
     const bool frozen = m_FreezeCamera && !m_FollowPlayer;
+    const bool lookBlocked = m_FollowPlayer || (frozen && !m_FreezeAllowLook);
 
-    // Mouse orbit + FOV wheel (ignored while frozen).
-    if (!frozen)
+    // Look input: mouse Y = pitch (always when not blocked); mouse X = yaw ONLY
+    // while the Yaw key (MMB by default) is held — freecam keeps the tilted
+    // look by default and you rotate left/right on demand. FOV wheel works
+    // unless look is blocked. Blocked entirely in Follow Player, and in Freeze
+    // Camera unless "Allow Mouse Look" is checked.
+    if (!lookBlocked)
     {
         auto* inp = ACU::Input::Get_InputContainerBig();
         if (inp)
         {
             const int dx = inp->mouseState.mouseDeltaIntForCamera_X;
             const int dy = inp->mouseState.mouseDeltaIntForCamera_Y;
-            if (dx != 0 || dy != 0)
+            if (dy != 0)
             {
-                const float xMult = m_InvertX ? 1.0f : -1.0f;
                 const float yMult = m_InvertY ? -1.0f : 1.0f;
-                m_Yaw += (float)dx * m_MouseSensitivity * xMult;
                 m_Pitch += (float)dy * m_MouseSensitivity * yMult;
-                m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
                 if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
                 if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+            }
+            if (dx != 0 && (GetAsyncKeyState(m_YawKey) & 0x8000))
+            {
+                const float xMult = m_InvertX ? 1.0f : -1.0f;
+                m_Yaw += (float)dx * m_MouseSensitivity * xMult;
+                m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
             }
 
             const int wheel = inp->mouseState.mouseWheelDeltaInt;
@@ -472,9 +455,9 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
             m_FreeCamPos = player->GetPosition() + m_FollowOffset;
     }
 
-    // Arrow-key / QE fly (ignored while frozen). Movement is along the camera
-    // plane (flat forward/right), independent of the game clock (world may be
-    // frozen at timescale 0).
+    // Position movement (ignored while frozen). Arrow keys always work —
+    // in Follow Player they reposition the camera relative to Arno. Q/E
+    // (up/down) is disabled in Follow Player so Arno's movement keys stay free.
     if (!frozen)
     {
         float speed = m_MoveSpeed;
@@ -491,8 +474,11 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
         if (GetAsyncKeyState(VK_DOWN) & 0x8000) { moveX -= fwdX; moveZ -= fwdZ; }
         if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { moveX += rightX; moveZ += rightZ; }
         if (GetAsyncKeyState(VK_LEFT) & 0x8000) { moveX -= rightX; moveZ -= rightZ; }
-        if (GetAsyncKeyState('E') & 0x8000) moveY += 1.0f;
-        if (GetAsyncKeyState('Q') & 0x8000) moveY -= 1.0f;
+        if (!m_FollowPlayer)
+        {
+            if (GetAsyncKeyState('E') & 0x8000) moveY += 1.0f;
+            if (GetAsyncKeyState('Q') & 0x8000) moveY -= 1.0f;
+        }
 
         if (moveX != 0.0f || moveY != 0.0f || moveZ != 0.0f)
         {
@@ -513,6 +499,58 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     }
 }
 
+// ============================================================
+// Saved camera poses (slots) — save current pose, jump to a slot,
+// cycle with ',' and '.'.
+// ============================================================
+int PhotoModePlugin::SaveCurrentCameraSlot()
+{
+    int slot = -1;
+    for (int i = 0; i < 9; ++i)
+        if (!m_Slots[i].used) { slot = i; break; }
+    if (slot < 0)
+        slot = (m_ActiveSlot >= 0) ? m_ActiveSlot : 0; // all full: overwrite active (or first)
+
+    m_Slots[slot].used = true;
+    m_Slots[slot].pos = m_FreeCamPos;
+    m_Slots[slot].yaw = m_Yaw;
+    m_Slots[slot].pitch = m_Pitch;
+    m_Slots[slot].fov = m_Fov;
+    m_ActiveSlot = slot;
+    return slot;
+}
+
+void PhotoModePlugin::ApplyCameraSlot(int index)
+{
+    if (index < 0 || index >= 9 || !m_Slots[index].used) return;
+    m_FreeCamPos = m_Slots[index].pos;
+    m_Yaw = m_Slots[index].yaw;
+    m_Pitch = m_Slots[index].pitch;
+    m_Fov = m_Slots[index].fov;
+    m_ActiveSlot = index;
+    if (m_FollowPlayer && m_Mode == Mode::Free)
+    {
+        Entity* player = ACU::GetPlayer();
+        if (player)
+            m_FollowOffset = m_FreeCamPos - player->GetPosition();
+    }
+}
+
+void PhotoModePlugin::CycleCameraSlots(int dir)
+{
+    if (dir == 0) return;
+    int i = m_ActiveSlot;
+    for (int step = 0; step < 9; ++step)
+    {
+        i = (i + dir + 9) % 9;
+        if (m_Slots[i].used)
+        {
+            ApplyCameraSlot(i);
+            return;
+        }
+    }
+}
+
 void PhotoModePlugin::OnUpdate()
 {
     if (!m_Enabled)
@@ -530,6 +568,7 @@ void PhotoModePlugin::OnUpdate()
             {
                 if (m_RebindTarget == 1) m_FreeCamKey = vk;
                 else if (m_RebindTarget == 3) m_ResetKey = vk;
+                else if (m_RebindTarget == 4) m_YawKey = vk;
                 m_WaitingForKey = false;
                 m_RebindTarget = 0;
                 SaveSettings();
@@ -551,6 +590,14 @@ void PhotoModePlugin::OnUpdate()
 
     m_PrevFreeDown = freeDown;
     m_PrevResetDown = resetDown;
+
+    // Saved-camera switching: ',' = previous slot, '.' = next slot.
+    const bool commaDown = (GetAsyncKeyState(VK_OEM_COMMA) & 0x8000) != 0;
+    const bool periodDown = (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) != 0;
+    if (commaDown && !m_PrevCommaDown && m_Mode != Mode::None) CycleCameraSlots(-1);
+    if (periodDown && !m_PrevPeriodDown && m_Mode != Mode::None) CycleCameraSlots(1);
+    m_PrevCommaDown = commaDown;
+    m_PrevPeriodDown = periodDown;
 
     if (m_Mode == Mode::None) return;
 
@@ -602,17 +649,30 @@ void PhotoModePlugin::OnImGuiRender()
         m_RebindTarget = 3;
     }
 
+    ImGui::Text("Yaw Hold:");
+    ImGui::SameLine();
+    ImGui::Text("0x%02X", m_YawKey);
+    ImGui::SameLine();
+    if (ImGui::Button(m_WaitingForKey && m_RebindTarget == 4 ? "Press any key..." : "Rebind##Yaw"))
+    {
+        m_WaitingForKey = true;
+        m_RebindTarget = 4;
+    }
+
     ImGui::Separator();
 
     ImGui::TextDisabled("CONTROLS");
     ImGui::BulletText("F9: toggle free camera");
     ImGui::BulletText("F11: reset camera to entry pose");
-    ImGui::BulletText("Mouse: look / orbit");
+    ImGui::BulletText("Mouse Y: look up / down");
+    ImGui::BulletText("Hold Yaw key (MMB) + mouse X: rotate left / right");
     ImGui::BulletText("Mouse wheel: FOV zoom");
     ImGui::BulletText("Arrow keys: move camera (forward/back/left/right)");
-    ImGui::BulletText("Q / E: move camera up / down");
+    ImGui::BulletText("Q / E: move camera up / down (disabled in Follow Player)");
     ImGui::BulletText("Shift: hold for 10x movement speed");
-    ImGui::BulletText("Freeze Camera on: mouse & arrows ignored");
+    ImGui::BulletText(", / .: switch between saved camera poses");
+    ImGui::BulletText("Follow Player on: mouse & Q/E locked, arrows still move");
+    ImGui::BulletText("Freeze Camera on: camera locked (Allow Mouse Look re-enables looking)");
 
     ImGui::Separator();
 
@@ -640,21 +700,9 @@ void PhotoModePlugin::OnImGuiRender()
     if (m_FreezeCamera)
     {
         ImGui::Indent();
-        ImGui::TextDisabled("Camera locked; move Arno without nudging the camera. Follow Player overrides this.");
+        if (ImGui::Checkbox("Allow Mouse Look", &m_FreezeAllowLook)) SaveSettings();
+        ImGui::TextDisabled("Position stays frozen; mouse can still look around.");
         ImGui::Unindent();
-    }
-    if (ImGui::Checkbox("Tilt Mode", &m_TiltMode)) SaveSettings();
-    if (m_TiltMode)
-    {
-        ImGui::Indent();
-        ImGui::TextDisabled("Mouse left/right rolls the camera (old tilted look).");
-        ImGui::Unindent();
-    }
-    if (!m_TiltMode)
-    {
-        if (ImGui::SliderFloat("Tilt Angle", &m_TiltAngle, -45.0f, 45.0f, "%.1f deg")) SaveSettings();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Static roll around the view axis in normal freecam — dial the angle in Tilt Mode by feel, then turn Tilt Mode off to carry it over.");
     }
     if (m_FollowPlayer)
     {
@@ -670,6 +718,37 @@ void PhotoModePlugin::OnImGuiRender()
     if (ImGui::Checkbox("Invert X", &m_InvertX)) SaveSettings();
     if (ImGui::Checkbox("Invert Y", &m_InvertY)) SaveSettings();
     if (ImGui::Checkbox("Disable Camera Smoothing", &m_DisableSmoothing)) SaveSettings();
+
+    ImGui::Separator();
+
+    ImGui::TextDisabled("SAVED CAMERAS");
+    if (ImGui::Button("Save Current Pose"))
+        SaveCurrentCameraSlot();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Stores the current position/angle/FOV into a free slot (overwrites the active slot when full).");
+    ImGui::SameLine();
+    if (ImGui::Button("Clear All"))
+    {
+        for (int i = 0; i < 9; ++i) m_Slots[i].used = false;
+        m_ActiveSlot = -1;
+    }
+    for (int i = 0; i < 9; ++i)
+    {
+        if (!m_Slots[i].used) continue;
+        char label[32];
+        sprintf_s(label, "Slot %d%s", i + 1, (m_ActiveSlot == i) ? " *" : "");
+        if (ImGui::Button(label))
+            ApplyCameraSlot(i);
+        ImGui::SameLine();
+        char clearLabel[32];
+        sprintf_s(clearLabel, "Clear##%d", i);
+        if (ImGui::Button(clearLabel))
+        {
+            m_Slots[i].used = false;
+            if (m_ActiveSlot == i) m_ActiveSlot = -1;
+        }
+    }
+    ImGui::TextDisabled("Switch between saved poses with ',' and '.'");
 
     ImGui::Separator();
 

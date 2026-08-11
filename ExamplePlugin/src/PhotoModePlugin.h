@@ -12,10 +12,11 @@ struct PhotoModeCameraHook;
 //
 // Camera takeover mode for Assassin's Creed Unity:
 //   Mode::Free - "Photo Mode": fly the camera anywhere (arrow keys + Q/E move,
-//                mouse orbit, wheel FOV), freeze the world, optional hidden
-//                player. Follow Player anchors the camera to Arno so he stays
-//                controllable during gameplay; Freeze Camera locks the pose in
-//                place; Tilt Mode enables the rolled look on mouse yaw.
+//                hold the Yaw key + mouse X to rotate, wheel FOV), freeze the
+//                world, optional hidden player. The camera keeps the tilted
+//                look (immune to vanilla acrobatics); Follow Player anchors it
+//                to Arno while you play; Freeze Camera locks the pose (optional
+//                mouse look); ',' / '.' switch between saved camera poses.
 //
 // SAFETY MODEL (learned from BombSprintAimPlugin v1 which crashed by forcing
 // the camera-selector field): we NEVER touch the camera selector / mode graph.
@@ -59,6 +60,9 @@ private:
     void SnapCameraFromGame();
     void SetWorldTimescale(float newTimescale);
     void UpdateFreeInput(float dt);
+    int SaveCurrentCameraSlot();
+    void ApplyCameraSlot(int index);
+    void CycleCameraSlots(int dir);
     void ApplyHidePlayer();
     void RestorePlayerVisibility();
 
@@ -68,8 +72,9 @@ private:
     // Hotkeys (rebindable; F9/F11 defaults).
     int m_FreeCamKey = VK_F9;
     int m_ResetKey = VK_F11;
+    int m_YawKey = VK_MBUTTON;          // Hold to rotate left/right (mouse X).
     bool m_WaitingForKey = false;
-    int m_RebindTarget = 0; // 1=FreeCamKey, 3=ResetKey
+    int m_RebindTarget = 0; // 1=FreeCamKey, 3=ResetKey, 4=YawKey
     bool m_PrevFreeDown = false;
     bool m_PrevResetDown = false;
 
@@ -79,6 +84,20 @@ private:
     float m_Yaw = 0.0f;      // Horizontal orbit angle.
     float m_Pitch = 0.45f;   // Vertical orbit angle.
     float m_Fov = 1.0f;      // fov_mb_pi_4 multiplier (0.2 .. 2.0).
+
+    // Saved camera poses (panel + ',' / '.' switching).
+    struct CameraSlot
+    {
+        bool used = false;
+        Vector3f pos;
+        float yaw = 0.0f;
+        float pitch = 0.45f;
+        float fov = 1.0f;
+    };
+    CameraSlot m_Slots[9];
+    int m_ActiveSlot = -1;
+    bool m_PrevCommaDown = false;
+    bool m_PrevPeriodDown = false;
 
     // Snapshot of the game camera taken when entering a mode.
     // "Reset Camera" restores it.
@@ -93,8 +112,7 @@ private:
     bool m_HidePlayer = false;          // Free mode: hide Arno (clean shots).
     bool m_FollowPlayer = false;        // Free mode: camera tracks Arno, world stays live.
     bool m_FreezeCamera = false;        // Free mode: lock camera pose, play without moving it.
-    bool m_TiltMode = false;            // Free mode: rolled camera on mouse yaw (quat write).
-    float m_TiltAngle = 0.0f;           // Degrees; static roll in normal freecam (carry-over from Tilt Mode).
+    bool m_FreezeAllowLook = false;     // Free mode + Freeze Camera: mouse can still look around.
     float m_MoveSpeed = 4.0f;           // Free mode: world units / second.
     float m_MouseSensitivity = 0.003f;  // Same default as FreeCameraRotation.
     bool m_InvertX = false;
