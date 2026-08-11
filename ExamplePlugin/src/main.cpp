@@ -4,6 +4,7 @@
 #include "MyLog.h"
 #include "MainConfig.h"
 #include "PhotoModePlugin.h"
+#include "GearSetPerkPlugin.h"
 
 #include "Common_Plugins/Common_PluginSide.h"
 
@@ -21,10 +22,12 @@ public:
         ImGui::Text("Hello from " THIS_DLL_PROJECT_TARGET_FILE_NAME " plugin!");
         ImGui::Separator();
         m_PhotoMode.OnImGuiRender();
+        m_GearSetPerk.OnImGuiRender();
     }
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
         m_PhotoMode.OnUpdate();
+        m_GearSetPerk.OnUpdate();
     }
     virtual uint64 GetThisPluginVersion() override
     {
@@ -49,8 +52,10 @@ public:
 
         LOG_DEBUG(DefaultLogger, "This line of text is written to both ImGui Console and the default log file\n");
         m_PhotoMode.OnBeforeActivate();
+        m_GearSetPerk.OnBeforeActivate();
         return true;
     }
 
     PhotoModePlugin m_PhotoMode;
+    GearSetPerkPlugin m_GearSetPerk;
     } g_thisPlugin;

@@ -23,5 +23,15 @@ struct ConfigTop : YAConfigSection {
         ACM(exampleConfig_batlampChargeModeButton, BindableKeyCode, EnumAdapter_template<BindableKeyCode>, BindableKeyCode::KEYBOARD_N);
     };
     ACM(features, Features, YAConfigSectionAdapter, );
+
+    struct GearSetPerk : YAConfigSection {
+        YACSTOR(GearSetPerk);
+        ACM(enabled, bool, BooleanAdapter, false);
+        ACM(setIndex, int, IntegerAdapter_template<int>, 0);       // 0 = Musketeer
+        ACM(requiredPieces, int, IntegerAdapter_template<int>, 5); // how many set pieces must be worn
+        ACM(perkTypeIndex, int, IntegerAdapter_template<int>, 0);  // 0 = bullet capacity
+        ACM(perkAmount, int, IntegerAdapter_template<int>, 6);     // e.g. +6 bullets
+    };
+    ACM(gearSetPerk, GearSetPerk, YAConfigSectionAdapter, );
 };
 extern ConfigTop g_Config;
