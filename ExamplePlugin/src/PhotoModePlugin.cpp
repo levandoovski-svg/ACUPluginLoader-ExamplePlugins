@@ -17,8 +17,6 @@ static constexpr float PI = 3.14159265358979323846f;
 static constexpr float VERTICAL_LIMIT = 1.48f;
 static constexpr float MIN_FOV = 0.2f;
 static constexpr float MAX_FOV = 2.0f;
-static constexpr float MIN_DISTANCE = 0.5f;
-static constexpr float MAX_DISTANCE = 30.0f;
 
 PhotoModePlugin* g_pPhotoMode = nullptr;
 
@@ -80,31 +78,8 @@ static Vector4f BuildFreeCameraQuaternion(float yaw, float pitch)
     return QuaternionFromBasis(right, up, fwd);
 }
 
-// Basis for "eye looks toward target" (cinematic follow looks INWARD at the
-// player — the orientation must encode the actual view ray, not the orbit
-// angle, or the game's orientation fights ours and the view shakes).
-static Vector4f BuildLookAtQuaternion(const Vector3f& eye, const Vector3f& target)
-{
-    Vector3f fwd = target - eye;
-    const float len = fwd.length();
-    if (len < 0.0001f) return Vector4f(0.0f, 0.0f, 0.0f, 1.0f);
-    fwd = fwd * (1.0f / len);
-
-    const Vector3f worldUp(0.0f, 1.0f, 0.0f);
-    Vector3f right(
-        worldUp.y * fwd.z - worldUp.z * fwd.y,
-        worldUp.z * fwd.x - worldUp.x * fwd.z,
-        worldUp.x * fwd.y - worldUp.y * fwd.x);
-    const float rlen = right.length();
-    if (rlen < 0.0001f) right = Vector3f(1.0f, 0.0f, 0.0f);
-    else right = right * (1.0f / rlen);
-
-    Vector3f up(
-        fwd.y * right.z - fwd.z * right.y,
-        fwd.z * right.x - fwd.x * right.z,
-        fwd.x * right.y - fwd.y * right.x);
-    return QuaternionFromBasis(right, up, fwd);
-}
+// Basis for "eye looks toward target" — removed with Cinematic mode (the free
+// camera drives orientation via the game's spinaround solver instead).
 
 // ============================================================
 // Camera hook: 0x141F3FE3B ("when setting FOV for frame").
@@ -140,7 +115,6 @@ struct PhotoModeCameraHook : AutoAssemblerCodeHolder_Base
                     switch (photoMode->GetMode())
                     {
                     case PhotoModePlugin::Mode::Free:      photoMode->ApplyFreeCamera(cam); break;
-                    case PhotoModePlugin::Mode::Cinematic: photoMode->ApplyCinematicCamera(cam); break;
                     default: break;
                     }
                 }
@@ -172,61 +146,35 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
     // Look direction from yaw/pitch (forward = (sinY*cosP, sinP, cosY*cosP)).
     Vector3f fwd(sy * cp, sp, cy * cp);
 
+    const Vector3f lookTarget = m_FreeCamPos + fwd;
+
     cam->positionLookFrom = Vector4f(m_FreeCamPos, 1.0f);
-    cam->locationLookat_A90 = Vector4f(m_FreeCamPos + fwd, 1.0f);
-    cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
-    cam->fov_mb_pi_4 = m_Fov;
-    cam->fovPrecalc = m_Fov * (PI / 4.0f);
-
-    // Sync the game's spinaround mixer to our angles so its next-frame solve
-    // (which runs every frame regardless of our override) can't fight us.
-    cam->spinaroundAngleZtarget = m_Yaw;
-    cam->spinaroundAngleUpDownTarget = ClampFloat(m_Pitch, -VERTICAL_LIMIT, VERTICAL_LIMIT);
-    cam->distFromSpinaround_mb = m_Distance;
-    cam->locationSpinaround_AA0 = Vector4f(m_FreeCamPos, 1.0f);
-
-    if (m_DisableSmoothing)
-        cam->disableCameraSmoothingForThisFrame = 1;
-}
-
-void PhotoModePlugin::ApplyCinematicCamera(ACUPlayerCameraComponent* cam)
-{
-    Entity* player = ACU::GetPlayer();
-    if (!player)
-    {
-        // No player ref (loading etc.) — at least keep our FOV.
-        cam->fov_mb_pi_4 = m_Fov;
-        cam->fovPrecalc = m_Fov * (PI / 4.0f);
-        return;
-    }
-
-    const Vector3f playerPos = player->GetPosition();
-    const float cv = cosf(m_Pitch);
-
-    // Orbit offset around the player (same formula as DisableCameraLockPlugin).
-    Vector3f offset(
-        m_Distance * cv * sinf(m_Yaw),
-        m_Distance * sinf(m_Pitch),
-        m_Distance * cv * cosf(m_Yaw));
-
-    const Vector3f camPos = playerPos + offset;
-    const Vector3f lookTarget = playerPos + Vector3f(0.0f, 1.5f, 0.0f);
-
-    cam->positionLookFrom = Vector4f(camPos, 1.0f);
     cam->locationLookat_A90 = Vector4f(lookTarget, 1.0f);
-    cam->quaternion_mb = BuildLookAtQuaternion(camPos, lookTarget);
     cam->fov_mb_pi_4 = m_Fov;
     cam->fovPrecalc = m_Fov * (PI / 4.0f);
 
-    // Sync the game's spinaround mixer so its next-frame solve can't fight us.
+    // Tilt Mode (optional): write our own orientation quaternion. The game
+    // reads this quat as the camera's up/roll around the look-at axis, which
+    // gives the "tilting horizon" look when yawing. Default (off): orientation
+    // comes from the spinaround targets below, which yaw horizontally flat.
+    if (m_TiltMode)
+        cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
+
+    // Spin the game's own mixer to our pose so its next-frame solve can't
+    // fight us. Center = one unit ahead along the view ray, distance 1, so the
+    // game's solver places the camera exactly at our position looking at
+    // lookTarget — using ITS conventions, no quaternion math on our side.
     cam->spinaroundAngleZtarget = m_Yaw;
     cam->spinaroundAngleUpDownTarget = ClampFloat(m_Pitch, -VERTICAL_LIMIT, VERTICAL_LIMIT);
-    cam->distFromSpinaround_mb = m_Distance;
-    cam->locationSpinaround_AA0 = Vector4f(playerPos, 1.0f);
+    cam->distFromSpinaround_mb = 1.0f;
+    cam->locationSpinaround_AA0 = Vector4f(lookTarget, 1.0f);
 
     if (m_DisableSmoothing)
         cam->disableCameraSmoothingForThisFrame = 1;
 }
+
+// Cinematic follow removed (v1.2) — the free camera with Follow Player makes
+// it redundant.
 
 // ============================================================
 // Settings persistence (Documents\Assassin's Creed Unity\PhotoModePlugin.ini)
@@ -252,8 +200,6 @@ void PhotoModePlugin::LoadSettings()
     {
         if (line.rfind("FreeCamKey=", 0) == 0)
             try { m_FreeCamKey = std::stoi(line.substr(11), nullptr, 16); } catch (...) {}
-        else if (line.rfind("CinematicKey=", 0) == 0)
-            try { m_CinematicKey = std::stoi(line.substr(13), nullptr, 16); } catch (...) {}
         else if (line.rfind("ResetKey=", 0) == 0)
             try { m_ResetKey = std::stoi(line.substr(9), nullptr, 16); } catch (...) {}
         else if (line.rfind("FreezeWorld=", 0) == 0)
@@ -262,10 +208,10 @@ void PhotoModePlugin::LoadSettings()
             m_HidePlayer = (line.substr(11) == "1");
         else if (line.rfind("FollowPlayer=", 0) == 0)
             m_FollowPlayer = (line.substr(13) == "1");
-        else if (line.rfind("SlowMotion=", 0) == 0)
-            m_SlowMotion = (line.substr(11) == "1");
-        else if (line.rfind("SlowMotionTimescale=", 0) == 0)
-            try { m_SlowMotionTimescale = std::stof(line.substr(20)); } catch (...) {}
+        else if (line.rfind("TiltMode=", 0) == 0)
+            m_TiltMode = (line.substr(9) == "1");
+        else if (line.rfind("FreezeCamera=", 0) == 0)
+            m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
             try { m_MoveSpeed = std::stof(line.substr(10)); } catch (...) {}
         else if (line.rfind("MouseSensitivity=", 0) == 0)
@@ -286,13 +232,12 @@ void PhotoModePlugin::SaveSettings()
         if (file)
         {
             file << "FreeCamKey=" << std::hex << m_FreeCamKey << std::dec << "\n"
-                 << "CinematicKey=" << std::hex << m_CinematicKey << std::dec << "\n"
                  << "ResetKey=" << std::hex << m_ResetKey << std::dec << "\n"
                  << "FreezeWorld=" << (m_FreezeWorld ? 1 : 0) << "\n"
                  << "HidePlayer=" << (m_HidePlayer ? 1 : 0) << "\n"
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
-                 << "SlowMotion=" << (m_SlowMotion ? 1 : 0) << "\n"
-                 << "SlowMotionTimescale=" << m_SlowMotionTimescale << "\n"
+                 << "FreezeCamera=" << (m_FreezeCamera ? 1 : 0) << "\n"
+                 << "TiltMode=" << (m_TiltMode ? 1 : 0) << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
@@ -341,8 +286,6 @@ void PhotoModePlugin::SnapCameraFromGame()
     {
         m_SnapshotPos = (Vector3f&)cam->positionLookFrom;
         m_SnapshotFov = cam->fov_mb_pi_4 > 0.2f ? cam->fov_mb_pi_4 : 1.0f;
-        m_SnapshotSpinZ = cam->spinaroundAngleZtarget;
-        m_SnapshotSpinUpDown = cam->spinaroundAngleUpDownTarget;
 
         Vector3f look(
             cam->locationLookat_A90.x - cam->positionLookFrom.x,
@@ -356,14 +299,8 @@ void PhotoModePlugin::SnapCameraFromGame()
         }
 
         Entity* player = ACU::GetPlayer();
-        if (player)
-        {
-            Vector3f playerPos = player->GetPosition();
-            Vector3f diff(m_SnapshotPos.x - playerPos.x, m_SnapshotPos.y - playerPos.y, m_SnapshotPos.z - playerPos.z);
-            const float dist = diff.length();
-            if (dist > 0.1f)
-                m_SnapshotDistance = ClampFloat(dist, MIN_DISTANCE, MAX_DISTANCE);
-        }
+        if (player && m_SnapshotPos.x == 0.0f && m_SnapshotPos.y == 0.0f && m_SnapshotPos.z == 0.0f)
+            m_SnapshotPos = player->GetPosition();
 
         m_HasSnapshot = true;
     }
@@ -393,21 +330,6 @@ void PhotoModePlugin::EnterFreeMode()
     m_LastTick = GetTickCount64();
 }
 
-void PhotoModePlugin::EnterCinematicMode()
-{
-    if (m_Mode == Mode::Cinematic) return;
-    ExitMode();
-
-    SnapCameraFromGame();
-    m_Distance = m_SnapshotDistance;
-    m_Yaw = m_SnapshotYaw;
-    m_Pitch = m_SnapshotPitch;
-    m_Fov = m_SnapshotFov;
-
-    m_Mode = Mode::Cinematic;
-    m_LastTick = GetTickCount64();
-}
-
 void PhotoModePlugin::ExitMode()
 {
     if (m_Mode == Mode::None) return;
@@ -430,7 +352,6 @@ void PhotoModePlugin::ResetCamera()
         m_FreeCamPos = m_SnapshotPos;
         m_Yaw = m_SnapshotYaw;
         m_Pitch = m_SnapshotPitch;
-        m_Distance = m_SnapshotDistance;
         m_Fov = m_SnapshotFov;
         if (m_FollowPlayer && m_Mode == Mode::Free)
         {
@@ -468,35 +389,44 @@ bool PhotoModePlugin::IsRisingEdgePressed(int vkCode)
 
 void PhotoModePlugin::UpdateFreeInput(float dt)
 {
-    // Timescale sync (live "Freeze World" checkbox). Follow Player keeps the
-    // world live so Arno can be controlled during freecam.
-    if (m_FreezeWorld && !m_FollowPlayer && !m_TimescaleApplied) { SetWorldTimescale(0.0f); m_TimescaleApplied = true; }
-    else if ((!m_FreezeWorld || m_FollowPlayer) && m_TimescaleApplied) { SetWorldTimescale(1.0f); m_TimescaleApplied = false; }
+    // Timescale sync (live "Freeze World" checkbox). Follow Player / Freeze
+    // Camera keep the world live so Arno can be controlled during freecam.
+    const bool keepWorldLive = m_FollowPlayer || m_FreezeCamera;
+    if (m_FreezeWorld && !keepWorldLive && !m_TimescaleApplied) { SetWorldTimescale(0.0f); m_TimescaleApplied = true; }
+    else if ((!m_FreezeWorld || keepWorldLive) && m_TimescaleApplied) { SetWorldTimescale(1.0f); m_TimescaleApplied = false; }
 
     // Player visibility sync (live "Hide Player" checkbox).
     if (m_HidePlayer && !m_PlayerHidden) ApplyHidePlayer();
     else if (!m_HidePlayer && m_PlayerHidden) RestorePlayerVisibility();
 
-    // Mouse orbit + FOV wheel.
-    auto* inp = ACU::Input::Get_InputContainerBig();
-    if (inp)
-    {
-        const int dx = inp->mouseState.mouseDeltaIntForCamera_X;
-        const int dy = inp->mouseState.mouseDeltaIntForCamera_Y;
-        if (dx != 0 || dy != 0)
-        {
-            const float xMult = m_InvertX ? 1.0f : -1.0f;
-            const float yMult = m_InvertY ? -1.0f : 1.0f;
-            m_Yaw += (float)dx * m_MouseSensitivity * xMult;
-            m_Pitch += (float)dy * m_MouseSensitivity * yMult;
-            m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
-            if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
-            if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
-        }
+    // Freeze Camera: lock the pose in place — skip the mouse orbit and movement
+    // below so Arno can be played without nudging the camera. Follow Player
+    // takes priority (the camera then tracks Arno instead of freezing).
+    const bool frozen = m_FreezeCamera && !m_FollowPlayer;
 
-        const int wheel = inp->mouseState.mouseWheelDeltaInt;
-        if (wheel)
-            m_Fov = ClampFloat(m_Fov + (wheel > 0 ? 0.05f : -0.05f), MIN_FOV, MAX_FOV);
+    // Mouse orbit + FOV wheel (ignored while frozen).
+    if (!frozen)
+    {
+        auto* inp = ACU::Input::Get_InputContainerBig();
+        if (inp)
+        {
+            const int dx = inp->mouseState.mouseDeltaIntForCamera_X;
+            const int dy = inp->mouseState.mouseDeltaIntForCamera_Y;
+            if (dx != 0 || dy != 0)
+            {
+                const float xMult = m_InvertX ? 1.0f : -1.0f;
+                const float yMult = m_InvertY ? -1.0f : 1.0f;
+                m_Yaw += (float)dx * m_MouseSensitivity * xMult;
+                m_Pitch += (float)dy * m_MouseSensitivity * yMult;
+                m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
+                if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
+                if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+            }
+
+            const int wheel = inp->mouseState.mouseWheelDeltaInt;
+            if (wheel)
+                m_Fov = ClampFloat(m_Fov + (wheel > 0 ? 0.05f : -0.05f), MIN_FOV, MAX_FOV);
+        }
     }
 
     // Follow Player: re-anchor to Arno (he may have moved since last frame)
@@ -508,31 +438,35 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
             m_FreeCamPos = player->GetPosition() + m_FollowOffset;
     }
 
-    // WASD/QE fly. Movement is along the camera plane (flat forward/right),
-    // independent of the game clock (world may be frozen at timescale 0).
-    float speed = m_MoveSpeed;
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 10.0f;
-
-    const float cp = cosf(m_Pitch);
-    const float fwdX = sinf(m_Yaw) * cp;
-    const float fwdZ = cosf(m_Yaw) * cp;
-    const float rightX = cosf(m_Yaw);
-    const float rightZ = -sinf(m_Yaw);
-
-    float moveX = 0.0f, moveY = 0.0f, moveZ = 0.0f;
-    if (GetAsyncKeyState('W') & 0x8000) { moveX += fwdX; moveZ += fwdZ; }
-    if (GetAsyncKeyState('S') & 0x8000) { moveX -= fwdX; moveZ -= fwdZ; }
-    if (GetAsyncKeyState('D') & 0x8000) { moveX += rightX; moveZ += rightZ; }
-    if (GetAsyncKeyState('A') & 0x8000) { moveX -= rightX; moveZ -= rightZ; }
-    if (GetAsyncKeyState('E') & 0x8000) moveY += 1.0f;
-    if (GetAsyncKeyState('Q') & 0x8000) moveY -= 1.0f;
-
-    if (moveX != 0.0f || moveY != 0.0f || moveZ != 0.0f)
+    // Arrow-key / QE fly (ignored while frozen). Movement is along the camera
+    // plane (flat forward/right), independent of the game clock (world may be
+    // frozen at timescale 0).
+    if (!frozen)
     {
-        const float step = speed * dt;
-        m_FreeCamPos.x += moveX * step;
-        m_FreeCamPos.y += moveY * step;
-        m_FreeCamPos.z += moveZ * step;
+        float speed = m_MoveSpeed;
+        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 10.0f;
+
+        const float cp = cosf(m_Pitch);
+        const float fwdX = sinf(m_Yaw) * cp;
+        const float fwdZ = cosf(m_Yaw) * cp;
+        const float rightX = cosf(m_Yaw);
+        const float rightZ = -sinf(m_Yaw);
+
+        float moveX = 0.0f, moveY = 0.0f, moveZ = 0.0f;
+        if (GetAsyncKeyState(VK_UP) & 0x8000) { moveX += fwdX; moveZ += fwdZ; }
+        if (GetAsyncKeyState(VK_DOWN) & 0x8000) { moveX -= fwdX; moveZ -= fwdZ; }
+        if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { moveX += rightX; moveZ += rightZ; }
+        if (GetAsyncKeyState(VK_LEFT) & 0x8000) { moveX -= rightX; moveZ -= rightZ; }
+        if (GetAsyncKeyState('E') & 0x8000) moveY += 1.0f;
+        if (GetAsyncKeyState('Q') & 0x8000) moveY -= 1.0f;
+
+        if (moveX != 0.0f || moveY != 0.0f || moveZ != 0.0f)
+        {
+            const float step = speed * dt;
+            m_FreeCamPos.x += moveX * step;
+            m_FreeCamPos.y += moveY * step;
+            m_FreeCamPos.z += moveZ * step;
+        }
     }
 
     // Follow Player: capture the new offset so the anchor next frame preserves
@@ -542,37 +476,6 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
         Entity* player = ACU::GetPlayer();
         if (player)
             m_FollowOffset = m_FreeCamPos - player->GetPosition();
-    }
-}
-
-void PhotoModePlugin::UpdateCinematicInput(float dt)
-{
-    (void)dt; // orbit is absolute, not speed-based
-
-    // Timescale sync (live "Slow Motion" checkbox).
-    if (m_SlowMotion && !m_TimescaleApplied) { SetWorldTimescale(m_SlowMotionTimescale); m_TimescaleApplied = true; }
-    else if (!m_SlowMotion && m_TimescaleApplied) { SetWorldTimescale(1.0f); m_TimescaleApplied = false; }
-    else if (m_SlowMotion && m_TimescaleApplied) { SetWorldTimescale(m_SlowMotionTimescale); } // keep slider live
-
-    auto* inp = ACU::Input::Get_InputContainerBig();
-    if (inp)
-    {
-        const int dx = inp->mouseState.mouseDeltaIntForCamera_X;
-        const int dy = inp->mouseState.mouseDeltaIntForCamera_Y;
-        if (dx != 0 || dy != 0)
-        {
-            const float xMult = m_InvertX ? 1.0f : -1.0f;
-            const float yMult = m_InvertY ? -1.0f : 1.0f;
-            m_Yaw += (float)dx * m_MouseSensitivity * xMult;
-            m_Pitch += (float)dy * m_MouseSensitivity * yMult;
-            m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
-            if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
-            if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
-        }
-
-        const int wheel = inp->mouseState.mouseWheelDeltaInt;
-        if (wheel)
-            m_Distance = ClampFloat(m_Distance + (wheel > 0 ? 0.5f : -0.5f), MIN_DISTANCE, MAX_DISTANCE);
     }
 }
 
@@ -592,7 +495,6 @@ void PhotoModePlugin::OnUpdate()
             if (IsRisingEdgePressed(vk))
             {
                 if (m_RebindTarget == 1) m_FreeCamKey = vk;
-                else if (m_RebindTarget == 2) m_CinematicKey = vk;
                 else if (m_RebindTarget == 3) m_ResetKey = vk;
                 m_WaitingForKey = false;
                 m_RebindTarget = 0;
@@ -603,7 +505,6 @@ void PhotoModePlugin::OnUpdate()
     }
 
     const bool freeDown = (GetAsyncKeyState(m_FreeCamKey) & 0x8000) != 0;
-    const bool cinDown = (GetAsyncKeyState(m_CinematicKey) & 0x8000) != 0;
     const bool resetDown = (GetAsyncKeyState(m_ResetKey) & 0x8000) != 0;
 
     if (freeDown && !m_PrevFreeDown)
@@ -611,16 +512,10 @@ void PhotoModePlugin::OnUpdate()
         if (m_Mode == Mode::Free) ExitMode();
         else EnterFreeMode();
     }
-    if (cinDown && !m_PrevCinematicDown)
-    {
-        if (m_Mode == Mode::Cinematic) ExitMode();
-        else EnterCinematicMode();
-    }
     if (resetDown && !m_PrevResetDown && m_Mode != Mode::None)
         ResetCamera();
 
     m_PrevFreeDown = freeDown;
-    m_PrevCinematicDown = cinDown;
     m_PrevResetDown = resetDown;
 
     if (m_Mode == Mode::None) return;
@@ -631,7 +526,6 @@ void PhotoModePlugin::OnUpdate()
     m_LastTick = now;
 
     if (m_Mode == Mode::Free) UpdateFreeInput(dt);
-    else if (m_Mode == Mode::Cinematic) UpdateCinematicInput(dt);
 }
 
 // ============================================================
@@ -645,9 +539,7 @@ void PhotoModePlugin::OnImGuiRender()
     if (ImGui::Checkbox("Enable Photo Mode", &m_Enabled))
         if (!m_Enabled) ExitMode();
 
-    const char* modeName =
-        (m_Mode == Mode::Free) ? "FREE CAMERA" :
-        (m_Mode == Mode::Cinematic) ? "CINEMATIC FOLLOW" : "OFF";
+    const char* modeName = (m_Mode == Mode::Free) ? "FREE CAMERA" : "OFF";
     const ImVec4 modeColor =
         (m_Mode == Mode::None) ? ImVec4(0.7f, 0.7f, 0.7f, 1.0f) : ImVec4(0.20f, 0.90f, 0.30f, 1.00f);
     ImGui::TextColored(modeColor, "Mode: %s", modeName);
@@ -666,16 +558,6 @@ void PhotoModePlugin::OnImGuiRender()
         m_RebindTarget = 1;
     }
 
-    ImGui::Text("Cinematic:");
-    ImGui::SameLine();
-    ImGui::Text("0x%02X", m_CinematicKey);
-    ImGui::SameLine();
-    if (ImGui::Button(m_WaitingForKey && m_RebindTarget == 2 ? "Press any key..." : "Rebind##Cinematic"))
-    {
-        m_WaitingForKey = true;
-        m_RebindTarget = 2;
-    }
-
     ImGui::Text("Reset Cam:");
     ImGui::SameLine();
     ImGui::Text("0x%02X", m_ResetKey);
@@ -689,20 +571,38 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::Separator();
 
     ImGui::TextDisabled("FREE CAMERA (F9)");
-    if (m_FollowPlayer)
+    if (m_FollowPlayer || m_FreezeCamera)
         ImGui::BeginDisabled();
     if (ImGui::Checkbox("Freeze World", &m_FreezeWorld)) SaveSettings();
-    if (m_FollowPlayer)
+    if (m_FollowPlayer || m_FreezeCamera)
     {
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Disabled while Follow Player is on (the world must stay live so Arno can move).");
+            ImGui::SetTooltip("Disabled while Follow Player / Freeze Camera is on (the world must stay live so Arno can move).");
     }
     if (ImGui::Checkbox("Hide Player", &m_HidePlayer)) SaveSettings();
     if (ImGui::Checkbox("Follow Player", &m_FollowPlayer))
     {
         if (m_FollowPlayer) m_FreezeWorld = false;
         SaveSettings();
+    }
+    if (ImGui::Checkbox("Freeze Camera", &m_FreezeCamera))
+    {
+        if (m_FreezeCamera) m_FreezeWorld = false;
+        SaveSettings();
+    }
+    if (m_FreezeCamera)
+    {
+        ImGui::Indent();
+        ImGui::TextDisabled("Camera locked; move Arno without nudging the camera. Follow Player overrides this.");
+        ImGui::Unindent();
+    }
+    if (ImGui::Checkbox("Tilt Mode", &m_TiltMode)) SaveSettings();
+    if (m_TiltMode)
+    {
+        ImGui::Indent();
+        ImGui::TextDisabled("Mouse left/right rolls the camera (old tilted look).");
+        ImGui::Unindent();
     }
     if (m_FollowPlayer)
     {
@@ -714,19 +614,7 @@ void PhotoModePlugin::OnImGuiRender()
 
     ImGui::Separator();
 
-    ImGui::TextDisabled("CINEMATIC FOLLOW (F10)");
-    if (ImGui::Checkbox("Slow Motion", &m_SlowMotion)) SaveSettings();
-    if (m_SlowMotion)
-    {
-        ImGui::Indent();
-        if (ImGui::SliderFloat("Timescale", &m_SlowMotionTimescale, 0.01f, 1.0f, "%.2f")) SaveSettings();
-        ImGui::Unindent();
-    }
-
-    ImGui::Separator();
-
     if (ImGui::SliderFloat("FOV", &m_Fov, MIN_FOV, MAX_FOV, "%.2f")) SaveSettings();
-    if (ImGui::SliderFloat("Orbit Distance", &m_Distance, MIN_DISTANCE, MAX_DISTANCE, "%.1f")) SaveSettings();
     if (ImGui::Checkbox("Invert X", &m_InvertX)) SaveSettings();
     if (ImGui::Checkbox("Invert Y", &m_InvertY)) SaveSettings();
     if (ImGui::Checkbox("Disable Camera Smoothing", &m_DisableSmoothing)) SaveSettings();
@@ -760,7 +648,7 @@ void PhotoModePlugin::OnImGuiRender()
             Vector3f p = player->GetPosition();
             ImGui::Text("Player pos: %.1f, %.1f, %.1f", p.x, p.y, p.z);
         }
-        ImGui::Text("Yaw: %.2f  Pitch: %.2f  Dist: %.1f", m_Yaw, m_Pitch, m_Distance);
+        ImGui::Text("Yaw: %.2f  Pitch: %.2f  FOV: %.2f", m_Yaw, m_Pitch, m_Fov);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 
     ImGui::Unindent();
