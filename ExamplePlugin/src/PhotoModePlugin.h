@@ -12,7 +12,7 @@ struct PhotoModeCameraHook;
 //
 // Camera takeover mode for Assassin's Creed Unity:
 //   Mode::Free - "Photo Mode": fly the camera anywhere (arrow keys + Q/E move,
-//                hold the Yaw key + mouse X to rotate, wheel FOV), freeze the
+//                hold { / } to rotate left/right, wheel FOV), freeze the
 //                world, optional hidden player. The camera keeps the tilted
 //                look (immune to vanilla acrobatics); Follow Player anchors it
 //                to Arno while you play; Freeze Camera locks the pose (optional
@@ -72,9 +72,8 @@ private:
     // Hotkeys (rebindable; F9/F11 defaults).
     int m_FreeCamKey = VK_F9;
     int m_ResetKey = VK_F11;
-    int m_YawKey = VK_MBUTTON;          // Hold to rotate left/right (mouse X).
     bool m_WaitingForKey = false;
-    int m_RebindTarget = 0; // 1=FreeCamKey, 3=ResetKey, 4=YawKey
+    int m_RebindTarget = 0; // 1=FreeCamKey, 3=ResetKey
     bool m_PrevFreeDown = false;
     bool m_PrevResetDown = false;
 
@@ -115,7 +114,6 @@ private:
     bool m_FreezeAllowLook = false;     // Free mode + Freeze Camera: mouse can still look around.
     float m_MoveSpeed = 4.0f;           // Free mode: world units / second.
     float m_MouseSensitivity = 0.003f;  // Same default as FreeCameraRotation.
-    bool m_InvertX = false;
     bool m_InvertY = false;
     bool m_DisableSmoothing = true;
 

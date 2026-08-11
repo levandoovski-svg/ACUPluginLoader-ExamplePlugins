@@ -18,6 +18,13 @@ static constexpr float VERTICAL_LIMIT = 1.48f;
 static constexpr float MIN_FOV = 0.2f;
 static constexpr float MAX_FOV = 2.0f;
 
+// Yaw rotation keys: hold { / } to rotate left/right. Key-driven instead of
+// mouse X + MMB because the game consumes the mouse deltas while MMB is held
+// (the MMB approach never delivered rotation to the camera).
+static constexpr int YAW_LEFT_KEY = VK_OEM_4;   // {
+static constexpr int YAW_RIGHT_KEY = VK_OEM_6;  // }
+static constexpr float YAW_ROTATE_SPEED = 1.0f; // radians/sec (Shift = 5x)
+
 PhotoModePlugin* g_pPhotoMode = nullptr;
 
 PhotoModePlugin::PhotoModePlugin()
@@ -162,12 +169,12 @@ void PhotoModePlugin::ApplyFreeCamera(ACUPlayerCameraComponent* cam)
     // bob/shake (sprint/landing acrobatics) never reaches the freecam — the
     // game reads this quat as the camera's roll around the look-at axis, which
     // gives the tilted look, and overwriting it every frame kills the acrobatic
-    // shake. Hold the Yaw key (MMB) to switch to the acrobatic-affected mode:
-    // leave the game's own quat alone so its bob/shake comes back, which is
-    // also what lets mouse X actually turn the camera left/right (yaw only
-    // rolls the horizon while we own the quat).
-    const bool yawing = (GetAsyncKeyState(m_YawKey) & 0x8000) != 0;
-    if (!yawing)
+    // shake. While a rotate key ({ / }) is held, leave the game's own quat
+    // alone: its bob/shake comes back AND yaw cleanly turns the camera
+    // left/right (with our quat in control, yaw only rolls the horizon).
+    const bool rotating = (GetAsyncKeyState(YAW_LEFT_KEY) & 0x8000) != 0 ||
+                          (GetAsyncKeyState(YAW_RIGHT_KEY) & 0x8000) != 0;
+    if (!rotating)
         cam->quaternion_mb = BuildFreeCameraQuaternion(m_Yaw, m_Pitch);
 
     // Spin the game's own mixer to our pose so its next-frame solve can't
@@ -220,16 +227,12 @@ void PhotoModePlugin::LoadSettings()
             m_FollowPlayer = (line.substr(13) == "1");
         else if (line.rfind("FreezeAllowLook=", 0) == 0)
             m_FreezeAllowLook = (line.substr(16) == "1");
-        else if (line.rfind("YawKey=", 0) == 0)
-            try { m_YawKey = std::stoi(line.substr(7), nullptr, 16); } catch (...) {}
         else if (line.rfind("FreezeCamera=", 0) == 0)
             m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
             try { m_MoveSpeed = std::stof(line.substr(10)); } catch (...) {}
         else if (line.rfind("MouseSensitivity=", 0) == 0)
             try { m_MouseSensitivity = std::stof(line.substr(17)); } catch (...) {}
-        else if (line.rfind("InvertX=", 0) == 0)
-            m_InvertX = (line.substr(8) == "1");
         else if (line.rfind("InvertY=", 0) == 0)
             m_InvertY = (line.substr(8) == "1");
         else if (line.rfind("DisableSmoothing=", 0) == 0)
@@ -250,10 +253,8 @@ void PhotoModePlugin::SaveSettings()
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
                  << "FreezeCamera=" << (m_FreezeCamera ? 1 : 0) << "\n"
                  << "FreezeAllowLook=" << (m_FreezeAllowLook ? 1 : 0) << "\n"
-                 << "YawKey=" << std::hex << m_YawKey << std::dec << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
-                 << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
                  << "InvertY=" << (m_InvertY ? 1 : 0) << "\n"
                  << "DisableSmoothing=" << (m_DisableSmoothing ? 1 : 0) << "\n";
         }
@@ -418,17 +419,17 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     const bool frozen = m_FreezeCamera && !m_FollowPlayer;
     const bool lookBlocked = m_FollowPlayer || (frozen && !m_FreezeAllowLook);
 
-    // Look input: mouse Y = pitch (always when not blocked); mouse X = yaw ONLY
-    // while the Yaw key (MMB by default) is held — freecam keeps the tilted
-    // look by default and you rotate left/right on demand. FOV wheel works
-    // unless look is blocked. Blocked entirely in Follow Player, and in Freeze
-    // Camera unless "Allow Mouse Look" is checked.
+    // Look input: mouse Y = pitch (always when not blocked); yaw rotation is
+    // key-driven — hold { / } to rotate left/right (mouse X + MMB was dropped:
+    // the game swallows the mouse deltas while MMB is held, so rotation never
+    // reached the camera). FOV wheel works unless look is blocked. Blocked
+    // entirely in Follow Player, and in Freeze Camera unless "Allow Mouse
+    // Look" is checked.
     if (!lookBlocked)
     {
         auto* inp = ACU::Input::Get_InputContainerBig();
         if (inp)
         {
-            const int dx = inp->mouseState.mouseDeltaIntForCamera_X;
             const int dy = inp->mouseState.mouseDeltaIntForCamera_Y;
             if (dy != 0)
             {
@@ -437,10 +438,16 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
                 if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
                 if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
             }
-            if (dx != 0 && (GetAsyncKeyState(m_YawKey) & 0x8000))
+
+            // Yaw: hold { / } to rotate left/right at a fixed rate.
+            const bool rotLeft = (GetAsyncKeyState(YAW_LEFT_KEY) & 0x8000) != 0;
+            const bool rotRight = (GetAsyncKeyState(YAW_RIGHT_KEY) & 0x8000) != 0;
+            if (rotLeft || rotRight)
             {
-                const float xMult = m_InvertX ? 1.0f : -1.0f;
-                m_Yaw += (float)dx * m_MouseSensitivity * xMult;
+                float yawSpeed = YAW_ROTATE_SPEED;
+                if (GetAsyncKeyState(VK_SHIFT) & 0x8000) yawSpeed *= 5.0f;
+                m_Yaw += (rotRight ? yawSpeed : 0.0f) * dt;
+                m_Yaw -= (rotLeft ? yawSpeed : 0.0f) * dt;
                 m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
             }
 
@@ -572,7 +579,6 @@ void PhotoModePlugin::OnUpdate()
             {
                 if (m_RebindTarget == 1) m_FreeCamKey = vk;
                 else if (m_RebindTarget == 3) m_ResetKey = vk;
-                else if (m_RebindTarget == 4) m_YawKey = vk;
                 m_WaitingForKey = false;
                 m_RebindTarget = 0;
                 SaveSettings();
@@ -653,23 +659,13 @@ void PhotoModePlugin::OnImGuiRender()
         m_RebindTarget = 3;
     }
 
-    ImGui::Text("Yaw Hold:");
-    ImGui::SameLine();
-    ImGui::Text("0x%02X", m_YawKey);
-    ImGui::SameLine();
-    if (ImGui::Button(m_WaitingForKey && m_RebindTarget == 4 ? "Press any key..." : "Rebind##Yaw"))
-    {
-        m_WaitingForKey = true;
-        m_RebindTarget = 4;
-    }
-
     ImGui::Separator();
 
     ImGui::TextDisabled("CONTROLS");
     ImGui::BulletText("F9: toggle free camera");
     ImGui::BulletText("F11: reset camera to entry pose");
     ImGui::BulletText("Mouse Y: look up / down");
-    ImGui::BulletText("Hold Yaw key (MMB) + mouse X: rotate left / right");
+    ImGui::BulletText("Hold { / }: rotate left / right (Shift = faster)");
     ImGui::BulletText("Mouse wheel: FOV zoom");
     ImGui::BulletText("Arrow keys: move camera (forward/back/left/right)");
     ImGui::BulletText("Q / E: move camera up / down (disabled in Follow Player)");
@@ -719,7 +715,6 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::Separator();
 
     if (ImGui::SliderFloat("FOV", &m_Fov, MIN_FOV, MAX_FOV, "%.2f")) SaveSettings();
-    if (ImGui::Checkbox("Invert X", &m_InvertX)) SaveSettings();
     if (ImGui::Checkbox("Invert Y", &m_InvertY)) SaveSettings();
     if (ImGui::Checkbox("Disable Camera Smoothing", &m_DisableSmoothing)) SaveSettings();
 
