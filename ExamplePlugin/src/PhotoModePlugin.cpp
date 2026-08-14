@@ -716,50 +716,7 @@ void PhotoModePlugin::OnUpdate()
 
     if (m_Mode == Mode::Free) UpdateFreeInput(dt);
 
-    // Recording sampling
-    if (m_Recording)
-    {
-        m_Record.push_back(MakeSampleFromCurrent());
-    }
-
-    // Replay handling (drive freecam/player)
-    if (m_Replaying && !m_Record.empty())
-    {
-        uint64 now = GetTickCount64();
-        uint64 rel = (uint64)((now - m_ReplayStartTick) * m_ReplaySpeed);
-        // clamp to last sample time
-        uint64 lastT = m_Record.back().t;
-        if (rel >= lastT)
-        {
-            // apply final sample and stop
-            auto &s = m_Record.back();
-            m_FreeCamPos = s.pos;
-            m_Yaw = s.yaw; m_Pitch = s.pitch; m_Fov = s.fov;
-            if (m_ReplayTeleportPlayer)
-            {
-                if (Entity* player = ACU::GetPlayer()) player->GetPosition() = s.pos;
-            }
-            m_Replaying = false;
-        }
-        else
-        {
-            // find samples
-            size_t i = 0;
-            while (i + 1 < m_Record.size() && m_Record[i+1].t < rel) ++i;
-            const auto &s0 = m_Record[i];
-            const auto &s1 = m_Record[i+1];
-            float frac = float(rel - s0.t) / float(s1.t - s0.t);
-            Vector3f pos = LerpVec(s0.pos, s1.pos, frac);
-            float yaw = InterpYaw(s0.yaw, s1.yaw, frac);
-            float pitch = LerpFloat(s0.pitch, s1.pitch, frac);
-            float fov = LerpFloat(s0.fov, s1.fov, frac);
-            m_FreeCamPos = pos; m_Yaw = yaw; m_Pitch = pitch; m_Fov = fov;
-            if (m_ReplayTeleportPlayer)
-            {
-                if (Entity* player = ACU::GetPlayer()) player->GetPosition() = pos;
-            }
-        }
-    }
+    // Recording/replay removed for ship-ready build.
 }
 
 // ============================================================
@@ -944,56 +901,9 @@ void PhotoModePlugin::OnImGuiRender()
     }
     ImGui::TextDisabled("Switch between saved poses with ',' and '.'");
 
-    ImGui::Separator();
 
-    ImGui::TextDisabled("RECORDING");
-    if (!m_Recording)
-    {
-        if (ImGui::Button("Start Recording"))
-        {
-            m_Record.clear();
-            m_Recording = true;
-            m_RecordStartTick = GetTickCount64();
-        }
-    }
-    else
-    {
-        if (ImGui::Button("Stop Recording")) m_Recording = false;
-        ImGui::SameLine();
-        if (ImGui::Button("Save Recording")) SaveRecordCSV(GetRecordingPath(), m_Record);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Load Recording")) LoadRecordCSV(GetRecordingPath(), m_Record);
-    ImGui::TextDisabled("Samples: %zu", m_Record.size());
-    ImGui::Separator();
+    // Recording/replay UI removed for ship-ready build.
 
-    ImGui::TextDisabled("REPLAY");
-    if (!m_Replaying)
-    {
-        if (ImGui::Button("Start Replay"))
-        {
-            if (!m_Record.empty())
-            {
-                m_Replaying = true;
-                m_ReplayStartTick = GetTickCount64();
-            }
-        }
-    }
-    else
-    {
-        if (ImGui::Button("Stop Replay")) m_Replaying = false;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Replay -> Teleport Player"))
-    {
-        if (!m_Record.empty())
-        {
-            m_Replaying = true;
-            m_ReplayStartTick = GetTickCount64();
-            m_ReplayTeleportPlayer = true;
-        }
-    }
-    if (ImGui::SliderFloat("Replay Speed", &m_ReplaySpeed, 0.1f, 4.0f, "%.2f")) {}
     ImGui::Checkbox("Teleport Player During Replay", &m_ReplayTeleportPlayer);
     ImGui::Separator();
 
@@ -1007,24 +917,7 @@ void PhotoModePlugin::OnImGuiRender()
 
     ImGui::Separator();
 
-    ImGui::TextDisabled("Hook hits: %llu (%s)",
-        m_HookHitCount, m_HookAlive ? "address live" : "NOT HIT - address may be wrong");
-
-    ACUPlayerCameraComponent* cam = SafeGetPlayerCameraComponent();
-    Entity* player = SafeGetPlayer();
-
-    if (cam)
-    {
-        ImGui::Text("Cam pos: %.1f, %.1f, %.1f",
-            cam->positionLookFrom.x, cam->positionLookFrom.y, cam->positionLookFrom.z);
-        ImGui::Text("FOV: %.2f (ours: %.2f)", cam->fov_mb_pi_4, m_Fov);
-    }
-    if (player)
-    {
-        Vector3f p = player->GetPosition();
-        ImGui::Text("Player pos: %.1f, %.1f, %.1f", p.x, p.y, p.z);
-    }
-    ImGui::Text("Yaw: %.2f  Pitch: %.2f  FOV: %.2f", m_Yaw, m_Pitch, m_Fov);
+    // Debug info removed for ship-ready build.
 
     ImGui::Unindent();
 }
