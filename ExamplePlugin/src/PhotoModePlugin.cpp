@@ -152,7 +152,7 @@ struct PhotoModeCameraHook : AutoAssemblerCodeHolder_Base
                 PhotoModePlugin* photoMode = g_pPhotoMode;
                 if (!photoMode) return;
 
-                ++photoMode->m_HookHitCount;
+                // hook hit accounting removed for ship-ready build
 
                 auto* cam = (ACUPlayerCameraComponent*)params->r14_;
                 if (!cam) return;
@@ -904,7 +904,6 @@ void PhotoModePlugin::OnImGuiRender()
 
     // Recording/replay UI removed for ship-ready build.
 
-    ImGui::Checkbox("Teleport Player During Replay", &m_ReplayTeleportPlayer);
     ImGui::Separator();
 
     if (ImGui::Button("RESET CAMERA", ImVec2(-1.0f, 0.0f)))
