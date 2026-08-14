@@ -259,6 +259,8 @@ void PhotoModePlugin::LoadSettings()
             m_DisablePitch = (line.substr(13) == "1");
         else if (line.rfind("DisableRoll=", 0) == 0)
             m_DisableRoll = (line.substr(11) == "1");
+        else if (line.rfind("BlockPositionMovement=", 0) == 0)
+            m_BlockPositionMovement = (line.substr(22) == "1");
         else if (line.rfind("FreezeCamera=", 0) == 0)
             m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
@@ -272,6 +274,8 @@ void PhotoModePlugin::LoadSettings()
         else if (line.rfind("DisableSmoothing=", 0) == 0)
             m_DisableSmoothing = (line.substr(17) == "1");
     }
+    // If Tilt Mode was loaded as enabled, allow yaw control (user intent).
+    if (m_TiltMode) m_DisableYaw = false;
 }
 
 void PhotoModePlugin::SaveSettings()
@@ -296,6 +300,7 @@ void PhotoModePlugin::SaveSettings()
                  << "DisableYaw=" << (m_DisableYaw ? 1 : 0) << "\n"
                  << "DisablePitch=" << (m_DisablePitch ? 1 : 0) << "\n"
                  << "DisableRoll=" << (m_DisableRoll ? 1 : 0) << "\n"
+                 << "BlockPositionMovement=" << (m_BlockPositionMovement ? 1 : 0) << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
@@ -379,7 +384,7 @@ void PhotoModePlugin::EnterFreeMode()
     {
         Entity* player = ACU::GetPlayer();
         if (player)
-            m_FollowOffset = m_FreeCamPos - player->GetPosition();
+            m_FollowOffset = m_BlockPositionMovement ? Vector3f{0.0f, 0.0f, 0.0f} : (m_FreeCamPos - player->GetPosition());
         // Follow Player keeps the world live so Arno stays controllable.
         m_FreezeWorld = false;
     }
@@ -539,6 +544,7 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     // and is independent of the game clock. Movement may be disabled while
     // following depending on the follow-player ignore settings.
     bool movementAllowed = !frozen && (!m_FollowPlayer || (!m_FollowIgnoreAllInput && !m_FollowIgnoreExceptMouse));
+    if (m_BlockPositionMovement) movementAllowed = false;
     if (movementAllowed)
     {
         float speed = m_MoveSpeed;
@@ -573,7 +579,10 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     {
         Entity* player = ACU::GetPlayer();
         if (player)
-            m_FollowOffset = m_FreeCamPos - player->GetPosition();
+            if (!m_BlockPositionMovement)
+                m_FollowOffset = m_FreeCamPos - player->GetPosition();
+            else
+                m_FollowOffset = Vector3f{0.0f, 0.0f, 0.0f};
     }
 }
 
@@ -612,7 +621,7 @@ void PhotoModePlugin::ApplyCameraSlot(int index)
     {
         Entity* player = ACU::GetPlayer();
         if (player)
-            m_FollowOffset = m_FreeCamPos - player->GetPosition();
+            m_FollowOffset = m_BlockPositionMovement ? Vector3f{0.0f, 0.0f, 0.0f} : (m_FreeCamPos - player->GetPosition());
     }
 }
 
@@ -755,7 +764,7 @@ void PhotoModePlugin::OnImGuiRender()
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Disabled while Follow Player / Freeze Camera is on (the world must stay live so Arno can move).");
     }
-    if (ImGui::Checkbox("Hide Player", &m_HidePlayer)) SaveSettings();
+    // Hide Player UI removed per request (option still exists in state but is no longer exposed)
     if (ImGui::Checkbox("Follow Player", &m_FollowPlayer))
     {
         if (m_FollowPlayer)
@@ -767,7 +776,7 @@ void PhotoModePlugin::OnImGuiRender()
             {
                 Entity* player = ACU::GetPlayer();
                 if (player)
-                    m_FollowOffset = m_FreeCamPos - player->GetPosition();
+                    m_FollowOffset = m_BlockPositionMovement ? Vector3f{0.0f,0.0f,0.0f} : (m_FreeCamPos - player->GetPosition());
             }
         }
         SaveSettings();
@@ -783,11 +792,16 @@ void PhotoModePlugin::OnImGuiRender()
         ImGui::TextDisabled("Camera locked; move Arno without nudging the camera. Follow Player overrides this.");
         ImGui::Unindent();
     }
-    if (ImGui::Checkbox("Tilt Mode", &m_TiltMode)) SaveSettings();
+    if (ImGui::Checkbox("Tilt Mode", &m_TiltMode))
+    {
+        // Enabling Tilt Mode should re-enable yaw control for users who want it.
+        if (m_TiltMode) m_DisableYaw = false;
+        SaveSettings();
+    }
     if (m_TiltMode)
     {
         ImGui::Indent();
-        ImGui::TextDisabled("Mouse left/right rolls the camera (old tilted look).");
+        ImGui::TextDisabled("Tilt Mode: enables rolled look and allows yaw control.");
         ImGui::Unindent();
     }
     if (!m_TiltMode)
@@ -819,6 +833,9 @@ void PhotoModePlugin::OnImGuiRender()
             if (m_FollowIgnoreExceptMouse) m_FollowIgnoreAllInput = false;
             SaveSettings();
         }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Block Camera Position Movement (allow angle only)", &m_BlockPositionMovement)) SaveSettings();
+        if (m_BlockPositionMovement) m_FollowOffset = Vector3f{0.0f, 0.0f, 0.0f};
         ImGui::TextDisabled("Camera tracks Arno as he runs; world stays live.");
         ImGui::TextDisabled("Use the options above to block camera controls while following.");
         ImGui::Unindent();
@@ -830,9 +847,7 @@ void PhotoModePlugin::OnImGuiRender()
     if (ImGui::SliderFloat("FOV", &m_Fov, MIN_FOV, MAX_FOV, "%.2f")) SaveSettings();
     if (ImGui::Checkbox("Invert X", &m_InvertX)) SaveSettings();
     if (ImGui::Checkbox("Invert Y", &m_InvertY)) SaveSettings();
-    if (ImGui::Checkbox("Disable Yaw", &m_DisableYaw)) SaveSettings();
-    if (ImGui::Checkbox("Disable Pitch", &m_DisablePitch)) SaveSettings();
-    if (ImGui::Checkbox("Disable Roll", &m_DisableRoll)) SaveSettings();
+    // Per-axis disable UI removed; yaw is disabled by default and can be re-enabled by enabling Tilt Mode.
     if (ImGui::Checkbox("Disable Camera Smoothing", &m_DisableSmoothing)) SaveSettings();
 
     ImGui::Separator();
