@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <shlobj.h>
+#include <sstream>
 
 static constexpr float PI = 3.14159265358979323846f;
 static constexpr float VERTICAL_LIMIT = 1.48f;
@@ -276,6 +277,93 @@ void PhotoModePlugin::LoadSettings()
     }
     // If Tilt Mode was loaded as enabled, allow yaw control (user intent).
     if (m_TiltMode) m_DisableYaw = false;
+}
+
+std::string PhotoModePlugin::GetRecordingPath() const
+{
+    char documents[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documents)))
+    {
+        std::string path(documents);
+        path += "\\Assassin's Creed Unity\\PhotoModePlugin_recording.csv";
+        return path;
+    }
+    return "PhotoModePlugin_recording.csv";
+}
+
+static PhotoModePlugin::RecSample MakeSampleFromCurrent(PhotoModePlugin* pm)
+{
+    PhotoModePlugin::RecSample s{};
+    uint64 now = GetTickCount64();
+    s.t = now - pm->m_RecordStartTick;
+    Entity* player = ACU::GetPlayer();
+    if (player) s.pos = player->GetPosition(); else s.pos = pm->m_FreeCamPos;
+    s.yaw = pm->m_Yaw;
+    s.pitch = pm->m_Pitch;
+    s.fov = pm->m_Fov;
+    return s;
+}
+
+bool SaveRecordCSV(const std::string& path, const std::vector<PhotoModePlugin::RecSample>& rec)
+{
+    try {
+        std::ofstream f(path);
+        if (!f) return false;
+        f << "t,posx,posy,posz,yaw,pitch,fov\n";
+        for (auto &s : rec)
+        {
+            f << s.t << ',' << s.pos.x << ',' << s.pos.y << ',' << s.pos.z << ','
+              << s.yaw << ',' << s.pitch << ',' << s.fov << '\n';
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+bool LoadRecordCSV(const std::string& path, std::vector<PhotoModePlugin::RecSample>& out)
+{
+    out.clear();
+    try {
+        std::ifstream f(path);
+        if (!f) return false;
+        std::string line;
+        // skip header
+        if (!std::getline(f, line)) return false;
+        while (std::getline(f, line))
+        {
+            if (line.empty()) continue;
+            std::stringstream ss(line);
+            PhotoModePlugin::RecSample s{};
+            char comma;
+            if (!(ss >> s.t >> comma)) continue;
+            // read commas separated: we need to parse differently
+            ss.clear(); ss.str(line);
+            std::string token;
+            std::vector<std::string> toks;
+            while (std::getline(ss, token, ',')) toks.push_back(token);
+            if (toks.size() < 7) continue;
+            s.t = std::stoull(toks[0]);
+            s.pos.x = std::stof(toks[1]);
+            s.pos.y = std::stof(toks[2]);
+            s.pos.z = std::stof(toks[3]);
+            s.yaw = std::stof(toks[4]);
+            s.pitch = std::stof(toks[5]);
+            s.fov = std::stof(toks[6]);
+            out.push_back(s);
+        }
+        return !out.empty();
+    } catch (...) { return false; }
+}
+
+static float LerpFloat(float a, float b, float t) { return a + (b - a) * t; }
+static Vector3f LerpVec(const Vector3f& a, const Vector3f& b, float t) { return a * (1.0f - t) + b * t; }
+
+// Interpolate yaw taking wraparound into account
+static float InterpYaw(float a, float b, float t)
+{
+    float diff = b - a;
+    while (diff > PI) diff -= 2*PI;
+    while (diff < -PI) diff += 2*PI;
+    return a + diff * t;
 }
 
 void PhotoModePlugin::SaveSettings()
@@ -695,6 +783,52 @@ void PhotoModePlugin::OnUpdate()
     m_LastTick = now;
 
     if (m_Mode == Mode::Free) UpdateFreeInput(dt);
+
+    // Recording sampling
+    if (m_Recording)
+    {
+        PhotoModePlugin::RecSample s = MakeSampleFromCurrent(this);
+        m_Record.push_back(s);
+    }
+
+    // Replay handling (drive freecam/player)
+    if (m_Replaying && !m_Record.empty())
+    {
+        uint64 now = GetTickCount64();
+        uint64 rel = (uint64)((now - m_ReplayStartTick) * m_ReplaySpeed);
+        // clamp to last sample time
+        uint64 lastT = m_Record.back().t;
+        if (rel >= lastT)
+        {
+            // apply final sample and stop
+            auto &s = m_Record.back();
+            m_FreeCamPos = s.pos;
+            m_Yaw = s.yaw; m_Pitch = s.pitch; m_Fov = s.fov;
+            if (m_ReplayTeleportPlayer)
+            {
+                if (Entity* player = ACU::GetPlayer()) player->GetPosition() = s.pos;
+            }
+            m_Replaying = false;
+        }
+        else
+        {
+            // find samples
+            size_t i = 0;
+            while (i + 1 < m_Record.size() && m_Record[i+1].t < rel) ++i;
+            const auto &s0 = m_Record[i];
+            const auto &s1 = m_Record[i+1];
+            float frac = float(rel - s0.t) / float(s1.t - s0.t);
+            Vector3f pos = LerpVec(s0.pos, s1.pos, frac);
+            float yaw = InterpYaw(s0.yaw, s1.yaw, frac);
+            float pitch = LerpFloat(s0.pitch, s1.pitch, frac);
+            float fov = LerpFloat(s0.fov, s1.fov, frac);
+            m_FreeCamPos = pos; m_Yaw = yaw; m_Pitch = pitch; m_Fov = fov;
+            if (m_ReplayTeleportPlayer)
+            {
+                if (Entity* player = ACU::GetPlayer()) player->GetPosition() = pos;
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -881,6 +1015,57 @@ void PhotoModePlugin::OnImGuiRender()
     }
     ImGui::TextDisabled("Switch between saved poses with ',' and '.'");
 
+    ImGui::Separator();
+
+    ImGui::TextDisabled("RECORDING");
+    if (!m_Recording)
+    {
+        if (ImGui::Button("Start Recording"))
+        {
+            m_Record.clear();
+            m_Recording = true;
+            m_RecordStartTick = GetTickCount64();
+        }
+    }
+    else
+    {
+        if (ImGui::Button("Stop Recording")) m_Recording = false;
+        ImGui::SameLine();
+        if (ImGui::Button("Save Recording")) SaveRecordCSV(GetRecordingPath(), m_Record);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load Recording")) LoadRecordCSV(GetRecordingPath(), m_Record);
+    ImGui::TextDisabled("Samples: %zu", m_Record.size());
+    ImGui::Separator();
+
+    ImGui::TextDisabled("REPLAY");
+    if (!m_Replaying)
+    {
+        if (ImGui::Button("Start Replay"))
+        {
+            if (!m_Record.empty())
+            {
+                m_Replaying = true;
+                m_ReplayStartTick = GetTickCount64();
+            }
+        }
+    }
+    else
+    {
+        if (ImGui::Button("Stop Replay")) m_Replaying = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Replay -> Teleport Player"))
+    {
+        if (!m_Record.empty())
+        {
+            m_Replaying = true;
+            m_ReplayStartTick = GetTickCount64();
+            m_ReplayTeleportPlayer = true;
+        }
+    }
+    if (ImGui::SliderFloat("Replay Speed", &m_ReplaySpeed, 0.1f, 4.0f, "%.2f")) {}
+    ImGui::Checkbox("Teleport Player During Replay", &m_ReplayTeleportPlayer);
     ImGui::Separator();
 
     if (ImGui::Button("RESET CAMERA", ImVec2(-1.0f, 0.0f)))

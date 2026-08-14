@@ -136,6 +136,18 @@ private:
     uint64 m_SavedPlayerFlags88 = 0;
 
     uint64 m_LastTick = 0;
+
+    // Recording / Replay
+    struct RecSample { uint64 t; Vector3f pos; float yaw; float pitch; float fov; };
+    std::vector<RecSample> m_Record;
+    bool m_Recording = false;
+    uint64 m_RecordStartTick = 0;
+
+    bool m_Replaying = false;
+    uint64 m_ReplayStartTick = 0;
+    float m_ReplaySpeed = 1.0f;
+    bool m_ReplayTeleportPlayer = false; // if true, teleport player during replay
+    std::string GetRecordingPath() const;
 };
 
 extern PhotoModePlugin* g_pPhotoMode;
