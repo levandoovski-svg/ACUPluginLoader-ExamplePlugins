@@ -132,9 +132,6 @@ struct PhotoModeCameraHook : AutoAssemblerCodeHolder_Base
                 if (!photoMode) return;
 
                 ++photoMode->m_HookHitCount;
-                photoMode->m_HookAlive = true;
-
-                if (!photoMode->ShouldOverrideFrame()) return;
 
                 auto* cam = (ACUPlayerCameraComponent*)params->r14_;
                 if (!cam) return;
@@ -143,11 +140,13 @@ struct PhotoModeCameraHook : AutoAssemblerCodeHolder_Base
                 {
                     switch (photoMode->GetMode())
                     {
-                    case PhotoModePlugin::Mode::Free:      photoMode->ApplyFreeCamera(cam); break;
-                    default: break;
+                    case PhotoModePlugin::Mode::Free:
+                        photoMode->ApplyFreeCamera(cam);
+                        break;
+                    default:
+                        break;
                     }
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {}
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
             },
             RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, executeStolenBytes);
     }
@@ -261,7 +260,7 @@ void PhotoModePlugin::LoadSettings()
         else if (line.rfind("DisableRoll=", 0) == 0)
             m_DisableRoll = (line.substr(11) == "1");
         else if (line.rfind("BlockPositionMovement=", 0) == 0)
-            m_BlockPositionMovement = (line.substr(22) == "1");
+            ; // removed option: ignore for backward compatibility
         else if (line.rfind("FreezeCamera=", 0) == 0)
             m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
@@ -291,16 +290,16 @@ std::string PhotoModePlugin::GetRecordingPath() const
     return "PhotoModePlugin_recording.csv";
 }
 
-static PhotoModePlugin::RecSample MakeSampleFromCurrent(PhotoModePlugin* pm)
+PhotoModePlugin::RecSample PhotoModePlugin::MakeSampleFromCurrent()
 {
-    PhotoModePlugin::RecSample s{};
+    RecSample s{};
     uint64 now = GetTickCount64();
-    s.t = now - pm->m_RecordStartTick;
+    s.t = now - m_RecordStartTick;
     Entity* player = ACU::GetPlayer();
-    if (player) s.pos = player->GetPosition(); else s.pos = pm->m_FreeCamPos;
-    s.yaw = pm->m_Yaw;
-    s.pitch = pm->m_Pitch;
-    s.fov = pm->m_Fov;
+    if (player) s.pos = player->GetPosition(); else s.pos = m_FreeCamPos;
+    s.yaw = m_Yaw;
+    s.pitch = m_Pitch;
+    s.fov = m_Fov;
     return s;
 }
 
@@ -388,7 +387,6 @@ void PhotoModePlugin::SaveSettings()
                  << "DisableYaw=" << (m_DisableYaw ? 1 : 0) << "\n"
                  << "DisablePitch=" << (m_DisablePitch ? 1 : 0) << "\n"
                  << "DisableRoll=" << (m_DisableRoll ? 1 : 0) << "\n"
-                 << "BlockPositionMovement=" << (m_BlockPositionMovement ? 1 : 0) << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
@@ -472,7 +470,7 @@ void PhotoModePlugin::EnterFreeMode()
     {
         Entity* player = ACU::GetPlayer();
         if (player)
-            m_FollowOffset = m_BlockPositionMovement ? Vector3f{0.0f, 0.0f, 0.0f} : (m_FreeCamPos - player->GetPosition());
+            m_FollowOffset = m_FreeCamPos - player->GetPosition();
         // Follow Player keeps the world live so Arno stays controllable.
         m_FreezeWorld = false;
     }
@@ -632,7 +630,6 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     // and is independent of the game clock. Movement may be disabled while
     // following depending on the follow-player ignore settings.
     bool movementAllowed = !frozen && (!m_FollowPlayer || (!m_FollowIgnoreAllInput && !m_FollowIgnoreExceptMouse));
-    if (m_BlockPositionMovement) movementAllowed = false;
     if (movementAllowed)
     {
         float speed = m_MoveSpeed;
@@ -667,10 +664,7 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
     {
         Entity* player = ACU::GetPlayer();
         if (player)
-            if (!m_BlockPositionMovement)
-                m_FollowOffset = m_FreeCamPos - player->GetPosition();
-            else
-                m_FollowOffset = Vector3f{0.0f, 0.0f, 0.0f};
+            m_FollowOffset = m_FreeCamPos - player->GetPosition();
     }
 }
 
@@ -709,7 +703,7 @@ void PhotoModePlugin::ApplyCameraSlot(int index)
     {
         Entity* player = ACU::GetPlayer();
         if (player)
-            m_FollowOffset = m_BlockPositionMovement ? Vector3f{0.0f, 0.0f, 0.0f} : (m_FreeCamPos - player->GetPosition());
+            m_FollowOffset = m_FreeCamPos - player->GetPosition();
     }
 }
 
@@ -787,8 +781,7 @@ void PhotoModePlugin::OnUpdate()
     // Recording sampling
     if (m_Recording)
     {
-        PhotoModePlugin::RecSample s = MakeSampleFromCurrent(this);
-        m_Record.push_back(s);
+        m_Record.push_back(MakeSampleFromCurrent());
     }
 
     // Replay handling (drive freecam/player)
@@ -910,7 +903,7 @@ void PhotoModePlugin::OnImGuiRender()
             {
                 Entity* player = ACU::GetPlayer();
                 if (player)
-                    m_FollowOffset = m_BlockPositionMovement ? Vector3f{0.0f,0.0f,0.0f} : (m_FreeCamPos - player->GetPosition());
+                    m_FollowOffset = m_FreeCamPos - player->GetPosition();
             }
         }
         SaveSettings();
@@ -967,9 +960,7 @@ void PhotoModePlugin::OnImGuiRender()
             if (m_FollowIgnoreExceptMouse) m_FollowIgnoreAllInput = false;
             SaveSettings();
         }
-        ImGui::SameLine();
-        if (ImGui::Checkbox("Block Camera Position Movement (allow angle only)", &m_BlockPositionMovement)) SaveSettings();
-        if (m_BlockPositionMovement) m_FollowOffset = Vector3f{0.0f, 0.0f, 0.0f};
+        // BlockPositionMovement option removed per UI simplification.
         ImGui::TextDisabled("Camera tracks Arno as he runs; world stays live.");
         ImGui::TextDisabled("Use the options above to block camera controls while following.");
         ImGui::Unindent();
@@ -1081,22 +1072,23 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::TextDisabled("Hook hits: %llu (%s)",
         m_HookHitCount, m_HookAlive ? "address live" : "NOT HIT - address may be wrong");
 
-    __try {
-        ACUPlayerCameraComponent* cam = ACU::GetPlayerCameraComponent();
-        Entity* player = ACU::GetPlayer();
-        if (cam)
-        {
-            ImGui::Text("Cam pos: %.1f, %.1f, %.1f",
-                cam->positionLookFrom.x, cam->positionLookFrom.y, cam->positionLookFrom.z);
-            ImGui::Text("FOV: %.2f (ours: %.2f)", cam->fov_mb_pi_4, m_Fov);
-        }
-        if (player)
-        {
-            Vector3f p = player->GetPosition();
-            ImGui::Text("Player pos: %.1f, %.1f, %.1f", p.x, p.y, p.z);
-        }
-        ImGui::Text("Yaw: %.2f  Pitch: %.2f  FOV: %.2f", m_Yaw, m_Pitch, m_Fov);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ACUPlayerCameraComponent* cam = nullptr;
+    Entity* player = nullptr;
+    __try { cam = ACU::GetPlayerCameraComponent(); } __except (EXCEPTION_EXECUTE_HANDLER) { cam = nullptr; }
+    __try { player = ACU::GetPlayer(); } __except (EXCEPTION_EXECUTE_HANDLER) { player = nullptr; }
+
+    if (cam)
+    {
+        ImGui::Text("Cam pos: %.1f, %.1f, %.1f",
+            cam->positionLookFrom.x, cam->positionLookFrom.y, cam->positionLookFrom.z);
+        ImGui::Text("FOV: %.2f (ours: %.2f)", cam->fov_mb_pi_4, m_Fov);
+    }
+    if (player)
+    {
+        Vector3f p = player->GetPosition();
+        ImGui::Text("Player pos: %.1f, %.1f, %.1f", p.x, p.y, p.z);
+    }
+    ImGui::Text("Yaw: %.2f  Pitch: %.2f  FOV: %.2f", m_Yaw, m_Pitch, m_Fov);
 
     ImGui::Unindent();
 }

@@ -43,6 +43,9 @@ public:
     Mode GetMode() const { return m_Mode; }
     void ApplyFreeCamera(ACUPlayerCameraComponent* cam);
 
+    // Recording sample type made public for helper functions.
+    struct RecSample { uint64 t; Vector3f pos; float yaw; float pitch; float fov; };
+
     // Hook-verification stats (shown in the ImGui panel so you can confirm
     // 0x141F3FE3B is live on your build).
     uint64 m_HookHitCount = 0;
@@ -123,7 +126,7 @@ private:
     bool m_DisablePitch = false;
     bool m_DisableRoll = false;
     // Block camera POSITION movement but allow angle movement (while following, centers on player)
-    bool m_BlockPositionMovement = false;
+    // m_BlockPositionMovement removed; kept behavior simple.
     float m_MoveSpeed = 4.0f;           // Free mode: world units / second.
     float m_MouseSensitivity = 0.003f;  // Same default as FreeCameraRotation.
     bool m_InvertX = false;
@@ -138,10 +141,12 @@ private:
     uint64 m_LastTick = 0;
 
     // Recording / Replay
-    struct RecSample { uint64 t; Vector3f pos; float yaw; float pitch; float fov; };
     std::vector<RecSample> m_Record;
     bool m_Recording = false;
     uint64 m_RecordStartTick = 0;
+
+    // create a sample from the current plugin state (used while recording)
+    RecSample MakeSampleFromCurrent();
 
     bool m_Replaying = false;
     uint64 m_ReplayStartTick = 0;
