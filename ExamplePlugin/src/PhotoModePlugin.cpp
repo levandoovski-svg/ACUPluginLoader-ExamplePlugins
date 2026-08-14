@@ -251,6 +251,14 @@ void PhotoModePlugin::LoadSettings()
             try { m_TiltAngle = std::stof(line.substr(10)); } catch (...) {}
         else if (line.rfind("MouseTilt=", 0) == 0)
             m_MouseTilt = (line.substr(10) == "1");
+        else if (line.rfind("MouseTiltSensitivity=", 0) == 0)
+            try { m_MouseTiltSensitivity = std::stof(line.substr(21)); } catch (...) {}
+        else if (line.rfind("DisableYaw=", 0) == 0)
+            m_DisableYaw = (line.substr(11) == "1");
+        else if (line.rfind("DisablePitch=", 0) == 0)
+            m_DisablePitch = (line.substr(13) == "1");
+        else if (line.rfind("DisableRoll=", 0) == 0)
+            m_DisableRoll = (line.substr(11) == "1");
         else if (line.rfind("FreezeCamera=", 0) == 0)
             m_FreezeCamera = (line.substr(13) == "1");
         else if (line.rfind("MoveSpeed=", 0) == 0)
@@ -284,6 +292,10 @@ void PhotoModePlugin::SaveSettings()
                  << "TiltMode=" << (m_TiltMode ? 1 : 0) << "\n"
                  << "TiltAngle=" << m_TiltAngle << "\n"
                  << "MouseTilt=" << (m_MouseTilt ? 1 : 0) << "\n"
+                 << "MouseTiltSensitivity=" << m_MouseTiltSensitivity << "\n"
+                 << "DisableYaw=" << (m_DisableYaw ? 1 : 0) << "\n"
+                 << "DisablePitch=" << (m_DisablePitch ? 1 : 0) << "\n"
+                 << "DisableRoll=" << (m_DisableRoll ? 1 : 0) << "\n"
                  << "MoveSpeed=" << m_MoveSpeed << "\n"
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
@@ -478,21 +490,33 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
                 if (m_MouseTilt)
                 {
                     // Mouse Tilt: X dials the Tilt Angle (±180) so roll can be
-                    // set by feel; Y still orbits pitch. Yaw is not touched.
-                    m_TiltAngle += (float)dx * m_MouseSensitivity * 3.0f * xMult;
-                    if (m_TiltAngle > 180.0f) m_TiltAngle = 180.0f;
-                    if (m_TiltAngle < -180.0f) m_TiltAngle = -180.0f;
-                    m_Pitch += (float)dy * m_MouseSensitivity * yMult;
-                    if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
-                    if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+                    // set by feel; Y still orbits pitch. Yaw may be disabled.
+                    if (!m_DisableRoll)
+                    {
+                        m_TiltAngle += (float)dx * m_MouseSensitivity * m_MouseTiltSensitivity * xMult;
+                        if (m_TiltAngle > 180.0f) m_TiltAngle = 180.0f;
+                        if (m_TiltAngle < -180.0f) m_TiltAngle = -180.0f;
+                    }
+                    if (!m_DisablePitch)
+                    {
+                        m_Pitch += (float)dy * m_MouseSensitivity * yMult;
+                        if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
+                        if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+                    }
                 }
                 else
                 {
-                    m_Yaw += (float)dx * m_MouseSensitivity * xMult;
-                    m_Pitch += (float)dy * m_MouseSensitivity * yMult;
-                    m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
-                    if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
-                    if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+                    if (!m_DisableYaw)
+                    {
+                        m_Yaw += (float)dx * m_MouseSensitivity * xMult;
+                        m_Yaw = BringToIntervalWithWraparound(m_Yaw, -PI, PI);
+                    }
+                    if (!m_DisablePitch)
+                    {
+                        m_Pitch += (float)dy * m_MouseSensitivity * yMult;
+                        if (m_Pitch > VERTICAL_LIMIT) m_Pitch = VERTICAL_LIMIT;
+                        if (m_Pitch < -VERTICAL_LIMIT) m_Pitch = -VERTICAL_LIMIT;
+                    }
                 }
             }
 
@@ -778,6 +802,7 @@ void PhotoModePlugin::OnImGuiRender()
         {
             ImGui::Indent();
             ImGui::TextDisabled("Mouse X now rolls the camera; use the slider or Y to orbit pitch.");
+            if (ImGui::SliderFloat("Mouse Tilt Sensitivity", &m_MouseTiltSensitivity, 0.1f, 10.0f, "%.2f")) SaveSettings();
             ImGui::Unindent();
         }
     }
@@ -805,6 +830,9 @@ void PhotoModePlugin::OnImGuiRender()
     if (ImGui::SliderFloat("FOV", &m_Fov, MIN_FOV, MAX_FOV, "%.2f")) SaveSettings();
     if (ImGui::Checkbox("Invert X", &m_InvertX)) SaveSettings();
     if (ImGui::Checkbox("Invert Y", &m_InvertY)) SaveSettings();
+    if (ImGui::Checkbox("Disable Yaw", &m_DisableYaw)) SaveSettings();
+    if (ImGui::Checkbox("Disable Pitch", &m_DisablePitch)) SaveSettings();
+    if (ImGui::Checkbox("Disable Roll", &m_DisableRoll)) SaveSettings();
     if (ImGui::Checkbox("Disable Camera Smoothing", &m_DisableSmoothing)) SaveSettings();
 
     ImGui::Separator();
