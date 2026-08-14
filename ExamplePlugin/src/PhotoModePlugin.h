@@ -43,13 +43,8 @@ public:
     Mode GetMode() const { return m_Mode; }
     void ApplyFreeCamera(ACUPlayerCameraComponent* cam);
 
-    // Recording sample type made public for helper functions.
-    struct RecSample { uint64 t; Vector3f pos; float yaw; float pitch; float fov; };
-
-    // Hook-verification stats (shown in the ImGui panel so you can confirm
-    // 0x141F3FE3B is live on your build).
-    uint64 m_HookHitCount = 0;
-    bool m_HookAlive = false;
+    // Hook-verification stats (kept internal).
+    // (debug UI removed for ship-ready build)
 
 private:
     friend struct PhotoModeCameraHook;
@@ -140,19 +135,7 @@ private:
 
     uint64 m_LastTick = 0;
 
-    // Recording / Replay
-    std::vector<RecSample> m_Record;
-    bool m_Recording = false;
-    uint64 m_RecordStartTick = 0;
-
-    // create a sample from the current plugin state (used while recording)
-    RecSample MakeSampleFromCurrent();
-
-    bool m_Replaying = false;
-    uint64 m_ReplayStartTick = 0;
-    float m_ReplaySpeed = 1.0f;
-    bool m_ReplayTeleportPlayer = false; // if true, teleport player during replay
-    std::string GetRecordingPath() const;
+    // Recording/replay removed for ship-ready build.
 };
 
 extern PhotoModePlugin* g_pPhotoMode;
