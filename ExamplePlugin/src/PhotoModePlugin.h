@@ -110,7 +110,9 @@ private:
     bool m_FreezeWorld = true;          // Free mode: timescale 0.
     bool m_HidePlayer = false;          // Free mode: hide Arno (clean shots).
     bool m_FollowPlayer = false;        // Free mode: camera tracks Arno, world stays live.
-    bool m_FollowAllowMouse = false;    // Follow Player: mouse orbit/FOV allowed; arrows & Q/E stay locked.
+    bool m_FollowAllowMouse = false;    // Follow Player: legacy toggle — mouse orbit/FOV allowed; arrows & Q/E stay locked.
+    bool m_FollowIgnoreAllInput = true; // Follow Player: ignore ALL camera movement input by default (preserves previous behavior)
+    bool m_FollowIgnoreExceptMouse = false; // Follow Player: ignore camera movement input except allow mouse control
     bool m_FreezeCamera = false;        // Free mode: lock camera pose, play without moving it.
     bool m_TiltMode = false;            // Free mode: rolled camera on mouse yaw (quat write).
     float m_TiltAngle = 0.0f;           // Degrees; static roll in normal freecam (carry-over from Tilt Mode).

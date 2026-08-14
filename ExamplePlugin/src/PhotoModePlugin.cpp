@@ -241,6 +241,10 @@ void PhotoModePlugin::LoadSettings()
             m_FollowPlayer = (line.substr(13) == "1");
         else if (line.rfind("FollowAllowMouse=", 0) == 0)
             m_FollowAllowMouse = (line.substr(17) == "1");
+        else if (line.rfind("FollowIgnoreAllInput=", 0) == 0)
+            m_FollowIgnoreAllInput = (line.substr(20) == "1");
+        else if (line.rfind("FollowIgnoreExceptMouse=", 0) == 0)
+            m_FollowIgnoreExceptMouse = (line.substr(24) == "1");
         else if (line.rfind("TiltMode=", 0) == 0)
             m_TiltMode = (line.substr(9) == "1");
         else if (line.rfind("TiltAngle=", 0) == 0)
@@ -274,6 +278,8 @@ void PhotoModePlugin::SaveSettings()
                  << "HidePlayer=" << (m_HidePlayer ? 1 : 0) << "\n"
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
                  << "FollowAllowMouse=" << (m_FollowAllowMouse ? 1 : 0) << "\n"
+                 << "FollowIgnoreAllInput=" << (m_FollowIgnoreAllInput ? 1 : 0) << "\n"
+                 << "FollowIgnoreExceptMouse=" << (m_FollowIgnoreExceptMouse ? 1 : 0) << "\n"
                  << "FreezeCamera=" << (m_FreezeCamera ? 1 : 0) << "\n"
                  << "TiltMode=" << (m_TiltMode ? 1 : 0) << "\n"
                  << "TiltAngle=" << m_TiltAngle << "\n"
@@ -441,13 +447,20 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
 
     // Freeze Camera: lock the pose in place — skip the mouse orbit and movement
     // below so Arno can be played without nudging the camera. Follow Player
-    // takes priority (the camera then tracks Arno instead of freezing).
+    // behavior is now configurable via checkboxes: you can ignore all input,
+    // ignore all except mouse, or allow inputs while following.
     const bool frozen = m_FreezeCamera && !m_FollowPlayer;
-    // Follow Player: ALL camera control is blocked by default so Arno's keys
-    // stay free. "Allow Mouse Look" re-enables mouse orbit + FOV wheel; arrow
-    // keys and Q/E remain locked (they'd nudge the camera mid-play).
-    const bool followLocked = m_FollowPlayer && !m_FollowAllowMouse;
-    const bool lookBlocked = followLocked || frozen;
+    const bool followIgnoreAll = m_FollowPlayer && m_FollowIgnoreAllInput;
+    const bool followIgnoreExceptMouse = m_FollowPlayer && m_FollowIgnoreExceptMouse;
+    // Determine whether mouse-based look is allowed this frame.
+    bool mouseAllowed = !frozen;
+    if (m_FollowPlayer)
+    {
+        if (followIgnoreAll) mouseAllowed = false;
+        else if (followIgnoreExceptMouse) mouseAllowed = true;
+        else mouseAllowed = m_FollowAllowMouse; // legacy behavior
+    }
+    const bool lookBlocked = !mouseAllowed;
 
     // Mouse orbit + FOV wheel (ignored while frozen, or while Following Player
     // unless "Allow Mouse Look" is on).
@@ -498,11 +511,11 @@ void PhotoModePlugin::UpdateFreeInput(float dt)
             m_FreeCamPos = player->GetPosition() + m_FollowOffset;
     }
 
-    // Arrow-key / QE fly (ignored while frozen, and always ignored in Follow
-    // Player so the keys stay with Arno). Movement is along the camera plane
-    // (flat forward/right), independent of the game clock (world may be frozen
-    // at timescale 0).
-    if (!frozen && !m_FollowPlayer)
+    // Arrow-key / QE fly. Movement is along the camera plane (flat forward/right)
+    // and is independent of the game clock. Movement may be disabled while
+    // following depending on the follow-player ignore settings.
+    bool movementAllowed = !frozen && (!m_FollowPlayer || (!m_FollowIgnoreAllInput && !m_FollowIgnoreExceptMouse));
+    if (movementAllowed)
     {
         float speed = m_MoveSpeed;
         if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 10.0f;
@@ -771,9 +784,18 @@ void PhotoModePlugin::OnImGuiRender()
     if (m_FollowPlayer)
     {
         ImGui::Indent();
-        if (ImGui::Checkbox("Allow Mouse Look (Follow)", &m_FollowAllowMouse)) SaveSettings();
+        if (ImGui::Checkbox("Ignore Camera Movement Input (Follow)", &m_FollowIgnoreAllInput))
+        {
+            if (m_FollowIgnoreAllInput) m_FollowIgnoreExceptMouse = false;
+            SaveSettings();
+        }
+        if (ImGui::Checkbox("Ignore Camera Movement Input Except Mouse (Follow)", &m_FollowIgnoreExceptMouse))
+        {
+            if (m_FollowIgnoreExceptMouse) m_FollowIgnoreAllInput = false;
+            SaveSettings();
+        }
         ImGui::TextDisabled("Camera tracks Arno as he runs; world stays live.");
-        ImGui::TextDisabled("Arrow keys & Q/E stay locked; the option above unlocks the mouse.");
+        ImGui::TextDisabled("Use the options above to block camera controls while following.");
         ImGui::Unindent();
     }
     if (ImGui::SliderFloat("Move Speed", &m_MoveSpeed, 0.5f, 20.0f, "%.1f")) SaveSettings();
