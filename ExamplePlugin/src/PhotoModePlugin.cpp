@@ -21,6 +21,27 @@ static constexpr float MAX_FOV = 2.0f;
 
 PhotoModePlugin* g_pPhotoMode = nullptr;
 
+// Small C-style SEH helpers: keep any __try blocks inside functions
+// that have only POD locals so MSVC won't complain about C2712.
+static ACUPlayerCameraComponent* SafeGetPlayerCameraComponent()
+{
+    ACUPlayerCameraComponent* cam = nullptr;
+    __try { cam = ACU::GetPlayerCameraComponent(); } __except (EXCEPTION_EXECUTE_HANDLER) { cam = nullptr; }
+    return cam;
+}
+
+static Entity* SafeGetPlayer()
+{
+    Entity* p = nullptr;
+    __try { p = ACU::GetPlayer(); } __except (EXCEPTION_EXECUTE_HANDLER) { p = nullptr; }
+    return p;
+}
+
+static void SafeApplyFreeCamera(PhotoModePlugin* photoMode, ACUPlayerCameraComponent* cam)
+{
+    __try { if (photoMode && cam) { switch (photoMode->GetMode()) { case PhotoModePlugin::Mode::Free: photoMode->ApplyFreeCamera(cam); break; default: break; } } } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 PhotoModePlugin::PhotoModePlugin()
 {
     g_pPhotoMode = this;
@@ -136,17 +157,7 @@ struct PhotoModeCameraHook : AutoAssemblerCodeHolder_Base
                 auto* cam = (ACUPlayerCameraComponent*)params->r14_;
                 if (!cam) return;
 
-                __try
-                {
-                    switch (photoMode->GetMode())
-                    {
-                    case PhotoModePlugin::Mode::Free:
-                        photoMode->ApplyFreeCamera(cam);
-                        break;
-                    default:
-                        break;
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                SafeApplyFreeCamera(photoMode, cam);
             },
             RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, executeStolenBytes);
     }
@@ -1072,10 +1083,8 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::TextDisabled("Hook hits: %llu (%s)",
         m_HookHitCount, m_HookAlive ? "address live" : "NOT HIT - address may be wrong");
 
-    ACUPlayerCameraComponent* cam = nullptr;
-    Entity* player = nullptr;
-    __try { cam = ACU::GetPlayerCameraComponent(); } __except (EXCEPTION_EXECUTE_HANDLER) { cam = nullptr; }
-    __try { player = ACU::GetPlayer(); } __except (EXCEPTION_EXECUTE_HANDLER) { player = nullptr; }
+    ACUPlayerCameraComponent* cam = SafeGetPlayerCameraComponent();
+    Entity* player = SafeGetPlayer();
 
     if (cam)
     {
