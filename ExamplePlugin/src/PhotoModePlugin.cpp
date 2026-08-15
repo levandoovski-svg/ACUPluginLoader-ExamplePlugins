@@ -834,10 +834,20 @@ void PhotoModePlugin::OnUpdate()
     }
     if (resetDown && !m_PrevResetDown && m_Mode != Mode::None)
         ResetCamera();
-    if (freezeWorldToggleDown && !m_PrevFreezeWorldKeyDown && m_Mode == Mode::Free && !m_FollowPlayer && !m_FreezeCamera)
+    if (freezeWorldToggleDown && !m_PrevFreezeWorldKeyDown)
     {
-        m_FreezeWorld = !m_FreezeWorld;
-        SaveSettings();
+        if (m_Mode == Mode::Free && !m_FollowPlayer && !m_FreezeCamera)
+        {
+            m_FreezeWorld = !m_FreezeWorld;
+            SaveSettings();
+        }
+        else if (m_Mode == Mode::None)
+        {
+            // World-only pause: allow the hotkey to freeze/unfreeze the world
+            // without entering photo mode itself.
+            m_FreezeWorld = !m_FreezeWorld;
+            SaveSettings();
+        }
     }
 
     m_PrevFreeDown = freeDown;
