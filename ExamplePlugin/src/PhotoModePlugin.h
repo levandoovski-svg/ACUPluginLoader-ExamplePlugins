@@ -96,6 +96,10 @@ private:
     bool m_PrevCommaDown = false;
     bool m_PrevPeriodDown = false;
 
+    // Slot hotkeys (1-9 for slots 1-9; default to numeric keys).
+    int m_SlotKeys[9] = { '1', '2', '3', '4', '5', '6', '7', '8', '9' };
+    bool m_PrevSlotKeyDown[9] = { false, false, false, false, false, false, false, false, false };
+
     // Snapshot of the game camera taken when entering a mode.
     // "Reset Camera" restores it.
     bool m_HasSnapshot = false;

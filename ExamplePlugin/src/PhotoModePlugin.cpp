@@ -284,6 +284,18 @@ void PhotoModePlugin::LoadSettings()
             m_InvertY = (line.substr(8) == "1");
         else if (line.rfind("DisableSmoothing=", 0) == 0)
             m_DisableSmoothing = (line.substr(17) == "1");
+        
+        // Load slot key bindings
+        for (int i = 0; i < 9; ++i)
+        {
+            std::string prefix = "SlotKey" + std::to_string(i + 1) + "=";
+            if (line.rfind(prefix, 0) == 0)
+            {
+                try { m_SlotKeys[i] = std::stoi(line.substr(prefix.length()), nullptr, 16); } 
+                catch (...) {}
+                break;
+            }
+        }
     }
     // If Tilt Mode was loaded as enabled, allow yaw control (user intent).
     if (m_TiltMode) m_DisableYaw = false;
@@ -330,9 +342,29 @@ void PhotoModePlugin::SaveSettings()
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
                  << "InvertY=" << (m_InvertY ? 1 : 0) << "\n"
                  << "DisableSmoothing=" << (m_DisableSmoothing ? 1 : 0) << "\n";
+            
+            // Save slot key bindings
+            for (int i = 0; i < 9; ++i)
+                file << "SlotKey" << (i + 1) << "=" << std::hex << m_SlotKeys[i] << std::dec << "\n";
+            
+            // Save camera slots
+            for (int i = 0; i < 9; ++i)
+            {
+                if (!m_Slots[i].used) continue;
+                std::string prefix = "Slot" + std::to_string(i + 1) + "_";
+                file << prefix << "Used=1\n"
+                     << prefix << "PosX=" << m_Slots[i].pos.x << "\n"
+                     << prefix << "PosY=" << m_Slots[i].pos.y << "\n"
+                     << prefix << "PosZ=" << m_Slots[i].pos.z << "\n"
+                     << prefix << "Yaw=" << m_Slots[i].yaw << "\n"
+                     << prefix << "Pitch=" << m_Slots[i].pitch << "\n"
+                     << prefix << "Fov=" << m_Slots[i].fov << "\n"
+                     << prefix << "Tilt=" << m_Slots[i].tilt << "\n";
+            }
         }
     } catch (...) {}
 }
+
 
 // ============================================================
 // Lifecycle
@@ -625,6 +657,7 @@ int PhotoModePlugin::SaveCurrentCameraSlot()
     m_Slots[slot].fov = m_Fov;
     m_Slots[slot].tilt = m_TiltAngle;
     m_ActiveSlot = slot;
+    SaveSettings(); // Persist the slot to INI file
     return slot;
 }
 
@@ -706,6 +739,18 @@ void PhotoModePlugin::OnUpdate()
     if (periodDown && !m_PrevPeriodDown && m_Mode != Mode::None) CycleCameraSlots(1);
     m_PrevCommaDown = commaDown;
     m_PrevPeriodDown = periodDown;
+
+    // Direct slot selection via hotkeys (1-9)
+    if (m_Mode != Mode::None)
+    {
+        for (int i = 0; i < 9; ++i)
+        {
+            const bool slotDown = (GetAsyncKeyState(m_SlotKeys[i]) & 0x8000) != 0;
+            if (slotDown && !m_PrevSlotKeyDown[i] && m_Slots[i].used)
+                ApplyCameraSlot(i);
+            m_PrevSlotKeyDown[i] = slotDown;
+        }
+    }
 
     if (m_Mode == Mode::None) return;
 
@@ -882,12 +927,20 @@ void PhotoModePlugin::OnImGuiRender()
     {
         for (int i = 0; i < 9; ++i) m_Slots[i].used = false;
         m_ActiveSlot = -1;
+        SaveSettings(); // Persist the cleared slots
     }
     for (int i = 0; i < 9; ++i)
     {
         if (!m_Slots[i].used) continue;
-        char label[32];
-        sprintf_s(label, "Slot %d%s", i + 1, (m_ActiveSlot == i) ? " *" : "");
+        
+        // Get the character representation of the slot key
+        char keyChar = (char)m_SlotKeys[i];
+        char label[64];
+        if (keyChar >= 32 && keyChar < 127)
+            sprintf_s(label, sizeof(label), "Slot %d [%c]%s", i + 1, keyChar, (m_ActiveSlot == i) ? " *" : "");
+        else
+            sprintf_s(label, sizeof(label), "Slot %d [0x%02X]%s", i + 1, m_SlotKeys[i], (m_ActiveSlot == i) ? " *" : "");
+        
         if (ImGui::Button(label))
             ApplyCameraSlot(i);
         ImGui::SameLine();
@@ -897,9 +950,10 @@ void PhotoModePlugin::OnImGuiRender()
         {
             m_Slots[i].used = false;
             if (m_ActiveSlot == i) m_ActiveSlot = -1;
+            SaveSettings(); // Persist the cleared slot
         }
     }
-    ImGui::TextDisabled("Switch between saved poses with ',' and '.'");
+    ImGui::TextDisabled("Use 1-9 keys, ',' or '.' to switch between saved poses");
 
 
     // Recording/replay UI removed for ship-ready build.
