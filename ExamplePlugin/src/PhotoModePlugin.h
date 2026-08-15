@@ -66,13 +66,15 @@ private:
     bool m_Enabled = true;
     Mode m_Mode = Mode::None;
 
-    // Hotkeys (rebindable; F9/F11 defaults).
+    // Hotkeys (rebindable; F9/F11/F12 defaults).
     int m_FreeCamKey = VK_F9;
     int m_ResetKey = VK_F11;
+    int m_FreezeWorldKey = VK_F12;
     bool m_WaitingForKey = false;
-    int m_RebindTarget = 0; // 1=FreeCamKey, 3=ResetKey
+    int m_RebindTarget = 0; // 1=FreeCamKey, 3=ResetKey, 4=FreezeWorldKey
     bool m_PrevFreeDown = false;
     bool m_PrevResetDown = false;
+    bool m_PrevFreezeWorldKeyDown = false;
 
     // Plugin-owned camera state.
     Vector3f m_FreeCamPos;   // Free mode: absolute camera position.

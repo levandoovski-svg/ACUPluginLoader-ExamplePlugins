@@ -244,6 +244,8 @@ void PhotoModePlugin::LoadSettings()
             try { m_FreeCamKey = std::stoi(line.substr(11), nullptr, 16); } catch (...) {}
         else if (line.rfind("ResetKey=", 0) == 0)
             try { m_ResetKey = std::stoi(line.substr(9), nullptr, 16); } catch (...) {}
+        else if (line.rfind("FreezeWorldKey=", 0) == 0)
+            try { m_FreezeWorldKey = std::stoi(line.substr(15), nullptr, 16); } catch (...) {}
         else if (line.rfind("FreezeWorld=", 0) == 0)
             m_FreezeWorld = (line.substr(12) == "1");
         else if (line.rfind("HidePlayer=", 0) == 0)
@@ -379,6 +381,7 @@ void PhotoModePlugin::SaveSettings()
         {
             file << "FreeCamKey=" << std::hex << m_FreeCamKey << std::dec << "\n"
                  << "ResetKey=" << std::hex << m_ResetKey << std::dec << "\n"
+                 << "FreezeWorldKey=" << std::hex << m_FreezeWorldKey << std::dec << "\n"
                  << "FreezeWorld=" << (m_FreezeWorld ? 1 : 0) << "\n"
                  << "HidePlayer=" << (m_HidePlayer ? 1 : 0) << "\n"
                  << "FollowPlayer=" << (m_FollowPlayer ? 1 : 0) << "\n"
@@ -799,8 +802,19 @@ void PhotoModePlugin::OnUpdate()
         {
             if (IsRisingEdgePressed(vk))
             {
-                if (m_RebindTarget == 1) m_FreeCamKey = vk;
-                else if (m_RebindTarget == 3) m_ResetKey = vk;
+                if (m_RebindTarget == 1) 
+                    m_FreeCamKey = vk;
+                else if (m_RebindTarget == 3) 
+                    m_ResetKey = vk;
+                else if (m_RebindTarget == 4)
+                    m_FreezeWorldKey = vk;
+                // Slot regular keys: 10-18 maps to slots 0-8
+                else if (m_RebindTarget >= 10 && m_RebindTarget < 19)
+                    m_SlotKeys[m_RebindTarget - 10] = vk;
+                // Slot numpad keys: 20-28 maps to slots 0-8
+                else if (m_RebindTarget >= 20 && m_RebindTarget < 29)
+                    m_NumpadSlotKeys[m_RebindTarget - 20] = vk;
+                
                 m_WaitingForKey = false;
                 m_RebindTarget = 0;
                 SaveSettings();
@@ -811,6 +825,7 @@ void PhotoModePlugin::OnUpdate()
 
     const bool freeDown = (GetAsyncKeyState(m_FreeCamKey) & 0x8000) != 0;
     const bool resetDown = (GetAsyncKeyState(m_ResetKey) & 0x8000) != 0;
+    const bool freezeWorldToggleDown = (GetAsyncKeyState(m_FreezeWorldKey) & 0x8000) != 0;
 
     if (freeDown && !m_PrevFreeDown)
     {
@@ -819,9 +834,15 @@ void PhotoModePlugin::OnUpdate()
     }
     if (resetDown && !m_PrevResetDown && m_Mode != Mode::None)
         ResetCamera();
+    if (freezeWorldToggleDown && !m_PrevFreezeWorldKeyDown && m_Mode == Mode::Free && !m_FollowPlayer && !m_FreezeCamera)
+    {
+        m_FreezeWorld = !m_FreezeWorld;
+        SaveSettings();
+    }
 
     m_PrevFreeDown = freeDown;
     m_PrevResetDown = resetDown;
+    m_PrevFreezeWorldKeyDown = freezeWorldToggleDown;
 
     // Saved-camera switching: ',' = previous slot, '.' = next slot.
     const bool commaDown = (GetAsyncKeyState(VK_OEM_COMMA) & 0x8000) != 0;
@@ -907,11 +928,22 @@ void PhotoModePlugin::OnImGuiRender()
         m_RebindTarget = 3;
     }
 
+    ImGui::Text("Freeze World:");
+    ImGui::SameLine();
+    ImGui::Text("0x%02X", m_FreezeWorldKey);
+    ImGui::SameLine();
+    if (ImGui::Button(m_WaitingForKey && m_RebindTarget == 4 ? "Press any key..." : "Rebind##FreezeWorld"))
+    {
+        m_WaitingForKey = true;
+        m_RebindTarget = 4;
+    }
+
     ImGui::Separator();
 
     ImGui::TextDisabled("CONTROLS");
     ImGui::BulletText("F9: toggle free camera");
     ImGui::BulletText("F11: reset camera to entry pose");
+    ImGui::BulletText("Freeze World key: toggle world pause while in free camera");
     ImGui::BulletText("Mouse: look / orbit");
     ImGui::BulletText("Mouse Tilt on: mouse X sets Tilt Angle (roll), Y orbits pitch");
     ImGui::BulletText("Mouse wheel: FOV zoom");
@@ -1054,6 +1086,27 @@ void PhotoModePlugin::OnImGuiRender()
         if (ImGui::Button(label))
             ApplyCameraSlot(i);
         ImGui::SameLine();
+        
+        // Rebind regular key button
+        char rebindLabel[32];
+        sprintf_s(rebindLabel, "Rebind##Key%d", i);
+        if (ImGui::Button(m_WaitingForKey && m_RebindTarget == (10 + i) ? "Press..." : rebindLabel, ImVec2(60, 0)))
+        {
+            m_WaitingForKey = true;
+            m_RebindTarget = 10 + i;
+        }
+        ImGui::SameLine();
+        
+        // Rebind numpad key button
+        char rebindNumpadLabel[32];
+        sprintf_s(rebindNumpadLabel, "NumPad##Key%d", i);
+        if (ImGui::Button(m_WaitingForKey && m_RebindTarget == (20 + i) ? "Press..." : rebindNumpadLabel, ImVec2(60, 0)))
+        {
+            m_WaitingForKey = true;
+            m_RebindTarget = 20 + i;
+        }
+        ImGui::SameLine();
+        
         char clearLabel[32];
         sprintf_s(clearLabel, "Clear##%d", i);
         if (ImGui::Button(clearLabel))
