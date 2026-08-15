@@ -847,33 +847,43 @@ void PhotoModePlugin::OnUpdate()
     // Saved-camera switching: ',' = previous slot, '.' = next slot.
     const bool commaDown = (GetAsyncKeyState(VK_OEM_COMMA) & 0x8000) != 0;
     const bool periodDown = (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) != 0;
-    if (commaDown && !m_PrevCommaDown && m_Mode != Mode::None) CycleCameraSlots(-1);
-    if (periodDown && !m_PrevPeriodDown && m_Mode != Mode::None) CycleCameraSlots(1);
+    if (commaDown && !m_PrevCommaDown)
+    {
+        if (m_Mode == Mode::None) EnterFreeMode();
+        if (m_Mode != Mode::None) CycleCameraSlots(-1);
+    }
+    if (periodDown && !m_PrevPeriodDown)
+    {
+        if (m_Mode == Mode::None) EnterFreeMode();
+        if (m_Mode != Mode::None) CycleCameraSlots(1);
+    }
     m_PrevCommaDown = commaDown;
     m_PrevPeriodDown = periodDown;
 
-    // Direct slot selection via hotkeys (1-9)
-    if (m_Mode != Mode::None)
+    // Direct slot selection via hotkeys (1-9). These can activate freecam on
+    // demand so a saved pose can be used immediately without toggling the mode
+    // first.
+    for (int i = 0; i < 9; ++i)
     {
-        for (int i = 0; i < 9; ++i)
+        const bool slotDown = (GetAsyncKeyState(m_SlotKeys[i]) & 0x8000) != 0;
+        if (slotDown && !m_PrevSlotKeyDown[i] && m_Slots[i].used)
         {
-            const bool slotDown = (GetAsyncKeyState(m_SlotKeys[i]) & 0x8000) != 0;
-            if (slotDown && !m_PrevSlotKeyDown[i] && m_Slots[i].used)
-                ApplyCameraSlot(i);
-            m_PrevSlotKeyDown[i] = slotDown;
+            if (m_Mode == Mode::None) EnterFreeMode();
+            if (m_Mode != Mode::None) ApplyCameraSlot(i);
         }
+        m_PrevSlotKeyDown[i] = slotDown;
     }
 
     // Direct slot selection via numpad hotkeys (Numpad 1-9)
-    if (m_Mode != Mode::None)
+    for (int i = 0; i < 9; ++i)
     {
-        for (int i = 0; i < 9; ++i)
+        const bool numpadDown = (GetAsyncKeyState(m_NumpadSlotKeys[i]) & 0x8000) != 0;
+        if (numpadDown && !m_PrevNumpadSlotKeyDown[i] && m_Slots[i].used)
         {
-            const bool numpadDown = (GetAsyncKeyState(m_NumpadSlotKeys[i]) & 0x8000) != 0;
-            if (numpadDown && !m_PrevNumpadSlotKeyDown[i] && m_Slots[i].used)
-                ApplyCameraSlot(i);
-            m_PrevNumpadSlotKeyDown[i] = numpadDown;
+            if (m_Mode == Mode::None) EnterFreeMode();
+            if (m_Mode != Mode::None) ApplyCameraSlot(i);
         }
+        m_PrevNumpadSlotKeyDown[i] = numpadDown;
     }
 
     if (m_Mode == Mode::None) return;
