@@ -795,7 +795,7 @@ void PhotoModePlugin::OnUpdate()
         return;
     }
 
-    // Key rebinding wait (mirrors ParkourCameraPlugin).
+    // Key rebinding wait (mirrors ParkourCameraPlugin)
     if (m_WaitingForKey)
     {
         for (int vk = 1; vk <= 0xFE; ++vk)

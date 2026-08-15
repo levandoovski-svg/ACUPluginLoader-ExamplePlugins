@@ -107,7 +107,7 @@ private:
     int m_NumpadSlotKeys[9] = { VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9 };
     bool m_PrevNumpadSlotKeyDown[9] = { false, false, false, false, false, false, false, false, false };
 
-    // Snapshot of the game camera taken when entering a mode.
+    // Snapshot of the game camera taken whenentering a mode.
     // "Reset Camera" restores it.
     bool m_HasSnapshot = false;
     Vector3f m_SnapshotPos;
