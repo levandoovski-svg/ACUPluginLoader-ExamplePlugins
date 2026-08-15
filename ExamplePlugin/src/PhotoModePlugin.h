@@ -90,6 +90,7 @@ private:
         float pitch = 0.45f;
         float fov = 1.0f;
         float tilt = 0.0f;
+        bool relativeToPlayer = false;  // If true, pos is offset from player; if false, pos is world position
     };
     CameraSlot m_Slots[9];
     int m_ActiveSlot = -1;
@@ -99,6 +100,10 @@ private:
     // Slot hotkeys (1-9 for slots 1-9; default to numeric keys).
     int m_SlotKeys[9] = { '1', '2', '3', '4', '5', '6', '7', '8', '9' };
     bool m_PrevSlotKeyDown[9] = { false, false, false, false, false, false, false, false, false };
+    
+    // Numpad slot hotkeys (Numpad 1-9; default to numpad keys).
+    int m_NumpadSlotKeys[9] = { VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9 };
+    bool m_PrevNumpadSlotKeyDown[9] = { false, false, false, false, false, false, false, false, false };
 
     // Snapshot of the game camera taken when entering a mode.
     // "Reset Camera" restores it.
@@ -131,6 +136,7 @@ private:
     bool m_InvertX = false;
     bool m_InvertY = false;
     bool m_DisableSmoothing = true;
+    bool m_SaveSlotsRelativeToPlayer = false; // When true, save slots as offset from player pos instead of world pos
 
     // Restore state.
     bool m_TimescaleApplied = false;

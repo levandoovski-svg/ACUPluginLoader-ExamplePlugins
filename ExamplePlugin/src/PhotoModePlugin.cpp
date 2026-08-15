@@ -284,6 +284,8 @@ void PhotoModePlugin::LoadSettings()
             m_InvertY = (line.substr(8) == "1");
         else if (line.rfind("DisableSmoothing=", 0) == 0)
             m_DisableSmoothing = (line.substr(17) == "1");
+        else if (line.rfind("SaveSlotsRelativeToPlayer=", 0) == 0)
+            m_SaveSlotsRelativeToPlayer = (line.substr(26) == "1");
         
         // Load slot key bindings
         for (int i = 0; i < 9; ++i)
@@ -294,6 +296,60 @@ void PhotoModePlugin::LoadSettings()
                 try { m_SlotKeys[i] = std::stoi(line.substr(prefix.length()), nullptr, 16); } 
                 catch (...) {}
                 break;
+            }
+        }
+        
+        // Load numpad slot key bindings
+        for (int i = 0; i < 9; ++i)
+        {
+            std::string prefix = "NumpadSlotKey" + std::to_string(i + 1) + "=";
+            if (line.rfind(prefix, 0) == 0)
+            {
+                try { m_NumpadSlotKeys[i] = std::stoi(line.substr(prefix.length()), nullptr, 16); } 
+                catch (...) {}
+                break;
+            }
+        }
+        
+        // Load saved camera slots
+        for (int i = 0; i < 9; ++i)
+        {
+            std::string slotPrefix = "Slot" + std::to_string(i + 1) + "_";
+            if (line.rfind(slotPrefix + "Used=", 0) == 0)
+            {
+                m_Slots[i].used = (line.substr(slotPrefix.length() + 5) == "1");
+            }
+            else if (line.rfind(slotPrefix + "PosX=", 0) == 0)
+            {
+                try { m_Slots[i].pos.x = std::stof(line.substr(slotPrefix.length() + 5)); } catch (...) {}
+            }
+            else if (line.rfind(slotPrefix + "PosY=", 0) == 0)
+            {
+                try { m_Slots[i].pos.y = std::stof(line.substr(slotPrefix.length() + 5)); } catch (...) {}
+            }
+            else if (line.rfind(slotPrefix + "PosZ=", 0) == 0)
+            {
+                try { m_Slots[i].pos.z = std::stof(line.substr(slotPrefix.length() + 5)); } catch (...) {}
+            }
+            else if (line.rfind(slotPrefix + "Yaw=", 0) == 0)
+            {
+                try { m_Slots[i].yaw = std::stof(line.substr(slotPrefix.length() + 4)); } catch (...) {}
+            }
+            else if (line.rfind(slotPrefix + "Pitch=", 0) == 0)
+            {
+                try { m_Slots[i].pitch = std::stof(line.substr(slotPrefix.length() + 6)); } catch (...) {}
+            }
+            else if (line.rfind(slotPrefix + "Fov=", 0) == 0)
+            {
+                try { m_Slots[i].fov = std::stof(line.substr(slotPrefix.length() + 4)); } catch (...) {}
+            }
+            else if (line.rfind(slotPrefix + "Tilt=", 0) == 0)
+            {
+                try { m_Slots[i].tilt = std::stof(line.substr(slotPrefix.length() + 5)); } catch (...) {}
+            }
+            else if (line.rfind(slotPrefix + "RelativeToPlayer=", 0) == 0)
+            {
+                m_Slots[i].relativeToPlayer = (line.substr(slotPrefix.length() + 17) == "1");
             }
         }
     }
@@ -341,11 +397,14 @@ void PhotoModePlugin::SaveSettings()
                  << "MouseSensitivity=" << m_MouseSensitivity << "\n"
                  << "InvertX=" << (m_InvertX ? 1 : 0) << "\n"
                  << "InvertY=" << (m_InvertY ? 1 : 0) << "\n"
-                 << "DisableSmoothing=" << (m_DisableSmoothing ? 1 : 0) << "\n";
+                 << "DisableSmoothing=" << (m_DisableSmoothing ? 1 : 0) << "\n"
+                 << "SaveSlotsRelativeToPlayer=" << (m_SaveSlotsRelativeToPlayer ? 1 : 0) << "\n";
             
-            // Save slot key bindings
+            // Save slot key bindings (regular and numpad)
             for (int i = 0; i < 9; ++i)
                 file << "SlotKey" << (i + 1) << "=" << std::hex << m_SlotKeys[i] << std::dec << "\n";
+            for (int i = 0; i < 9; ++i)
+                file << "NumpadSlotKey" << (i + 1) << "=" << std::hex << m_NumpadSlotKeys[i] << std::dec << "\n";
             
             // Save camera slots
             for (int i = 0; i < 9; ++i)
@@ -359,7 +418,8 @@ void PhotoModePlugin::SaveSettings()
                      << prefix << "Yaw=" << m_Slots[i].yaw << "\n"
                      << prefix << "Pitch=" << m_Slots[i].pitch << "\n"
                      << prefix << "Fov=" << m_Slots[i].fov << "\n"
-                     << prefix << "Tilt=" << m_Slots[i].tilt << "\n";
+                     << prefix << "Tilt=" << m_Slots[i].tilt << "\n"
+                     << prefix << "RelativeToPlayer=" << (m_Slots[i].relativeToPlayer ? 1 : 0) << "\n";
             }
         }
     } catch (...) {}
@@ -651,7 +711,23 @@ int PhotoModePlugin::SaveCurrentCameraSlot()
         slot = (m_ActiveSlot >= 0) ? m_ActiveSlot : 0; // all full: overwrite active (or first)
 
     m_Slots[slot].used = true;
-    m_Slots[slot].pos = m_FreeCamPos;
+    m_Slots[slot].relativeToPlayer = m_SaveSlotsRelativeToPlayer;
+    
+    // If saving relative to player, compute and store the offset
+    if (m_SaveSlotsRelativeToPlayer)
+    {
+        Entity* player = ACU::GetPlayer();
+        if (player)
+            m_Slots[slot].pos = m_FreeCamPos - player->GetPosition();
+        else
+            m_Slots[slot].pos = m_FreeCamPos; // fallback to world pos if player unavailable
+    }
+    else
+    {
+        // Save world position
+        m_Slots[slot].pos = m_FreeCamPos;
+    }
+    
     m_Slots[slot].yaw = m_Yaw;
     m_Slots[slot].pitch = m_Pitch;
     m_Slots[slot].fov = m_Fov;
@@ -664,12 +740,27 @@ int PhotoModePlugin::SaveCurrentCameraSlot()
 void PhotoModePlugin::ApplyCameraSlot(int index)
 {
     if (index < 0 || index >= 9 || !m_Slots[index].used) return;
-    m_FreeCamPos = m_Slots[index].pos;
+    
+    // Apply position (either absolute or relative to player)
+    if (m_Slots[index].relativeToPlayer)
+    {
+        Entity* player = ACU::GetPlayer();
+        if (player)
+            m_FreeCamPos = player->GetPosition() + m_Slots[index].pos;
+        else
+            m_FreeCamPos = m_Slots[index].pos; // fallback to stored pos if player unavailable
+    }
+    else
+    {
+        m_FreeCamPos = m_Slots[index].pos;
+    }
+    
     m_Yaw = m_Slots[index].yaw;
     m_Pitch = m_Slots[index].pitch;
     m_Fov = m_Slots[index].fov;
     m_TiltAngle = m_Slots[index].tilt;
     m_ActiveSlot = index;
+    
     if (m_FollowPlayer && m_Mode == Mode::Free)
     {
         Entity* player = ACU::GetPlayer();
@@ -749,6 +840,18 @@ void PhotoModePlugin::OnUpdate()
             if (slotDown && !m_PrevSlotKeyDown[i] && m_Slots[i].used)
                 ApplyCameraSlot(i);
             m_PrevSlotKeyDown[i] = slotDown;
+        }
+    }
+
+    // Direct slot selection via numpad hotkeys (Numpad 1-9)
+    if (m_Mode != Mode::None)
+    {
+        for (int i = 0; i < 9; ++i)
+        {
+            const bool numpadDown = (GetAsyncKeyState(m_NumpadSlotKeys[i]) & 0x8000) != 0;
+            if (numpadDown && !m_PrevNumpadSlotKeyDown[i] && m_Slots[i].used)
+                ApplyCameraSlot(i);
+            m_PrevNumpadSlotKeyDown[i] = numpadDown;
         }
     }
 
@@ -918,6 +1021,11 @@ void PhotoModePlugin::OnImGuiRender()
     ImGui::Separator();
 
     ImGui::TextDisabled("SAVED CAMERAS");
+    if (ImGui::Checkbox("Save Slots Relative to Player", &m_SaveSlotsRelativeToPlayer))
+        SaveSettings();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("When ON, camera positions are saved as offsets from the player,\nallowing them to be reused as preset camera angles.\nWhen OFF, positions are absolute world coordinates.");
+    
     if (ImGui::Button("Save Current Pose"))
         SaveCurrentCameraSlot();
     if (ImGui::IsItemHovered())
@@ -935,11 +1043,13 @@ void PhotoModePlugin::OnImGuiRender()
         
         // Get the character representation of the slot key
         char keyChar = (char)m_SlotKeys[i];
-        char label[64];
+        char label[96];
+        const char* relativeStr = m_Slots[i].relativeToPlayer ? " [REL]" : "";
+        
         if (keyChar >= 32 && keyChar < 127)
-            sprintf_s(label, sizeof(label), "Slot %d [%c]%s", i + 1, keyChar, (m_ActiveSlot == i) ? " *" : "");
+            sprintf_s(label, sizeof(label), "Slot %d [%c|Num%d]%s%s", i + 1, keyChar, i + 1, relativeStr, (m_ActiveSlot == i) ? " *" : "");
         else
-            sprintf_s(label, sizeof(label), "Slot %d [0x%02X]%s", i + 1, m_SlotKeys[i], (m_ActiveSlot == i) ? " *" : "");
+            sprintf_s(label, sizeof(label), "Slot %d [0x%02X|Num%d]%s%s", i + 1, m_SlotKeys[i], i + 1, relativeStr, (m_ActiveSlot == i) ? " *" : "");
         
         if (ImGui::Button(label))
             ApplyCameraSlot(i);
@@ -953,7 +1063,7 @@ void PhotoModePlugin::OnImGuiRender()
             SaveSettings(); // Persist the cleared slot
         }
     }
-    ImGui::TextDisabled("Use 1-9 keys, ',' or '.' to switch between saved poses");
+    ImGui::TextDisabled("Press 1-9, Numpad 1-9, ',' or '.' to switch poses ([REL] = relative to player)");
 
 
     // Recording/replay UI removed for ship-ready build.
