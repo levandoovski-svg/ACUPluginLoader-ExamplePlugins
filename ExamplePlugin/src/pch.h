@@ -14,6 +14,9 @@
 #include <memory>
 #include <vector>
 #include <array>
+#include <algorithm>
+#include <iterator>
+#include <cstring>
 #include <set>
 #include <map>
 #include <unordered_map>
@@ -25,3 +28,5 @@ namespace fs = std::filesystem;
 #include <optional>
 #include <variant>
 #include <future>
+#include <functional>
+#include <mutex>

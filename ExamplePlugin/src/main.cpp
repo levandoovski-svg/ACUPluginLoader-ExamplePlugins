@@ -1,30 +1,26 @@
-
 #include "pch.h"
 
 #include "MyLog.h"
-#include "MainConfig.h"
-#include "PhotoModePlugin.h"
+#include "Hack_ParkourDistanceOverride.h"
 
 #include "Common_Plugins/Common_PluginSide.h"
 
 #define LOG_FILENAME    THIS_DLL_PROJECT_NAME "-log.log"
-#define CONFIG_FILENAME THIS_DLL_PROJECT_NAME "-config.json"
 
 std::optional<MyLogFileLifetime> g_LogLifetime;
+
 class ExamplePlugin : public ACUPluginInterfaceVirtuals
 {
 public:
     virtual void EveryFrameWhenMenuIsOpen() override
     {
-        // You can draw the contents of your ImGui menu here.
-
         ImGui::Text("Hello from " THIS_DLL_PROJECT_TARGET_FILE_NAME " plugin!");
         ImGui::Separator();
-        m_PhotoMode.OnImGuiRender();
+        if (m_hackCurrent)
+            m_hackCurrent->DrawImGuiControls();
     }
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        m_PhotoMode.OnUpdate();
     }
     virtual uint64 GetThisPluginVersion() override
     {
@@ -38,7 +34,6 @@ public:
         // It is not okay to try to patch the game's code, call the game's code, access the game's globals here.
 
         g_LogLifetime.emplace(AbsolutePathInThisDLLDirectory(LOG_FILENAME));
-        MainConfig::FindAndLoadConfigFileOrCreateDefault(AbsolutePathInThisDLLDirectory(CONFIG_FILENAME));
     }
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
@@ -47,11 +42,12 @@ public:
         // At this point the Main Integrity Check is killed, and the game's code can be safely patched.
         // Return `false` to unload the plugin.
 
-        LOG_DEBUG(DefaultLogger, "This line of text is written to both ImGui Console and the default log file\n");
-        m_PhotoMode.OnBeforeActivate();
+        if (!m_hackCurrent)
+            m_hackCurrent = std::make_unique<Hack_ParkourDistanceOverride>();
+        m_hackCurrent->OnBeforeActivate();
         return true;
     }
 
-    PhotoModePlugin m_PhotoMode;
+    std::unique_ptr<Hack_ParkourDistanceOverride> m_hackCurrent;
     
     } g_thisPlugin;
