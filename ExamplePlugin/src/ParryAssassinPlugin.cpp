@@ -6,6 +6,7 @@
 #include "ACU/ACUGetSingletons.h"
 #include "ACU/Entity.h"
 #include <shlobj.h>
+#include <mmsystem.h> // PlaySoundW + SND_* flags (not pulled in via windows.h because of WIN32_LEAN_AND_MEAN)
 
 #pragma comment(lib, "winmm.lib")
 
