@@ -11,7 +11,6 @@
 #pragma comment(lib, "winmm.lib")
 
 bool g_ParryAssaultEnabled = false;
-bool g_ParryAssaultTriggerOverride = false;
 extern bool g_SmokeBombAssaultEnabled;
 
 static bool IsPlayerInActiveCombat()
@@ -46,7 +45,7 @@ DEFINE_GAME_FUNCTION(ReattachWeaponToSheathOrHolster, 0x141B05570,
 
 static void OnAssassinationDecisionStage1(AllRegisters* params)
 {
-    if ((g_ParryAssaultEnabled || g_SmokeBombAssaultEnabled) && (!IsPlayerInActiveCombat() || g_ParryAssaultTriggerOverride))
+    if ((g_ParryAssaultEnabled || g_SmokeBombAssaultEnabled) && !IsPlayerInActiveCombat())
     {
         *params->rax_ = 0;
         return;
@@ -57,7 +56,7 @@ static void OnAssassinationDecisionStage1(AllRegisters* params)
 
 static void OnAssassinationDecisionStage2(AllRegisters* params)
 {
-    if ((g_ParryAssaultEnabled || g_SmokeBombAssaultEnabled) && (!IsPlayerInActiveCombat() || g_ParryAssaultTriggerOverride))
+    if ((g_ParryAssaultEnabled || g_SmokeBombAssaultEnabled) && !IsPlayerInActiveCombat())
     {
         *params->rax_ = 0;
         return;
@@ -186,16 +185,6 @@ static void ForceSheatheWeapon()
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-static void SimulateAssassinateClick()
-{
-    INPUT in[2] = {};
-    in[0].type = INPUT_MOUSE;
-    in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    in[1].type = INPUT_MOUSE;
-    in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(2, in, sizeof(INPUT));
-}
-
 void ParryAssassinPlugin::LoadSettings()
 {
     InstallAssassinationHooks();
@@ -259,22 +248,6 @@ void ParryAssassinPlugin::OnUpdate()
     // Apply the insta-critical-kill patches on the rising edge of "ready",
     // and restore the original bytes when the ready window expires.
     UpdateCritPatches();
-
-    // Brute force trigger: rising edge → override + sheathe + click in one frame
-    float now = GetTimeSeconds();
-    bool keyDown = (GetAsyncKeyState(m_TriggerKey) & 0x8000) != 0;
-    if (keyDown && !m_TriggerKeyPrev)
-    {
-        g_ParryAssaultTriggerOverride = true;
-        m_OverrideStartTime = now;
-        ForceSheatheWeapon();
-        SimulateAssassinateClick();
-    }
-    m_TriggerKeyPrev = keyDown;
-
-    // Clear override after 0.5s
-    if (g_ParryAssaultTriggerOverride && (now - m_OverrideStartTime) > 0.5f)
-        g_ParryAssaultTriggerOverride = false;
 }
 
 void ParryAssassinPlugin::OnImGuiRender()
@@ -293,36 +266,6 @@ void ParryAssassinPlugin::OnImGuiRender()
             if (ImGui::Checkbox("Unrestricted critical kill (bypass gate)", &m_UnrestrictedCritEnabled))
                 UpdateCritPatches();
             ImGui::TextDisabled("Patches apply while the ready window is open.");
-        }
-
-        char keyLabel[96];
-        if (m_TriggerKey >= 'A' && m_TriggerKey <= 'Z')
-            snprintf(keyLabel, sizeof(keyLabel), "Assassinate Trigger Key: %c", (char)m_TriggerKey);
-        else
-        {
-            const char* name = "Unknown";
-            if      (m_TriggerKey == VK_SPACE)    name = "Space";
-            else if (m_TriggerKey == VK_LSHIFT)   name = "LShift";
-            else if (m_TriggerKey == VK_LCONTROL) name = "LCtrl";
-            snprintf(keyLabel, sizeof(keyLabel), "Assassinate Trigger Key: %s", name);
-        }
-
-        if (m_WaitingForKeybind)
-            ImGui::Text("Press a key for trigger...");
-        else if (ImGui::Button(keyLabel, ImVec2(250, 0)))
-            m_WaitingForKeybind = true;
-
-        if (m_WaitingForKeybind)
-        {
-            for (int vk = 0x08; vk <= 0xFE; ++vk)
-            {
-                if (GetAsyncKeyState(vk) & 0x8000)
-                {
-                    m_TriggerKey = vk;
-                    m_WaitingForKeybind = false;
-                    break;
-                }
-            }
         }
     }
 }

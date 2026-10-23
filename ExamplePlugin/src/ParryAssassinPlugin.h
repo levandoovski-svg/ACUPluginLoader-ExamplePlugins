@@ -16,11 +16,6 @@ private:
     bool    m_PrevParryState     = false;
     bool    m_PrevReady          = false;
 
-    int     m_TriggerKey          = VK_SPACE;
-    bool    m_TriggerKeyPrev      = false;
-    float   m_OverrideStartTime   = 0.0f;
-    bool    m_WaitingForKeybind   = false;
-
     bool    m_CritKillEnabled         = false;
     bool    m_BoostCritDamage         = true;
     bool    m_UnrestrictedCritEnabled = true;
