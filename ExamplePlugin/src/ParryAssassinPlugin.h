@@ -21,7 +21,13 @@ private:
     float   m_OverrideStartTime   = 0.0f;
     bool    m_WaitingForKeybind   = false;
 
+    bool    m_CritKillEnabled         = false;
+    bool    m_BoostCritDamage         = true;
+    bool    m_UnrestrictedCritEnabled = true;
+    bool    m_PatchesActive           = false;
+
     bool IsParryActive();
+    void UpdateCritPatches();
 
     static constexpr uint64_t ADDR_PARRYING_PUNCHENEMY = 0x1419AAA90;
 };

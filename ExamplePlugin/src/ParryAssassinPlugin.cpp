@@ -93,6 +93,56 @@ static void InstallAssassinationHooks()
     w2.Activate();
 }
 
+// ---- Insta-critical kill after two parries (ACU 1.5.0, sites found in ACUFixes "Cheats") ----
+// 0x1409E76FB (12 bytes): mov eax, 1.0f; mov [rbx+34h],eax; mov [rbx+38h],eax; nop
+//   -> forces the melee damage multiplier to 100% ("Increase additional damage to 100%").
+// 0x1405769EB (5 bytes): movss xmm6,[rax+50h] -> movss xmm6,xmm8 (paired rewrite on the same path).
+struct CritDamagePatch : AutoAssemblerCodeHolder_Base
+{
+    CritDamagePatch()
+    {
+        DEFINE_ADDR(critDamageMul, 0x1409E76FB);
+        critDamageMul = { "B8 00 00 80 3F", "89 43 34", "89 43 38", "90" };
+
+        DEFINE_ADDR(critDamageLoad, 0x1405769EB);
+        critDamageLoad = { "F3 41 0F 10 F0" };
+    }
+};
+
+// 0x140704188 (2 bytes): jg +0x0D -> nop nop
+//   -> "Unrestricted Critical Kill": removes the gate restricting when a critical kill may occur.
+struct UnrestrictedCritKillPatch : AutoAssemblerCodeHolder_Base
+{
+    UnrestrictedCritKillPatch()
+    {
+        DEFINE_ADDR(critKillGate, 0x140704188);
+        critKillGate = { "90 90" };
+    }
+};
+
+static AutoAssembleWrapper<CritDamagePatch>& GetCritDamagePatch()
+{
+    static AutoAssembleWrapper<CritDamagePatch> w;
+    return w;
+}
+
+static AutoAssembleWrapper<UnrestrictedCritKillPatch>& GetCritKillPatch()
+{
+    static AutoAssembleWrapper<UnrestrictedCritKillPatch> w;
+    return w;
+}
+
+void ParryAssassinPlugin::UpdateCritPatches()
+{
+    bool wantDmg  = m_Enabled && m_CritKillEnabled && m_BoostCritDamage && m_ReadyToAssassinate;
+    bool wantKill = m_Enabled && m_CritKillEnabled && m_UnrestrictedCritEnabled && m_ReadyToAssassinate;
+
+    if (wantDmg)  GetCritDamagePatch().Activate(); else GetCritDamagePatch().Deactivate();
+    if (wantKill) GetCritKillPatch().Activate();   else GetCritKillPatch().Deactivate();
+
+    m_PatchesActive = wantDmg || wantKill;
+}
+
 static float GetTimeSeconds()
 {
     return static_cast<float>(GetTickCount64()) / 1000.0f;
@@ -152,7 +202,11 @@ void ParryAssassinPlugin::LoadSettings()
 
 void ParryAssassinPlugin::OnUpdate()
 {
-    if (!m_Enabled) return;
+    if (!m_Enabled)
+    {
+        UpdateCritPatches(); // restores original bytes if the plugin is switched off mid-window
+        return;
+    }
 
     bool parryNow   = IsParryActive();
     bool risingEdge = parryNow && !m_PrevParryState;
@@ -201,6 +255,10 @@ void ParryAssassinPlugin::OnUpdate()
 
     g_ParryAssaultEnabled = m_ReadyToAssassinate;
 
+    // Apply the insta-critical-kill patches on the rising edge of "ready",
+    // and restore the original bytes when the ready window expires.
+    UpdateCritPatches();
+
     // Brute force trigger: rising edge → override + sheathe + click in one frame
     float now = GetTimeSeconds();
     bool keyDown = (GetAsyncKeyState(m_TriggerKey) & 0x8000) != 0;
@@ -224,6 +282,18 @@ void ParryAssassinPlugin::OnImGuiRender()
 
     if (m_Enabled)
     {
+        if (ImGui::Checkbox("Insta-critical kill after two parries", &m_CritKillEnabled))
+            UpdateCritPatches();
+
+        if (m_CritKillEnabled)
+        {
+            if (ImGui::Checkbox("Max critical damage (100%)", &m_BoostCritDamage))
+                UpdateCritPatches();
+            if (ImGui::Checkbox("Unrestricted critical kill (bypass gate)", &m_UnrestrictedCritEnabled))
+                UpdateCritPatches();
+            ImGui::TextDisabled("Patches apply while the ready window is open.");
+        }
+
         char keyLabel[96];
         if (m_TriggerKey >= 'A' && m_TriggerKey <= 'Z')
             snprintf(keyLabel, sizeof(keyLabel), "Assassinate Trigger Key: %c", (char)m_TriggerKey);

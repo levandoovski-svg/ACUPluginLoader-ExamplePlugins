@@ -203,10 +203,9 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\Hack_ParkourDistanceOverride.cpp" />
-    <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
+    <ClCompile Include="src\AllowSmokeAssassinatePlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
-    <ClCompile Include="src\MyLog.cpp" />
+    <ClCompile Include="src\ParryAssassinPlugin.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
@@ -215,8 +214,8 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\Hack_ParkourDistanceOverride.h" />
-    <ClInclude Include="src\MyLog.h" />
+    <ClInclude Include="src\AllowSmokeAssassinatePlugin.h" />
+    <ClInclude Include="src\ParryAssassinPlugin.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>
