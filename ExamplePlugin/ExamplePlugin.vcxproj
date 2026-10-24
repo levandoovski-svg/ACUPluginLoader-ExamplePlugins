@@ -205,8 +205,6 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
   <ItemGroup>
     <ClCompile Include="src\BreakfallForcePlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
-    <ClCompile Include="src\BreakfallForcePlugin.cpp" />
-    <ClCompile Include="src\BreakfallForcePlugin.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>

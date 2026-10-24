@@ -10,6 +10,8 @@ void BreakfallForcePlugin::LoadSettings() {
     // Context checks (ledge raycast) preserved per library design
 }
 
+void BreakfallForcePlugin::OnImGuiRender() {}
+
 void BreakfallForcePlugin::OnUpdate() {
     // Tester: T forces animation-cancel / freefall via AtomGraph GraphVar 236 (FreeFallState)
     // Supported by AtomGraphDump.txt (verified against library DumpAnimationGraph.cpp):
