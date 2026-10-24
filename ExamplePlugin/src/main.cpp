@@ -23,6 +23,7 @@ public:
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
         g_breakfallForce.LoadSettings();
+        g_breakfallForce.Init();
         return true;
     }
 

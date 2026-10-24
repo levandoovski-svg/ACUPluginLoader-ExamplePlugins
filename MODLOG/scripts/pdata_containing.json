@@ -1,0 +1,30 @@
+{
+  "gate": {
+    "va": "0x141a3c0e1",
+    "func_start": "0x141a3c0a3",
+    "func_end": "0x141a3c24b",
+    "size": 424,
+    "unwind_rva": "0x389759c"
+  },
+  "epilogue": {
+    "va": "0x141a3c293",
+    "func_start": "0x141a3c24b",
+    "func_end": "0x141a3c298",
+    "size": 77,
+    "unwind_rva": "0x38975b8"
+  },
+  "breakfall_enter": {
+    "va": "0x141a3bb20",
+    "func_start": "0x141a3bb20",
+    "func_end": "0x141a3bcd1",
+    "size": 433,
+    "unwind_rva": "0x3897fc8"
+  },
+  "freefall_enter": {
+    "va": "0x141a3dfd0",
+    "func_start": "0x141a3dfd0",
+    "func_end": "0x141a3dfdc",
+    "size": 12,
+    "unwind_rva": "0x38cfd9c"
+  }
+}

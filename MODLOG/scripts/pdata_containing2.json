@@ -1,0 +1,38 @@
+{
+  "trigger_0x1B3": {
+    "va": "0x141acba30",
+    "func_start": "0x141acba30",
+    "func_end": "0x141acba61",
+    "size": 49
+  },
+  "gate_check_4_0x141A3E4C0": {
+    "va": "0x141a3e4c0",
+    "func_start": "0x141a3e4c0",
+    "func_end": "0x141a3e5b4",
+    "size": 244
+  },
+  "gate_check_5_0x140C98100": {
+    "va": "0x140c98100",
+    "func_start": "0x140c98100",
+    "func_end": "0x140c98127",
+    "size": 39
+  },
+  "graphvar_byhash_0x14277AA00": {
+    "va": "0x14277aa00",
+    "func_start": "0x14277aa00",
+    "func_end": "0x14277aa1a",
+    "size": 26
+  },
+  "flag_query_0x140CFDA80": {
+    "va": "0x140cfda80",
+    "func_start": "0x140cfda80",
+    "func_end": "0x140cfdadd",
+    "size": 93
+  },
+  "landing_calc_0x1406CCE60": {
+    "va": "0x1406cce60",
+    "func_start": "0x1406cce60",
+    "func_end": "0x1406cd031",
+    "size": 465
+  }
+}
