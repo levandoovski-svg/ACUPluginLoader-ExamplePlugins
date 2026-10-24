@@ -1,0 +1,19 @@
+program=ACU.exe path=/ACU.exe language=x86:LE:64:default imagebase=140000000
+block Headers    140000000-1400005ff initialized=true size=1536
+block .text      140001000-142e687ae initialized=false size=48658351
+block .rdata     142e69000-1439bef59 initialized=false size=11886426
+block .data      1439bf000-14527ea67 initialized=false size=25950824
+block .pdata     14527f000-145583733 initialized=false size=3163956
+block .shared    145584000-1455c401b initialized=false size=262172
+block .tls       1455c5000-1455c51ff initialized=true size=512
+block _RDATA     1455c6000-1455c774f initialized=false size=5968
+block .UBX0      1455c8000-145aab412 initialized=false size=5125139
+block .UBX1      145aac000-14779a3ff initialized=true size=30336000
+block .rsrc      14779b000-1478249ff initialized=true size=563712
+block tdb        ff00000000-ff0000184f initialized=true size=6224
+function_count=40
+=== addr=0x141a3c0e1 instruction=none containing=null
+=== addr=0x141a3c293 instruction=none containing=null
+=== addr=0x141a3bb20 instruction=none containing=null
+=== addr=0x141a3dfd0 instruction=none containing=null
+PROBE_DONE

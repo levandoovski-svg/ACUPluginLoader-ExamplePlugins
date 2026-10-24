@@ -4,15 +4,18 @@
 #include "ACU/ACUGetSingletons.h"
 #include "ACU/Entity.h"
 #include "ACU/Human.h"
+#include "ACU/SmallArray.h"
 #include "ACU_DefineNativeFunction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <shlobj.h>
+#include <xmmintrin.h>
 
 namespace
 {
@@ -39,6 +42,69 @@ namespace
     // breakfall action rather than redirecting a state Enter directly.
     DEFINE_GAME_FUNCTION(ParkourAction__Request, 0x140C85280, void, __fastcall,
         (int actionId, int actionFlags));
+
+    // ---------------------------------------------------------------------
+    // Native raycast API (ACUFixes-0.9.3 addresses, byte-verified against the
+    // runtime dump; see MODLOG/scripts/scanner_raycast_out.txt).
+    //
+    // `World` is forward-declared by ACU/ACUGetSingletons.h and must remain the
+    // global type, so it is intentionally not re-declared in this namespace.
+    // ---------------------------------------------------------------------
+
+    // RaycastResult, size 0x60 (stride used by the game's sort routine).
+    class PluginRaycastResult
+    {
+    public:
+        Vector4f hitLocation;      //0x0000
+        Vector4f targetNormal;     //0x0010
+        void* physicCpnt;          //0x0020
+        void* shared_targetEntity; //0x0028
+        uint32 entityId_mb;        //0x0030
+        char pad_0034[4];
+        float distance_mb;         //0x0038
+        char pad_003C[0x60 - 0x3C];
+    };
+    static_assert(sizeof(PluginRaycastResult) == 0x60, "RaycastResult must be 0x60");
+
+    // RaycastStruct, size 0x680. The native ctor/raycast can use aligned SSE
+    // stores on the struct and its inline result buffer (at +0x20), so force
+    // 16-byte alignment.
+    struct alignas(16) PluginRaycastStruct
+    {
+        char pad_0[8];
+        SmallArray<PluginRaycastResult> raycastResults; //0x0008
+        char pad_14[0x620 - 0x14];
+        SmallArray<void*> excludedEntities_mb;          //0x0620
+        char pad_62C[0x650 - 0x62C];
+        uint64 raycastFlags;                            //0x0650
+        char pad_658[0x680 - 0x658];
+    };
+    static_assert(sizeof(PluginRaycastStruct) == 0x680, "RaycastStruct must be 0x680");
+
+    DEFINE_GAME_FUNCTION(RaycastStruct__ctor, 0x1425EC5A0, void*, __fastcall,
+        (void* this_));
+    DEFINE_GAME_FUNCTION(RaycastStruct__CastRay, 0x1425FD7D0, char, __fastcall,
+        (void* this_, World* world, __m128* p_origin, __m128* p_direction,
+            float p_rayLength, unsigned __int8 p_1forGunshot, char p_0forGunshot));
+    DEFINE_GAME_FUNCTION(ArrRaycastResults__Destroy, 0x140010340, void, __fastcall,
+        (void* arr));
+
+    struct PluginRaycastHit
+    {
+        Vector3f position { 0.0f, 0.0f, 0.0f };
+        Vector3f normal { 0.0f, 0.0f, 0.0f };
+        float distance = 0.0f;
+    };
+
+    struct LedgeProbeOutcome
+    {
+        bool found = false;
+        int raysCast = 0;
+        int wallsFound = 0;
+        float bestDistance = 0.0f;
+        float bestLedgeRise = 0.0f;
+        Vector3f bestDirection { 0.0f, 0.0f, 0.0f };
+    };
 
     bool BytesMatch(uintptr_t address, const unsigned char* expected, size_t count)
     {
@@ -76,6 +142,18 @@ namespace
         }
     }
 
+    World* GetWorldSafely()
+    {
+        __try
+        {
+            return ACU::GetWorld();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
     bool ApplyNativeSetTransform(Entity* entity, const Matrix4f* transform)
     {
         __try
@@ -102,17 +180,201 @@ namespace
         }
     }
 
-    bool RequestBreakfallActionSafely()
+    bool RequestParkourActionSafely(int actionId)
     {
         __try
         {
-            ParkourAction__Request(static_cast<int>(EnumParkourAction::breakfall), 0);
+            ParkourAction__Request(actionId, 0);
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return false;
         }
+    }
+
+    // The native calls below are kept in small SEH wrappers that only take
+    // scalars/pointers. This keeps the __try blocks out of functions that
+    // would otherwise require C++ object unwinding.
+    bool RaycastCtorSafely(void* raycastStruct)
+    {
+        __try
+        {
+            RaycastStruct__ctor(raycastStruct);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool RaycastCastSafely(void* raycastStruct, World* world, __m128* origin, __m128* direction, float range)
+    {
+        __try
+        {
+            RaycastStruct__CastRay(raycastStruct, world, origin, direction, range, 1, 0);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    void RaycastDestroySafely(void* resultsArray)
+    {
+        __try
+        {
+            ArrRaycastResults__Destroy(resultsArray);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    // Single raycast; returns the nearest hit (by distance) from the native
+    // result array. `origin`/`direction` are the four-float vectors the native
+    // wrapper expects (they are loaded with MOVAPS, so they must be 16-byte
+    // aligned -- __m128 guarantees that).
+    bool CastRayNearest(World* world, const Vector3f& origin, const Vector3f& direction,
+        float range, PluginRaycastHit& outHit)
+    {
+        if (!world)
+        {
+            return false;
+        }
+
+        PluginRaycastStruct raycast;
+        if (!RaycastCtorSafely(&raycast))
+        {
+            return false;
+        }
+
+        // Mirrors ACUFixes-0.9.3 Raycasting::RaycastStruct_CastRay.
+        raycast.raycastFlags = ~static_cast<uint64>(0);
+
+        __m128 originAlign = _mm_setr_ps(origin.x, origin.y, origin.z, 0.0f);
+        __m128 directionAlign = _mm_setr_ps(direction.x, direction.y, direction.z, 0.0f);
+
+        bool found = false;
+        if (RaycastCastSafely(&raycast, world, &originAlign, &directionAlign, range))
+        {
+            SmallArray<PluginRaycastResult>& results = raycast.raycastResults;
+            if (results.arr && results.size > 0)
+            {
+                float bestDistance = 3.4e38f;
+                for (int i = 0; i < results.size; ++i)
+                {
+                    const PluginRaycastResult& hit = results.arr[i];
+                    if (hit.distance_mb < bestDistance)
+                    {
+                        bestDistance = hit.distance_mb;
+                        outHit.position = Vector3f(hit.hitLocation.x, hit.hitLocation.y, hit.hitLocation.z);
+                        outHit.normal = Vector3f(hit.targetNormal.x, hit.targetNormal.y, hit.targetNormal.z);
+                        outHit.distance = hit.distance_mb;
+                        found = true;
+                    }
+                }
+            }
+        }
+
+        if (raycast.raycastResults.arr)
+        {
+            RaycastDestroySafely(&raycast.raycastResults);
+        }
+        return found;
+    }
+
+    // The raycast "ledge gate".
+    //
+    // For a ring of horizontal directions around the player:
+    //   1. cast a horizontal ray at (feet + WallProbeHeight) and accept it as
+    //      a wall only if the surface normal is close to horizontal,
+    //   2. step a little past that wall face and cast straight down within
+    //      [feet + MinLedgeRise, feet + MaxLedgeRise], accepting the surface
+    //      only if it is close to horizontal (a walkable/grabbable top).
+    //
+    // This mirrors the native freefall ledge scan at 0x141A3C050, which is fed
+    // the player's feet position (ACUFixes shifts it 1.0 m toward the wall to
+    // widen the search), but without depending on the Denuvo-virtualized
+    // decision itself.
+    LedgeProbeOutcome ProbeForLedge(World* world, const Vector3f& feet,
+        int directions, float maxHorizontalReach, float wallProbeHeight,
+        float wallNormalMaxAbsZ, float ledgeInset, float minLedgeRise,
+        float maxLedgeRise, float topNormalMinZ)
+    {
+        LedgeProbeOutcome outcome;
+        if (!world || directions <= 0 || maxHorizontalReach <= 0.0f)
+        {
+            return outcome;
+        }
+
+        const float twoPi = 6.28318530718f;
+
+        // Sample two heights so both chest-high walls and waist-high walls
+        // (the case the tester reported) are caught.
+        const float probeHeights[2] = { wallProbeHeight, wallProbeHeight * 0.4f };
+
+        for (int i = 0; i < directions; ++i)
+        {
+            const float angle = twoPi * static_cast<float>(i) / static_cast<float>(directions);
+            const Vector3f dir(std::cos(angle), std::sin(angle), 0.0f);
+
+            for (const float probeHeight : probeHeights)
+            {
+                PluginRaycastHit wallHit;
+                const Vector3f wallOrigin(feet.x, feet.y, feet.z + probeHeight);
+                if (!CastRayNearest(world, wallOrigin, dir, maxHorizontalReach, wallHit))
+                {
+                    continue;
+                }
+                ++outcome.raysCast;
+
+                if (std::fabs(wallHit.normal.z) > wallNormalMaxAbsZ)
+                {
+                    // Ground/ceiling rather than a vertical wall face.
+                    continue;
+                }
+                ++outcome.wallsFound;
+
+                // Probe for the top of that wall just past its face.
+                const Vector3f topOrigin(
+                    wallHit.position.x + dir.x * ledgeInset,
+                    wallHit.position.y + dir.y * ledgeInset,
+                    feet.z + maxLedgeRise + 0.25f);
+                const float topRange = (maxLedgeRise - minLedgeRise) + 0.5f;
+                const Vector3f down(0.0f, 0.0f, -1.0f);
+
+                PluginRaycastHit topHit;
+                if (!CastRayNearest(world, topOrigin, down, topRange, topHit))
+                {
+                    continue;
+                }
+                ++outcome.raysCast;
+
+                if (topHit.normal.z < topNormalMinZ)
+                {
+                    continue;
+                }
+
+                const float ledgeRise = topHit.position.z - feet.z;
+                if (ledgeRise < minLedgeRise || ledgeRise > maxLedgeRise)
+                {
+                    continue;
+                }
+
+                if (!outcome.found || wallHit.distance < outcome.bestDistance)
+                {
+                    outcome.found = true;
+                    outcome.bestDistance = wallHit.distance;
+                    outcome.bestLedgeRise = ledgeRise;
+                    outcome.bestDirection = dir;
+                }
+            }
+        }
+
+        return outcome;
     }
 
     std::string GetDocumentsIniPath()
@@ -136,10 +398,27 @@ namespace
         file << "// ExactPositionTeleport settings\n"
              << "// ForceKey is a Windows virtual-key code in hexadecimal (54 = T).\n"
              << "ForceKey=" << std::hex << kDefaultForceKey << std::dec << "\n"
-             << "// Request EnumParkourAction::breakfall after the exact-position teleport.\n"
+             << "// Request a parkour action (default 18 = EnumParkourAction::breakfall)\n"
+             << "// after the exact-position teleport.\n"
              << "BreakfallAfterTeleport=1\n"
-             << "// Delay in milliseconds between the teleport/reset and the breakfall request.\n"
-             << "BreakfallDelayMs=" << kDefaultBreakfallDelayMs << "\n";
+             << "// Keep re-issuing the breakfall request for as long as ForceKey is held.\n"
+             << "HoldBreakfallWhileHeld=1\n"
+             << "BreakfallActionId=18\n"
+             << "// Delay in milliseconds between the teleport/reset and the first breakfall request.\n"
+             << "BreakfallDelayMs=" << kDefaultBreakfallDelayMs << "\n"
+             << "// While held: 0 = re-issue the request every frame.\n"
+             << "BreakfallHoldIntervalMs=0\n"
+             << "// Raycast ledge gate: only force-freefall when a wall with a usable\n"
+             << "// top ledge is detected around the player.\n"
+             << "RequireLedge=1\n"
+             << "ProbeDirections=12\n"
+             << "MaxHorizontalReach=1.5\n"
+             << "WallProbeHeight=0.9\n"
+             << "WallNormalMaxAbsZ=0.35\n"
+             << "LedgeInset=0.35\n"
+             << "MinLedgeRise=-1.0\n"
+             << "MaxLedgeRise=2.5\n"
+             << "TopNormalMinZ=0.6\n";
         file.flush();
         return static_cast<bool>(file);
     }
@@ -165,6 +444,16 @@ void ExactPositionTeleportPlugin::Init()
     static const unsigned char expectedParkourRequest[] = {
         0x33, 0xD2, 0xE9, 0x09, 0x00, 0x00, 0x00
     };
+    static const unsigned char expectedRaycastCtor[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10,
+        0x57, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0xF9
+    };
+    static const unsigned char expectedRaycastCast[] = {
+        0x48, 0x83, 0xEC, 0x48, 0x0F, 0xB6, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00
+    };
+    static const unsigned char expectedRaycastDestroy[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x18, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x41, 0x08
+    };
 
     const bool setTransformMatches = BytesMatch(
         reinterpret_cast<uintptr_t>(BaseEntity__SetTransform),
@@ -178,9 +467,22 @@ void ExactPositionTeleportPlugin::Init()
         reinterpret_cast<uintptr_t>(ParkourAction__Request),
         expectedParkourRequest,
         sizeof(expectedParkourRequest));
+    const bool raycastCtorMatches = BytesMatch(
+        reinterpret_cast<uintptr_t>(RaycastStruct__ctor),
+        expectedRaycastCtor,
+        sizeof(expectedRaycastCtor));
+    const bool raycastCastMatches = BytesMatch(
+        reinterpret_cast<uintptr_t>(RaycastStruct__CastRay),
+        expectedRaycastCast,
+        sizeof(expectedRaycastCast));
+    const bool raycastDestroyMatches = BytesMatch(
+        reinterpret_cast<uintptr_t>(ArrRaycastResults__Destroy),
+        expectedRaycastDestroy,
+        sizeof(expectedRaycastDestroy));
 
     m_BuildCompatible = setTransformMatches && resetBehaviorMatches;
     m_BreakfallRequestCompatible = parkourRequestMatches;
+    m_RaycastCompatible = raycastCtorMatches && raycastCastMatches && raycastDestroyMatches;
     m_PrevKeyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
 
     Log("ini=" + m_IniPath + " log=" + GetLogPath());
@@ -200,11 +502,14 @@ void ExactPositionTeleportPlugin::Init()
     }
     else
     {
-        char details[224];
+        char details[288];
         std::snprintf(details, sizeof(details),
-            "Ready - force key 0x%02X; breakfall after teleport %s (request %s)",
+            "Ready - force key 0x%02X; ledge gate %s (raycast %s); breakfall %s (hold %s, request %s)",
             m_ForceKey,
+            m_RequireLedge ? "on" : "off",
+            m_RaycastCompatible ? "compatible" : "UNAVAILABLE",
             m_BreakfallAfterTeleport ? "on" : "off",
+            m_HoldBreakfallWhileHeld ? "on" : "off",
             m_BreakfallRequestCompatible ? "compatible" : "UNAVAILABLE");
         SetStatus(details);
     }
@@ -213,32 +518,64 @@ void ExactPositionTeleportPlugin::Init()
 void ExactPositionTeleportPlugin::OnUpdate()
 {
     const bool keyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
+
     if (!m_WaitingForKey && keyDown && !m_PrevKeyDown)
     {
-        TriggerForceFreefall();
+        BeginForceFreefall();
     }
+
+    if (m_ForceActive)
+    {
+        if (!keyDown)
+        {
+            ReleaseForce();
+        }
+        else
+        {
+            ServiceHeldBreakfall();
+        }
+    }
+
     m_PrevKeyDown = keyDown;
 
     ProcessPendingBreakfall();
 }
 
-void ExactPositionTeleportPlugin::TriggerForceFreefall()
+void ExactPositionTeleportPlugin::BeginForceFreefall()
 {
+    m_PendingBreakfall = false;
+    m_HoldRequestCount = 0;
+
+    if (m_RequireLedge)
+    {
+        if (!m_RaycastCompatible)
+        {
+            SetStatus("Force freefall blocked: raycast ledge gate unavailable for this build");
+            return;
+        }
+        if (!ProbeLedgeGate())
+        {
+            char details[224];
+            std::snprintf(details, sizeof(details),
+                "Force freefall blocked: no ledge within %.2f m (rays=%d, walls=%d)",
+                m_MaxHorizontalReach, m_LastProbeRays, m_LastProbeWalls);
+            SetStatus(details);
+            return;
+        }
+    }
+
     if (!TeleportToExactCurrentPosition())
     {
-        m_PendingBreakfall = false;
         return;
     }
 
     if (!m_BreakfallAfterTeleport)
     {
-        m_PendingBreakfall = false;
         return;
     }
 
     if (!m_BreakfallRequestCompatible)
     {
-        m_PendingBreakfall = false;
         m_LastBreakfallRequested = false;
         SetStatus(m_LastStatus + "; breakfall request unavailable for this build");
         return;
@@ -246,10 +583,78 @@ void ExactPositionTeleportPlugin::TriggerForceFreefall()
 
     // Give the reset/freefall transition a few frames to establish before
     // asking the parkour pipeline to execute breakfall.
-    m_PendingBreakfall = true;
-    m_LastBreakfallRequested = false;
     m_BreakfallRequestAt = GetTickCount64() + static_cast<uint64_t>(m_BreakfallDelayMs);
-    SetStatus(m_LastStatus + "; breakfall queued");
+    m_NextHoldRequestAt = m_BreakfallRequestAt;
+    m_LastBreakfallRequested = false;
+    m_ForceActive = true;
+
+    if (m_HoldBreakfallWhileHeld)
+    {
+        // The held-key service path delivers (and keeps re-issuing) the request.
+        SetStatus(m_LastStatus + "; breakfall held while key is down");
+    }
+    else
+    {
+        m_PendingBreakfall = true;
+        SetStatus(m_LastStatus + "; breakfall queued");
+    }
+}
+
+bool ExactPositionTeleportPlugin::ProbeLedgeGate()
+{
+    if (!m_RaycastCompatible)
+    {
+        m_LastProbeFound = false;
+        SetStatus("Ledge probe skipped: raycast API unavailable for this build");
+        return false;
+    }
+
+    Entity* player = GetPlayerSafely();
+    if (!player)
+    {
+        m_LastProbeFound = false;
+        SetStatus("Ledge probe skipped: player entity is unavailable");
+        return false;
+    }
+
+    World* world = GetWorldSafely();
+    if (!world)
+    {
+        m_LastProbeFound = false;
+        SetStatus("Ledge probe skipped: world is unavailable");
+        return false;
+    }
+
+    const Vector3f feet = player->GetPosition();
+    const LedgeProbeOutcome outcome = ProbeForLedge(
+        world, feet,
+        m_ProbeDirections, m_MaxHorizontalReach, m_WallProbeHeight,
+        m_WallNormalMaxAbsZ, m_LedgeInset, m_MinLedgeRise, m_MaxLedgeRise,
+        m_TopNormalMinZ);
+
+    m_LastProbeFound = outcome.found;
+    m_LastProbeRays = outcome.raysCast;
+    m_LastProbeWalls = outcome.wallsFound;
+    m_LastProbeDistance = outcome.bestDistance;
+    m_LastProbeRise = outcome.bestLedgeRise;
+
+    if (!outcome.found)
+    {
+        char details[224];
+        std::snprintf(details, sizeof(details),
+            "No ledge detected within %.2f m (rays=%d, walls=%d)",
+            m_MaxHorizontalReach, outcome.raysCast, outcome.wallsFound);
+        SetStatus(details);
+        return false;
+    }
+
+    char details[256];
+    std::snprintf(details, sizeof(details),
+        "Ledge detected: wall %.2f m ahead, top %.2f m relative to feet (rays=%d, walls=%d)",
+        outcome.bestDistance, outcome.bestLedgeRise,
+        outcome.raysCast, outcome.wallsFound);
+    SetStatus(details);
+    return true;
 }
 
 bool ExactPositionTeleportPlugin::TeleportToExactCurrentPosition()
@@ -321,6 +726,54 @@ bool ExactPositionTeleportPlugin::TeleportToExactCurrentPosition()
     return true;
 }
 
+void ExactPositionTeleportPlugin::ServiceHeldBreakfall()
+{
+    if (!m_BreakfallAfterTeleport || !m_BreakfallRequestCompatible)
+    {
+        return;
+    }
+
+    const uint64_t now = GetTickCount64();
+    if (now < m_BreakfallRequestAt)
+    {
+        return;
+    }
+
+    if (m_BreakfallHoldIntervalMs > 0 && now < m_NextHoldRequestAt)
+    {
+        return;
+    }
+
+    m_LastBreakfallRequested = RequestParkourActionSafely(m_BreakfallActionId);
+    m_NextHoldRequestAt = now + static_cast<uint64_t>(m_BreakfallHoldIntervalMs);
+    ++m_HoldRequestCount;
+
+    if (!m_LastBreakfallRequested)
+    {
+        SetStatus("Breakfall request raised an exception while held");
+    }
+    else if (m_HoldRequestCount <= 1)
+    {
+        char details[192];
+        std::snprintf(details, sizeof(details),
+            "Breakfall action %d requested; will stay applied while the key is held",
+            m_BreakfallActionId);
+        SetStatus(details);
+    }
+}
+
+void ExactPositionTeleportPlugin::ReleaseForce()
+{
+    m_ForceActive = false;
+    if (m_HoldRequestCount > 0)
+    {
+        char details[192];
+        std::snprintf(details, sizeof(details),
+            "Force key released after %d breakfall request(s)", m_HoldRequestCount);
+        SetStatus(details);
+    }
+}
+
 void ExactPositionTeleportPlugin::ProcessPendingBreakfall()
 {
     if (!m_PendingBreakfall || GetTickCount64() < m_BreakfallRequestAt)
@@ -336,9 +789,9 @@ void ExactPositionTeleportPlugin::ProcessPendingBreakfall()
         return;
     }
 
-    m_LastBreakfallRequested = RequestBreakfallActionSafely();
+    m_LastBreakfallRequested = RequestParkourActionSafely(m_BreakfallActionId);
     SetStatus(m_LastBreakfallRequested
-        ? "Breakfall action 18 requested through the parkour-action pipeline"
+        ? "Breakfall action requested through the parkour-action pipeline"
         : "Breakfall action request raised an exception");
 }
 
@@ -398,14 +851,60 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
             "Press any keyboard key or mouse button to bind it...");
     }
 
+    ImGui::Separator();
+    ImGui::Checkbox("Require nearby ledge (raycast gate)", &m_RequireLedge);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "Casts rays around the player and only allows the force-freefall\n"
+            "when a vertical wall with a usable horizontal top ledge is found.\n"
+            "This prevents the mid-air force-freefall outside the parkour system.");
+    }
+    if (!m_RaycastCompatible)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f),
+            "Raycast API signature MISMATCH - gate will block the trigger.");
+    }
+
+    if (ImGui::TreeNodeEx("Ledge gate parameters", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::SliderInt("Probe directions", &m_ProbeDirections, 4, 32);
+        ImGui::SliderFloat("Max horizontal reach", &m_MaxHorizontalReach, 0.25f, 4.0f, "%.2f m");
+        ImGui::SliderFloat("Wall probe height", &m_WallProbeHeight, 0.1f, 2.0f, "%.2f m");
+        ImGui::SliderFloat("Wall normal max |z|", &m_WallNormalMaxAbsZ, 0.05f, 0.9f, "%.2f");
+        ImGui::SliderFloat("Ledge inset", &m_LedgeInset, 0.05f, 1.0f, "%.2f m");
+        ImGui::SliderFloat("Min ledge rise", &m_MinLedgeRise, -3.0f, 2.0f, "%.2f m");
+        ImGui::SliderFloat("Max ledge rise", &m_MaxLedgeRise, 0.1f, 5.0f, "%.2f m");
+        ImGui::SliderFloat("Top normal min z", &m_TopNormalMinZ, 0.0f, 1.0f, "%.2f");
+        ImGui::TreePop();
+    }
+
+    ImGui::Separator();
     bool breakfallAfterTeleport = m_BreakfallAfterTeleport;
-    if (ImGui::Checkbox("Execute Breakfall after teleport", &breakfallAfterTeleport))
+    if (ImGui::Checkbox("Execute breakfall after teleport", &breakfallAfterTeleport))
     {
         m_BreakfallAfterTeleport = breakfallAfterTeleport;
         if (!m_BreakfallAfterTeleport)
         {
             m_PendingBreakfall = false;
+            m_ForceActive = false;
         }
+        SaveSettings();
+    }
+
+    ImGui::Checkbox("Hold breakfall while forced key is held", &m_HoldBreakfallWhileHeld);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "While the force key is held down, the breakfall action request is\n"
+            "re-issued every frame so the breakfall stays applied. Releasing the\n"
+            "key stops the requests.");
+    }
+
+    if (ImGui::InputInt("Breakfall action id", &m_BreakfallActionId))
+    {
+        if (m_BreakfallActionId < 0) m_BreakfallActionId = 0;
+        if (m_BreakfallActionId > 255) m_BreakfallActionId = 255;
         SaveSettings();
     }
 
@@ -418,16 +917,38 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         SaveSettings();
     }
 
+    int holdIntervalMs = m_BreakfallHoldIntervalMs;
+    if (ImGui::InputInt("Held re-issue interval (ms, 0 = every frame)", &holdIntervalMs))
+    {
+        if (holdIntervalMs < 0) holdIntervalMs = 0;
+        if (holdIntervalMs > 2000) holdIntervalMs = 2000;
+        m_BreakfallHoldIntervalMs = holdIntervalMs;
+        SaveSettings();
+    }
+
     ImGui::Separator();
     ImGui::Text("Build signature: %s", m_BuildCompatible ? "compatible" : "MISMATCH");
+    ImGui::Text("Raycast API: %s", m_RaycastCompatible ? "compatible" : "MISMATCH");
     ImGui::Text("Breakfall request pipeline: %s",
         m_BreakfallRequestCompatible ? "compatible" : "UNAVAILABLE");
+    ImGui::Text("Force active (key held): %s", m_ForceActive ? "yes" : "no");
+    ImGui::Text("Last ledge probe: %s (%.2f m wall, %.2f m rise)",
+        m_LastProbeFound ? "FOUND" : "none",
+        m_LastProbeDistance, m_LastProbeRise);
+    ImGui::Text("Last probe rays/walls: %d / %d", m_LastProbeRays, m_LastProbeWalls);
     ImGui::Text("Last transform applied: %s", m_LastTransformApplied ? "yes" : "no");
     ImGui::Text("Last HSTE reset dispatched: %s", m_LastResetDispatched ? "yes" : "no");
+    ImGui::Text("Held breakfall requests: %d", m_HoldRequestCount);
     ImGui::Text("Last breakfall request: %s",
         m_LastBreakfallRequested ? "dispatched" : (m_PendingBreakfall ? "pending" : "no"));
     ImGui::Text("Last position: %.3f, %.3f, %.3f", m_LastX, m_LastY, m_LastZ);
     ImGui::TextWrapped("Settings file: %s", m_IniPath.c_str());
+
+    if (ImGui::Button("Probe ledge now (no teleport)"))
+    {
+        ProbeLedgeGate();
+    }
+
     ImGui::Separator();
     ImGui::TextWrapped("Last result: %s", m_LastStatus.c_str());
 
@@ -435,7 +956,7 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         ? "Force freefall + Breakfall now"
         : "Force freefall now"))
     {
-        TriggerForceFreefall();
+        BeginForceFreefall();
     }
 
     ImGui::End();
@@ -449,37 +970,85 @@ void ExactPositionTeleportPlugin::LoadSettings()
         return;
     }
 
+    auto parseFloat = [](const std::string& value, float fallback) -> float {
+        try { return std::stof(value); }
+        catch (...) { return fallback; }
+    };
+    auto parseInt = [](const std::string& value, int fallback) -> int {
+        try { return std::stoi(value); }
+        catch (...) { return fallback; }
+    };
+    auto parseBool = [](const std::string& value, bool fallback) -> bool {
+        try { return std::stoi(value) != 0; }
+        catch (...) { return fallback; }
+    };
+
     std::string line;
     while (std::getline(file, line))
     {
-        auto startsWith = [&line](const char* key) { return line.rfind(key, 0) == 0; };
-        try
+        const size_t comment = line.find_first_of(";#");
+        if (comment != std::string::npos)
         {
-            if (startsWith("ForceKey="))
+            line.erase(comment);
+        }
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos)
+        {
+            continue;
+        }
+
+        std::string key = line.substr(0, equals);
+        std::string value = line.substr(equals + 1);
+        auto trim = [](std::string& text) {
+            const size_t first = text.find_first_not_of(" \t\r\n");
+            const size_t last = text.find_last_not_of(" \t\r\n");
+            text = (first == std::string::npos) ? std::string() : text.substr(first, last - first + 1);
+        };
+        trim(key);
+        trim(value);
+
+        if (key == "ForceKey")
+        {
+            try
             {
-                const int key = std::stoi(line.substr(9), nullptr, 16);
-                if (key >= 1 && key <= 0xFF)
+                const int hexKey = std::stoi(value, nullptr, 16);
+                if (hexKey >= 1 && hexKey <= 0xFF)
                 {
-                    m_ForceKey = key;
+                    m_ForceKey = hexKey;
                 }
             }
-            else if (startsWith("BreakfallAfterTeleport="))
-            {
-                m_BreakfallAfterTeleport = std::stoi(line.substr(23)) != 0;
-            }
-            else if (startsWith("BreakfallDelayMs="))
-            {
-                const int delay = std::stoi(line.substr(17));
-                if (delay >= 0 && delay <= 2000)
-                {
-                    m_BreakfallDelayMs = delay;
-                }
-            }
+            catch (...) {}
         }
-        catch (...)
+        else if (key == "BreakfallAfterTeleport") { m_BreakfallAfterTeleport = parseBool(value, m_BreakfallAfterTeleport); }
+        else if (key == "HoldBreakfallWhileHeld") { m_HoldBreakfallWhileHeld = parseBool(value, m_HoldBreakfallWhileHeld); }
+        else if (key == "BreakfallActionId")
         {
-            // Keep the current/default value for a malformed setting.
+            const int id = parseInt(value, m_BreakfallActionId);
+            if (id >= 0 && id <= 255) { m_BreakfallActionId = id; }
         }
+        else if (key == "BreakfallDelayMs")
+        {
+            const int delay = parseInt(value, m_BreakfallDelayMs);
+            if (delay >= 0 && delay <= 2000) { m_BreakfallDelayMs = delay; }
+        }
+        else if (key == "BreakfallHoldIntervalMs")
+        {
+            const int interval = parseInt(value, m_BreakfallHoldIntervalMs);
+            if (interval >= 0 && interval <= 2000) { m_BreakfallHoldIntervalMs = interval; }
+        }
+        else if (key == "RequireLedge") { m_RequireLedge = parseBool(value, m_RequireLedge); }
+        else if (key == "ProbeDirections")
+        {
+            const int dirs = parseInt(value, m_ProbeDirections);
+            if (dirs >= 1 && dirs <= 64) { m_ProbeDirections = dirs; }
+        }
+        else if (key == "MaxHorizontalReach") { m_MaxHorizontalReach = parseFloat(value, m_MaxHorizontalReach); }
+        else if (key == "WallProbeHeight") { m_WallProbeHeight = parseFloat(value, m_WallProbeHeight); }
+        else if (key == "WallNormalMaxAbsZ") { m_WallNormalMaxAbsZ = parseFloat(value, m_WallNormalMaxAbsZ); }
+        else if (key == "LedgeInset") { m_LedgeInset = parseFloat(value, m_LedgeInset); }
+        else if (key == "MinLedgeRise") { m_MinLedgeRise = parseFloat(value, m_MinLedgeRise); }
+        else if (key == "MaxLedgeRise") { m_MaxLedgeRise = parseFloat(value, m_MaxLedgeRise); }
+        else if (key == "TopNormalMinZ") { m_TopNormalMinZ = parseFloat(value, m_TopNormalMinZ); }
     }
 }
 
@@ -502,10 +1071,20 @@ void ExactPositionTeleportPlugin::SaveSettings()
         file << "// ExactPositionTeleport settings\n"
              << "// ForceKey is a Windows virtual-key code in hexadecimal (54 = T).\n"
              << "ForceKey=" << std::hex << m_ForceKey << std::dec << "\n"
-             << "// Request EnumParkourAction::breakfall after the exact-position teleport.\n"
              << "BreakfallAfterTeleport=" << (m_BreakfallAfterTeleport ? 1 : 0) << "\n"
-             << "// Delay in milliseconds between the teleport/reset and the breakfall request.\n"
-             << "BreakfallDelayMs=" << m_BreakfallDelayMs << "\n";
+             << "HoldBreakfallWhileHeld=" << (m_HoldBreakfallWhileHeld ? 1 : 0) << "\n"
+             << "BreakfallActionId=" << m_BreakfallActionId << "\n"
+             << "BreakfallDelayMs=" << m_BreakfallDelayMs << "\n"
+             << "BreakfallHoldIntervalMs=" << m_BreakfallHoldIntervalMs << "\n"
+             << "RequireLedge=" << (m_RequireLedge ? 1 : 0) << "\n"
+             << "ProbeDirections=" << m_ProbeDirections << "\n"
+             << "MaxHorizontalReach=" << m_MaxHorizontalReach << "\n"
+             << "WallProbeHeight=" << m_WallProbeHeight << "\n"
+             << "WallNormalMaxAbsZ=" << m_WallNormalMaxAbsZ << "\n"
+             << "LedgeInset=" << m_LedgeInset << "\n"
+             << "MinLedgeRise=" << m_MinLedgeRise << "\n"
+             << "MaxLedgeRise=" << m_MaxLedgeRise << "\n"
+             << "TopNormalMinZ=" << m_TopNormalMinZ << "\n";
     }
     catch (...)
     {

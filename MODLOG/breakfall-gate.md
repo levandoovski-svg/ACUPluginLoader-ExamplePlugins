@@ -108,3 +108,32 @@
 - REBIND: the force-freefall/teleport key is rebindable to any keyboard key or mouse button from the ImGui window. A fresh press is required after rebinding so the capture cannot trigger immediately.
 - INI: `ExactPositionTeleport.ini` is created automatically on first run. Primary location is the directory containing `ACU.exe`; if that directory is not writable, it falls back to `Documents\Assassin's Creed Unity\ExactPositionTeleport.ini`. The active path is displayed in the ImGui window and written to the log. Settings: `ForceKey` (hex VK), `BreakfallAfterTeleport`, `BreakfallDelayMs`.
 - Plugin interface version bumped to 0.2.0.0. Source and project wiring updated; not built locally (user builds through GitHub Actions).
+
+## SESSION 3 — RAYCAST LEDGE GATE + HOLD-TO-KEEP-BREAKFALL (ExactPositionTeleportPlugin v0.3.0.0)
+
+### New dump-verified findings (runtime dump, base 0x140000000, no ASLR)
+- The breakfall gate is ONE logical function that begins at **0x141A3C050**. The `.pdata` boundary at 0x141A3C0A3 is a Denuvo artifact (the VM thunk 0x141A3C0E1 splits the fragment); 0x141A3C0A3.. is the same body's tail, reached by fall-through.
+- Whole function behavior: early-out unless avatar flag bit **0x25** is set (`FUN_140CFDA80(avatar+0x1C88, 0x25)`); then the Denuvo-virtualized decision at 0x141A3C0E1 (fed feet pos RBP + movement dir R14); then vtable probes 0x1401858D0/0x140185630/0x140185990 (all `MOV RCX,[RCX+8]; JMP [RCX+0x2F0/0x310/0x330]` thunks); then cancel primitive 0x141A3E4C0; then validity 0x140C98100; then height check `[RBX+0x1E4] - avatarPos.z > [RSI+0x2B0]` (`76 0A` COMISS/JBE at 0x141A3C21D); then `ParkourAction__Request(0x21)` at 0x140C85280.
+- Only direct caller of 0x141A3C050: **0x141A0017E** inside `FUN_1419FFFF7` (0x1419FFFF7..0x141A00246), the parkour action-selection driver. It runs scanners 0x141A3C050, 0x141A3CEA0, 0x141A3C4E0, 0x141A3D0A0 in sequence (short-circuit OR).
+- 0x141A3C050 has NO E8/E9/`0F8x` xref and NO data pointer xref, confirming the fall-through/VM-split explanation.
+
+### Raycast API — 0.9.3 addresses CONFIRMED byte-identical in the dump
+(ACUFixes 1.5.1 values differ; must NOT be mixed.)
+- `RaycastStruct__ctor` = **0x1425EC5A0** (`48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 50 48 8B F9`)
+- `g_RaycastStruct__CastRay_impl` = **0x1425FD7D0** (`48 83 EC 48 0F B6 84 24 80 00 00 00`); it builds `origin + dir*range` and calls core 0x1425FD830.
+- `ArrRaycastResults__SortByDistance` = **0x1425DF220** (not in .pdata; leaf, tail-jumps to 0x141D34A00)
+- `ArrRaycastResults__Destroy` = **0x140010340** (`48 89 5C 24 18 56 48 83 EC 20 8B 41 08`)
+- Layouts: `RaycastResult` 0x60 (hitLocation+0x00, targetNormal+0x10, physicCpnt+0x20, shared_targetEntity+0x28, distance+0x38); `RaycastStruct` 0x680 (raycastResults SmallArray+0x08, excludedEntities+0x620, raycastFlags+0x650).
+- Real in-game usage template decompiled at `FUN_140C13333` (calls 0x1425FD7D0): casts around sample points with ±0.2 Z offsets and tests hit-normal Z against ±0.17364818 (sin 10°) / 0.5.
+
+### Why the native scan can't be a standalone preflight
+The ledge decision lives in the Denuvo VM fragment at 0x13FE30120 (outside the module, unrecoverable). ACUFixes proves the *only* plugin-visible input that matters is the feet position (it shifts it 1.0 m toward the wall). Therefore an independent raycast probe around the feet is functionally equivalent and non-circular.
+
+### ExactPositionTeleportPlugin changes (implemented, not built locally)
+- **Raycast ledge gate** (`ProbeLedgeGate` / `ProbeForLedge` / `CastRayNearest`): for a ring of horizontal directions (default 12) at two probe heights (chest + 40% of it, to catch waist-high walls), cast a horizontal ray within MaxHorizontalReach (default 1.5 m). Accept a wall only if `|normal.z| <= 0.35`; then step `LedgeInset` (0.35 m) past the wall face and cast straight down across `[feet+MinLedgeRise, feet+MaxLedgeRise]` (default -1.0..2.5 m), accepting a top surface only if `normal.z >= 0.6`. Toggle `RequireLedge` (default on). All native calls are SEH-wrapped; the raycast signatures are independently verified, and the gate fails closed on mismatch.
+- **Hold-to-keep-breakfall**: on the rising edge the plugin teleports/resets once, then while the force key is HELD it re-issues `ParkourAction__Request(BreakfallActionId)` (default 18) after `BreakfallDelayMs` (100 ms), every frame (`BreakfallHoldIntervalMs = 0`) until release. `HoldBreakfallWhileHeld` (default on) can be turned off to restore the old single-shot behavior.
+- New INI/ImGui settings: RequireLedge, ProbeDirections, MaxHorizontalReach, WallProbeHeight, WallNormalMaxAbsZ, LedgeInset, MinLedgeRise, MaxLedgeRise, TopNormalMinZ, HoldBreakfallWhileHeld, BreakfallActionId, BreakfallHoldIntervalMs. INI parser rewritten to a robust key=value form. Plugin version bumped to 0.3.0.0.
+- ImGui adds a "Probe ledge now (no teleport)" button and live probe readout (found/distance/rise/rays/walls), so the gate can be tuned without triggering.
+
+### Crash (Shift+Space+T) — residual note
+Crash stack top frames (`0x1400EEC05`, `0x1400E9A3A`, `0x141D591FD`, `0x141D44004`) sit above the `0x14276xxx`/`0x14277xxx` container+atom-graph-variable region (near `FUN_14277AA00` graph-var setter used by the freefall enter). This is consistent with forcing the freefall state while the game is mid-transition (sprint+jump), corrupting the state/atom-graph containers — not with the raycast or the request call signature itself. The ledge gate reduces the window (no force when no ledge is present) but is not a complete guard against forcing during an unrelated transition. Kept as a known residual; do not re-enable an unconditional trigger.
