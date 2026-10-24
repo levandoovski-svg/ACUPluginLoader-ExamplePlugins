@@ -79,3 +79,12 @@
   * Ini: Documents\Assassin's Creed Unity\BreakfallForce.ini (Mode, ForceKey hex default 54, AlwaysOn, PositionNudge, SkipHeightCheck); log: BreakfallForce.log; ImGui status window.
   * Build handled by user via GitHub Actions (do not build locally).
 - Untracked artifacts NOT to commit: MODLOG/scripts/ACU_dumped.bin, ACU_dumped.bin.json, ACU_dumped_pe.exe (126MB each). Commit-worthy evidence still untracked: MODLOG/scripts/cancel_path_out.txt, MODLOG/scripts/build_pe_from_dump.py.
+
+## EXACT-POSITION TELEPORT TEST PLUGIN
+- New test plugin: `ExamplePlugin/src/ExactPositionTeleportPlugin.{h,cpp}`; wired into `main.cpp` and `ExamplePlugin.vcxproj`.
+- Trigger: one rising-edge press of T (`VK_T`), handled by `EveryFrameEvenWhenMenuIsClosed` so it works whether or not the loader menu is open.
+- Operation: snapshots `Entity::GetPosition()` and `Entity::GetTransform()`, writes the unchanged position back, sends the unchanged matrix through native `BaseEntity::SetTransform` at 0x1425DE360, then dispatches `Human__Dispatch_HSTE_ResetBehavior` at 0x14131A530.
+- The reset call is the library-proven second half of ACUFixes-0.9.3's debug `TeleportPlayer` helper. Therefore this plugin tests whether a normal exact-position teleport causes the game to cancel/re-evaluate the active parkour context; it does NOT independently prove that the identical-coordinate transform write alone cancels a move.
+- Both native signatures were checked against the runtime dump and match exactly: SetTransform `0F 28 02 0F 29 41 20 0F`; ResetBehavior `48 89 5C 24 08 57 48 83 EC 20`. Runtime also fails closed on a signature mismatch.
+- The prior BreakfallForcePlugin is no longer initialized from main.cpp, preventing its default T binding from contaminating this isolated test. Its source remains in the repository/project for later comparison.
+- Status: source written and project wiring validated; intentionally NOT built locally (user builds through GitHub Actions).

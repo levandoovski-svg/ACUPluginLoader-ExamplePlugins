@@ -204,6 +204,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\BreakfallForcePlugin.cpp" />
+    <ClCompile Include="src\ExactPositionTeleportPlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -215,7 +216,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
   <ItemGroup>
     <ClInclude Include="src\AllowSmokeAssassinatePlugin.h" />
     <ClInclude Include="src\BreakfallForcePlugin.h" />
-    <ClInclude Include="src\BreakfallForcePlugin.h" />
+    <ClInclude Include="src\ExactPositionTeleportPlugin.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>

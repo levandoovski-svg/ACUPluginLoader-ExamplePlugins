@@ -1,5 +1,5 @@
 #include "pch.h"
-#include "BreakfallForcePlugin.h"
+#include "ExactPositionTeleportPlugin.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
 class ExamplePlugin : public ACUPluginInterfaceVirtuals
@@ -7,11 +7,15 @@ class ExamplePlugin : public ACUPluginInterfaceVirtuals
 public:
     virtual void EveryFrameWhenMenuIsOpen() override
     {
-        g_breakfallForce.OnImGuiRender();
+        // Keep T active even while the loader menu is open. The rising-edge
+        // guard makes this safe if the loader also invokes the closed-menu
+        // callback during the same frame.
+        g_exactPositionTeleport.OnUpdate();
+        g_exactPositionTeleport.OnImGuiRender();
     }
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        g_breakfallForce.OnUpdate();
+        g_exactPositionTeleport.OnUpdate();
     }
     virtual uint64 GetThisPluginVersion() override
     {
@@ -22,10 +26,9 @@ public:
     }
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
-        g_breakfallForce.LoadSettings();
-        g_breakfallForce.Init();
+        g_exactPositionTeleport.Init();
         return true;
     }
 
-    BreakfallForcePlugin g_breakfallForce;
+    ExactPositionTeleportPlugin g_exactPositionTeleport;
 } g_thisPlugin;
