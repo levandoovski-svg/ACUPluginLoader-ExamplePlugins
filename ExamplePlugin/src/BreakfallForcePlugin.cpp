@@ -32,8 +32,11 @@ static void Hook_GateTest_Assist(AllRegisters* params)
         return;
     // The gate scans for a grabbable ledge from the feet position; pretend the
     // player is one nudge closer along the ground-plane movement direction.
+    // (Component-wise: this vmath build has no Vector4f+Vector3f operator.)
     Vector3f* moveDir = (Vector3f*)params->r14_;
-    *feetPos = *feetPos + *moveDir * s_PositionNudge;
+    feetPos->x += moveDir->x * s_PositionNudge;
+    feetPos->y += moveDir->y * s_PositionNudge;
+    feetPos->z += moveDir->z * s_PositionNudge;
 }
 
 static void Hook_GateEpilogue_Assist(AllRegisters* params)
@@ -209,7 +212,7 @@ void BreakfallForcePlugin::OnImGuiRender()
                              : m_Mode == 1 ? "1: hook-assist (library)"
                              : "2: force-nop";
         ImGui::Text("Mode: %s", modeName);
-        ImGui::Text("ForceKey: %s (0x%02X)", m_ForceKey >= 32 && m_ForceKey < 127 ? "pressed-check log" : "?", m_ForceKey);
+        ImGui::Text("ForceKey: 0x%02X", m_ForceKey);
         ImGui::Text("Key held: %s", IsKeyDown(m_ForceKey) ? "yes" : "no");
         ImGui::Text("Forcing: %s", s_ForcedActive ? "YES" : "no");
         if (m_Mode == 2)
