@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -41,6 +42,7 @@ private:
     bool m_BreakfallAfterTeleport = true;
     int  m_BreakfallDelayMs = 100;         // delay before requesting action 18
     bool m_WaitingForKey = false;
+    std::array<bool, 256> m_CaptureKeyWasDown {};
 
     bool m_BuildCompatible = false;
     bool m_BreakfallRequestCompatible = false;

@@ -100,3 +100,11 @@
 - Both native signatures were checked against the runtime dump and match exactly: SetTransform `0F 28 02 0F 29 41 20 0F`; ResetBehavior `48 89 5C 24 08 57 48 83 EC 20`. Runtime also fails closed on a signature mismatch.
 - The prior BreakfallForcePlugin is no longer initialized from main.cpp, preventing its default T binding from contaminating this isolated test. Its source remains in the repository/project for later comparison.
 - Status: source written and project wiring validated; intentionally NOT built locally (user builds through GitHub Actions).
+
+## EXACT-POSITION TELEPORT — TESTER CONFIRMED + BREAKFALL/QoL UPDATE
+- TESTER CONFIRMED: the exact-position teleport/reset method works. Executed mid-air, it puts the player into freefall. This validates the same-position native transform write + HSTE reset path as a practical force-freefall mechanism.
+- OPTIONAL BREAKFALL: after a successful teleport/reset, the plugin now queues `EnumParkourAction::breakfall` (action id 18) through the game's normal parkour-action REQUEST pipeline at 0x140C85280 (real implementation 0x140C85290). The entry thunk signature was dump-verified as `33 D2 E9 09 00 00 00`. This is intentionally not a state-Enter redirect; it asks the normal action pipeline to execute breakfall after freefall has had time to establish.
+- The breakfall request is delayed by a configurable `BreakfallDelayMs` (default 100 ms) and is toggleable with the ImGui checkbox `Execute Breakfall after teleport` (default enabled). The request-pipeline signature is checked independently, so a mismatch does not disable the already-working teleport/reset.
+- REBIND: the force-freefall/teleport key is rebindable to any keyboard key or mouse button from the ImGui window. A fresh press is required after rebinding so the capture cannot trigger immediately.
+- INI: `ExactPositionTeleport.ini` is created automatically on first run. Primary location is the directory containing `ACU.exe`; if that directory is not writable, it falls back to `Documents\Assassin's Creed Unity\ExactPositionTeleport.ini`. The active path is displayed in the ImGui window and written to the log. Settings: `ForceKey` (hex VK), `BreakfallAfterTeleport`, `BreakfallDelayMs`.
+- Plugin interface version bumped to 0.2.0.0. Source and project wiring updated; not built locally (user builds through GitHub Actions).

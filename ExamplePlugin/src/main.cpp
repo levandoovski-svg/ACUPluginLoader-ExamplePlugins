@@ -7,9 +7,9 @@ class ExamplePlugin : public ACUPluginInterfaceVirtuals
 public:
     virtual void EveryFrameWhenMenuIsOpen() override
     {
-        // Keep T active even while the loader menu is open. The rising-edge
-        // guard makes this safe if the loader also invokes the closed-menu
-        // callback during the same frame.
+        // Keep the bound force key active even while the loader menu is open.
+        // The rising-edge guard makes this safe if the loader also invokes
+        // the closed-menu callback during the same frame.
         g_exactPositionTeleport.OnUpdate();
         g_exactPositionTeleport.OnImGuiRender();
     }

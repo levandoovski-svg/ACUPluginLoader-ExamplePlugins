@@ -212,32 +212,6 @@ void ExactPositionTeleportPlugin::Init()
 
 void ExactPositionTeleportPlugin::OnUpdate()
 {
-    if (m_WaitingForKey)
-    {
-        // Capture any keyboard virtual key. Mouse buttons are deliberately
-        // excluded so the Cancel button remains usable while rebinding.
-        for (int vk = VK_BACK; vk <= 0xFE; ++vk)
-        {
-            if ((GetAsyncKeyState(vk) & 1) == 0)
-            {
-                continue;
-            }
-
-            m_ForceKey = vk;
-            m_WaitingForKey = false;
-            // The newly captured key may still be held. Requiring a fresh
-            // press prevents an accidental immediate teleport.
-            m_PrevKeyDown = (GetAsyncKeyState(vk) & 0x8000) != 0;
-            SaveSettings();
-            SetStatus("Force key rebound to 0x" + [&] {
-                char keyText[8];
-                std::snprintf(keyText, sizeof(keyText), "%02X", vk);
-                return std::string(keyText);
-            }());
-            break;
-        }
-    }
-
     const bool keyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
     if (!m_WaitingForKey && keyDown && !m_PrevKeyDown)
     {
@@ -382,11 +356,46 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     if (ImGui::Button(m_WaitingForKey ? "Cancel rebind" : "Rebind"))
     {
         m_WaitingForKey = !m_WaitingForKey;
+        if (m_WaitingForKey)
+        {
+            for (int vk = 1; vk <= 0xFF; ++vk)
+            {
+                m_CaptureKeyWasDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            }
+        }
     }
+
     if (m_WaitingForKey)
     {
+        // Capture the first fresh key/mouse-button transition. This runs
+        // after the Cancel button is processed, so clicking Cancel cannot
+        // accidentally bind the mouse button.
+        for (int vk = 1; vk <= 0xFF; ++vk)
+        {
+            const bool keyDown = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            const bool newlyPressed = keyDown && !m_CaptureKeyWasDown[vk];
+            m_CaptureKeyWasDown[vk] = keyDown;
+            if (!newlyPressed)
+            {
+                continue;
+            }
+
+            m_ForceKey = vk;
+            m_WaitingForKey = false;
+            // The newly captured key may still be held. Requiring a fresh
+            // press prevents an accidental immediate teleport.
+            m_PrevKeyDown = keyDown;
+            SaveSettings();
+            SetStatus("Force key rebound to 0x" + [&] {
+                char keyText[8];
+                std::snprintf(keyText, sizeof(keyText), "%02X", vk);
+                return std::string(keyText);
+            }());
+            break;
+        }
+
         ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f),
-            "Press any keyboard key to bind it...");
+            "Press any keyboard key or mouse button to bind it...");
     }
 
     bool breakfallAfterTeleport = m_BreakfallAfterTeleport;
