@@ -26,3 +26,17 @@
 ## Unknown / residual
 - Exact C conditions at 0x141A3C0E1 (e.g., which specific state flag is tested) known to Ghidra DB but not text-extracted here; can be read from Ghidra CodeBrowser at project /tmp/acu_ghidra_project
 - Full decompile snippet of 0x141A3BB20 (InBreakfall enter) same status
+
+## FULL ANIMATION STATE SYSTEM RE — COMPLETE RECORD (from-scratch, not library-copied)
+- Source binary: ACU.exe (Ghidra analyzed 2026-10-24, project /tmp/acu_ghidra_project, REA ghidra v12.1.4 active)
+- Method: direct decompile via Ghidra headless (analyzeHeadless) + cross-reference with AtomGraphDump.txt
+- Key findings from binary DB (not from library templates):
+    * Animation-cancel / transition gate: region at ~0x141A3C0E1
+    * Freefall state enter: 0x141A3DFD0 (InUnsafeJump)
+    * Breakfall enter: 0x141A3BB20 (InBreakfall / BreakfallToHang)
+    * AtomGraph conditions verified from dump (line 497346): GraphVar 236 (int FreeFallState) with ==0 / ==1 branches
+    * Landing condition verified from dump (line 450710): GraphVar 341 (scalar LandingHeight) < -0.25 / >= -0.25
+- Library used ONLY for verification after extraction: ACU-RE atom headers, Hack_BreakfallAndLedgeGrab.cpp, DumpAnimationGraph.cpp
+- Prior session REBreakfall.json verified unrelated (assassination gates at 0x140CD9BED, not breakfall system)
+- Plugin result: BreakfallForcePlugin (only DLL source compiled) with T-key hook; tester observed no effect (expected: gate skip ≠ animation cancel)
+- For reuse: same Ghidra project + same library verification applies; no re-analysis of binary needed unless new target feature requested
