@@ -1,8 +1,4 @@
 #include "pch.h"
-
-    // Only BreakfallForcePlugin compiles — tester verifies behavior
-#endif
-
 #include "BreakfallForcePlugin.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
