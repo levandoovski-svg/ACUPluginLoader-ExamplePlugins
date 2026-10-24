@@ -3,6 +3,7 @@
 #include "ParryAssassinPlugin.h"
 #include "AllowSmokeAssassinatePlugin.h"
 
+#include "BreakfallForcePlugin.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
 class ExamplePlugin : public ACUPluginInterfaceVirtuals
@@ -25,9 +26,11 @@ public:
     }
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
-        g_parryAssassin.LoadSettings();
+        g_breakfallForce.LoadSettings();
+    g_parryAssassin.LoadSettings();
         return true;
     }
 
     ParryAssassinPlugin g_parryAssassin;
+    BreakfallForcePlugin g_breakfallForce;
 } g_thisPlugin;
