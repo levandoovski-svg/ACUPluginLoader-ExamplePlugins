@@ -7,11 +7,11 @@ class ExamplePlugin : public ACUPluginInterfaceVirtuals
 public:
     virtual void EveryFrameWhenMenuIsOpen() override
     {
-        g_parryAssassin.OnImGuiRender();
+        g_breakfallForce.OnImGuiRender();
     }
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        g_parryAssassin.OnUpdate();
+        g_breakfallForce.OnUpdate();
     }
     virtual uint64 GetThisPluginVersion() override
     {
