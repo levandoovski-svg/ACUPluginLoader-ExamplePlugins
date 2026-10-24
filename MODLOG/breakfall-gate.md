@@ -80,6 +80,18 @@
   * Build handled by user via GitHub Actions (do not build locally).
 - Untracked artifacts NOT to commit: MODLOG/scripts/ACU_dumped.bin, ACU_dumped.bin.json, ACU_dumped_pe.exe (126MB each). Commit-worthy evidence still untracked: MODLOG/scripts/cancel_path_out.txt, MODLOG/scripts/build_pe_from_dump.py.
 
+## SESSION 2 ADDENDUM — GOAL RESTATEMENT + PLUGIN v3 (FORCE FREEFALL)
+- TESTER (explicit): the game only allows breakfall from a freefall state; the plugin's purpose is to FORCE THE PLAYER INTO A FREEFALL STATE regardless of what the game thinks the current state is. Mode 1 as built in v2 (ledge-scan nudge) can never do that by design — it only acts while the gate already runs (freefall). Kept as optional assist only.
+- INI BUG (why it "couldn't be found"): v2 only READ the ini, never created it. v3 auto-creates Documents\Assassin's Creed Unity\BreakfallForce.ini (commented defaults) + folder on first run, and Init logs both ini and log paths.
+- MODE 2 CRASH BUG (fixed before ever being tested): the epilogue thunk 0x141A3C293 is the LAST instruction of its block (E9 88 3E 3E FE; the VM fragment performs the actual return). NOPing it = fall off the end into the next function's bytes. The library HOOKS that site (stolen bytes re-executed), it never NOPs it. v3 Mode 2 patches ONLY the gate thunk 0x141A3C0E1 (mid-block; fall-through to 0x141A3C0E6 is valid) + optional height JBE 0x141A3C21D.
+- MODE 3 (new default) — force freefall using the game's own machinery; all offsets dump-verified and mapped to typed structs:
+  * State tree: FunctorBase nodes (Enter +0xE0; parentStack SmallArraySemistatic<FunctorBase*,0x10> at +0x28; arr[0] = parent node, arr[1] = HumanStatesHolder root — proven by the decompiled enters reading arr[1]+0x1C88 = ownerEntity and arr[1]+0x1CD0 = integerSignalReceiversManager).
+  * Active nodes: HumanStatesHolder::GetForPlayer()->primaryCallbackReceivers (SmallArraySemistatic<HumanStatesHolder_1B0{void* ppNode; FunctorBase* pNode;},0x20> at +0x1B0); usage precedent AllowSmokeAssassinatePlugin (r.pNode->Enter).
+  * On ForceKey rising edge: pick node (prefer Enter in parkour region 0x141A3B000..0x141A3F000; fallback any with parentStack.size>=1) → SEH-guarded call of the game's own freefall enter 0x141A3DFD0(node): sets [parents[0]+0x294]=1 (freefall flag on shared parent), motion flags 0x27/0x28 via the holder's integerSignalReceiversManager, position into node+0x1D0.., float params 0.7f/0.4f, graph vars 0xBDEC3825:=123 / 0x4D509A44:=0 (animation graph follows into freefall). Optional StateReset=1 then calls the game's own cancel primitive 0x141A3E4C0(parents[0]) — the exact call the breakfall gate makes before requesting its transition (kills current child state of the parent, installs fresh node, returns 1).
+  * Diagnostics: BreakfallForce.log + ImGui window (mode, key state, force-attempt count, last node Enter, mode-1 hook hit counters).
+- Note: gate block 0x141A3C0A3 has NO direct E8/E9/0F8x branches targeting it (full-.text scan) — reached by fall-through from its containing function (Denuvo .pdata split fragment); true callers remain unenumerated (kept as unknown).
+- Files: ExamplePlugin/src/BreakfallForcePlugin.{h,cpp} rewritten to v3; main.cpp unchanged (Init() call already present).
+
 ## EXACT-POSITION TELEPORT TEST PLUGIN
 - New test plugin: `ExamplePlugin/src/ExactPositionTeleportPlugin.{h,cpp}`; wired into `main.cpp` and `ExamplePlugin.vcxproj`.
 - Trigger: one rising-edge press of T (`VK_T`), handled by `EveryFrameEvenWhenMenuIsClosed` so it works whether or not the loader menu is open.
