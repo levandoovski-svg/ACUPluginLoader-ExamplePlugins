@@ -476,6 +476,10 @@ namespace
         file << "// ExactPositionTeleport settings\n"
              << "// ForceKey is a Windows virtual-key code in hexadecimal (54 = T).\n"
              << "ForceKey=" << std::hex << kDefaultForceKey << std::dec << "\n"
+             << "// Dispatch the HSTE ResetBehavior after the transform write.\n"
+             << "// This is what forces the parkour system to re-evaluate the context\n"
+             << "// and drop into freefall; turn off to A/B test the crash.\n"
+             << "ResetBehaviorAfterTeleport=1\n"
              << "// Request a parkour action (default 18 = EnumParkourAction::breakfall)\n"
              << "// after the exact-position teleport.\n"
              << "BreakfallAfterTeleport=1\n"
@@ -871,6 +875,23 @@ bool ExactPositionTeleportPlugin::TeleportToExactCurrentPosition()
         return false;
     }
 
+    // A/B test mode: with the reset disabled, the transform write is a
+    // same-value no-op, so nothing in this pipeline can change the game's
+    // state. Skip the Human lookup entirely.
+    if (!m_ResetBehaviorAfterTeleport)
+    {
+        m_LastResetDispatched = false;
+        char details[224];
+        std::snprintf(details, sizeof(details),
+            "Transform written at (%.3f, %.3f, %.3f); HSTE reset DISABLED (test)%s",
+            m_LastX, m_LastY, m_LastZ,
+            m_BreakfallAfterTeleport
+                ? " - warning: breakfall requests will fire outside freefall"
+                : "");
+        SetStatus(details);
+        return true;
+    }
+
     Human* human = GetPlayerHumanSafely();
     if (!human)
     {
@@ -1085,6 +1106,17 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     }
 
     ImGui::Separator();
+    ImGui::Checkbox("Dispatch HSTE reset after teleport", &m_ResetBehaviorAfterTeleport);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "The reset makes the parkour system cancel the current behavior and\n"
+            "re-evaluate the context after the transform write - that re-evaluation\n"
+            "is what drops the player into freefall. With it off the teleport is a\n"
+            "same-value write: expect NO state change at all.\n"
+            "Toggle to A/B test whether the reset itself causes the crash.");
+    }
+
     bool breakfallAfterTeleport = m_BreakfallAfterTeleport;
     if (ImGui::Checkbox("Execute breakfall after teleport", &breakfallAfterTeleport))
     {
@@ -1251,6 +1283,7 @@ void ExactPositionTeleportPlugin::LoadSettings()
             const int interval = parseInt(value, m_BreakfallHoldIntervalMs);
             if (interval >= 0 && interval <= 2000) { m_BreakfallHoldIntervalMs = interval; }
         }
+        else if (key == "ResetBehaviorAfterTeleport") { m_ResetBehaviorAfterTeleport = parseBool(value, m_ResetBehaviorAfterTeleport); }
         else if (key == "StateGateEnabled") { m_StateGateEnabled = parseBool(value, m_StateGateEnabled); }
         else if (key == "StateGateRequireValid") { m_StateGateRequireValid = parseBool(value, m_StateGateRequireValid); }
         else if (key == "ForceCooldownMs")
@@ -1298,6 +1331,7 @@ void ExactPositionTeleportPlugin::SaveSettings()
              << "BreakfallActionId=" << m_BreakfallActionId << "\n"
              << "BreakfallDelayMs=" << m_BreakfallDelayMs << "\n"
              << "BreakfallHoldIntervalMs=" << m_BreakfallHoldIntervalMs << "\n"
+             << "ResetBehaviorAfterTeleport=" << (m_ResetBehaviorAfterTeleport ? 1 : 0) << "\n"
              << "StateGateEnabled=" << (m_StateGateEnabled ? 1 : 0) << "\n"
              << "StateGateRequireValid=" << (m_StateGateRequireValid ? 1 : 0) << "\n"
              << "ForceCooldownMs=" << m_ForceCooldownMs << "\n"

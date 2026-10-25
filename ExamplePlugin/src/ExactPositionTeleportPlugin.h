@@ -12,8 +12,10 @@
 //   2. snapshots the player's current transform and position,
 //   3. writes that unchanged transform/position back through the game's
 //      BaseEntity::SetTransform path,
-//   4. dispatches the same HSTE ResetBehavior used by ACUFixes' debug
-//      TeleportPlayer helper so the game re-evaluates the current context,
+//   4. (optional) dispatches the same HSTE ResetBehavior used by ACUFixes'
+//      debug TeleportPlayer helper so the game re-evaluates the current
+//      context (m_ResetBehaviorAfterTeleport; with it off the teleport is a
+//      same-value write and should cause NO state change - test mode),
 //   5. requests EnumParkourAction::breakfall through the game's normal
 //      parkour-action request pipeline. While HoldBreakfallWhileHeld is on,
 //      that breakfall request is re-issued every frame for as long as the
@@ -56,6 +58,11 @@ private:
     int  m_BreakfallActionId = 18;         // EnumParkourAction::breakfall
     int  m_BreakfallDelayMs = 100;         // delay before the first request
     int  m_BreakfallHoldIntervalMs = 0;    // 0 = re-issue every frame while held
+
+    // HSTE reset after the transform write. In the exact-position pipeline
+    // this is the only state-changing call; toggling it off turns the
+    // teleport into a same-value write (crash A/B test mode).
+    bool m_ResetBehaviorAfterTeleport = true;
 
     // human-state gate
     bool m_StateGateEnabled = true;      // block while in the known-invalid states
