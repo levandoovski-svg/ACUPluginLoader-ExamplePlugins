@@ -65,6 +65,17 @@ private:
     bool m_WaitingForKey = false;
     std::array<bool, 256> m_CaptureKeyWasDown {};
 
+    // Master toggle ("Enable CatchLedge"): when off the plugin never touches
+    // the game - no teleport, no reset, no breakfall requests.
+    bool m_PluginEnabled = true;
+
+    // Show the collapsible "Debug / parameters" section in the UI.
+    bool m_ShowDebugUi = false;
+
+    // Debug toggle: when off, skips the transform write entirely and only
+    // dispatches the HSTE reset (isolates the reset from the teleport).
+    bool m_TeleportBeforeReset = true;
+
     // breakfall
     // OFF by default: the request layer is the identified crash source.
     // VALIDATED STABLE CONFIG: reset ON + this OFF (30+ min constant use, 0 crashes).

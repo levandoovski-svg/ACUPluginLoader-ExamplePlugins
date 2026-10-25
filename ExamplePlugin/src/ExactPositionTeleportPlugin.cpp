@@ -559,7 +559,13 @@ namespace
               << "// Buffer (ms) after first valid-state detection before teleport.\n"
               << "StateDetectionBufferMs=200\n"
               << "// Re-apply teleport/freefall mechanism continuously while held.\n"
-              << "ReapplyTeleportWhileHeld=0\n";
+              << "ReapplyTeleportWhileHeld=0\n"
+              << "// Master toggle: when 0, the plugin never touches the game.\n"
+              << "PluginEnabled=1\n"
+              << "// Show the collapsible debug/parameters section in the UI.\n"
+              << "ShowDebugUi=0\n"
+              << "// 0 = skip the transform write, dispatch only the HSTE reset.\n"
+              << "TeleportBeforeReset=1\n";
         file.flush();
         return static_cast<bool>(file);
     }
@@ -711,6 +717,23 @@ void ExactPositionTeleportPlugin::Init()
 
 void ExactPositionTeleportPlugin::OnUpdate()
 {
+    if (!m_PluginEnabled)
+    {
+        if (m_ForceActive)
+        {
+            m_ForceActive = false;
+        }
+        if (m_PendingBreakfall)
+        {
+            m_PendingBreakfall = false;
+        }
+        if (m_ShiftNegationActive)
+        {
+            m_ShiftNegationActive = false;
+        }
+        return;
+    }
+
     ServiceShiftNegation();
 
     // Report a completed deferred (game-thread) reset on this thread, so the
@@ -755,6 +778,12 @@ void ExactPositionTeleportPlugin::OnUpdate()
 
 void ExactPositionTeleportPlugin::BeginForceFreefall()
 {
+    if (!m_PluginEnabled)
+    {
+        SetStatus("CatchLedge is disabled (enable it in the UI)");
+        return;
+    }
+
     m_PendingBreakfall = false;
 
     // Cooldown: repeated teleports/force-freefalls in quick succession are the
@@ -999,26 +1028,37 @@ bool ExactPositionTeleportPlugin::TeleportToExactCurrentPosition()
         return false;
     }
 
-    // Snapshot before writing. The destination is exactly the position that
-    // was sampled; no offset or movement is introduced.
-    const Vector3f exactPosition = player->GetPosition();
-    const Matrix4f exactTransform = player->GetTransform();
-
-    m_LastX = exactPosition.x;
-    m_LastY = exactPosition.y;
-    m_LastZ = exactPosition.z;
-
-    // Keep the library-proven position write, then also send the unchanged
-    // matrix through the native transform setter so this is a real transform
-    // update rather than merely a same-value assignment that the compiler
-    // could discard.
-    player->GetPosition() = exactPosition;
-    m_LastTransformApplied = ApplyNativeSetTransform(player, &exactTransform);
-
-    if (!m_LastTransformApplied)
+    // Debug toggle: "teleport before reset" off skips the transform write
+    // entirely, so only the HSTE reset runs. Isolates the reset from the
+    // teleport when A/B testing.
+    if (m_TeleportBeforeReset)
     {
-        SetStatus("Teleport failed: native SetTransform raised an exception");
-        return false;
+        // Snapshot before writing. The destination is exactly the position that
+        // was sampled; no offset or movement is introduced.
+        const Vector3f exactPosition = player->GetPosition();
+        const Matrix4f exactTransform = player->GetTransform();
+
+        m_LastX = exactPosition.x;
+        m_LastY = exactPosition.y;
+        m_LastZ = exactPosition.z;
+
+        // Keep the library-proven position write, then also send the unchanged
+        // matrix through the native transform setter so this is a real transform
+        // update rather than merely a same-value assignment that the compiler
+        // could discard.
+        player->GetPosition() = exactPosition;
+        m_LastTransformApplied = ApplyNativeSetTransform(player, &exactTransform);
+
+        if (!m_LastTransformApplied)
+        {
+            SetStatus("Teleport failed: native SetTransform raised an exception");
+            return false;
+        }
+    }
+    else
+    {
+        m_LastTransformApplied = false;
+        SetStatus("Teleport disabled (debug): reset-only, no transform write");
     }
 
     // A/B test mode: with the reset disabled, the transform write is a
@@ -1220,7 +1260,25 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
 {
     ImGui::Begin("Exact Position Teleport");
 
-    // Minimal player-facing view: binding + action only.
+    // Minimal player-facing view: the two main toggles, binding, action.
+    if (ImGui::Checkbox("Enable CatchLedge", &m_PluginEnabled))
+    {
+        SaveSettings();
+        if (!m_PluginEnabled)
+        {
+            SetStatus("CatchLedge disabled - plugin will not touch the game");
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Master toggle. When off, the plugin never teleports, resets or requests breakfall.");
+
+    if (ImGui::Checkbox("Debug settings", &m_ShowDebugUi))
+    {
+        SaveSettings();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show the collapsible debug / parameters section.");
+
     ImGui::Text("Force-freefall / teleport key: 0x%02X", m_ForceKey);
     if (m_ForceKey >= 0x20 && m_ForceKey <= 0x7E)
     {
@@ -1255,18 +1313,6 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
             "Press any keyboard key or mouse button to bind it...");
     }
 
-    // Confirm loaded config briefly; shows checkbox / slider values were read.
-    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
-        "Config loaded: reset=%s | safe=%s | buffer=%d ms | reapply=%s",
-        m_ResetBehaviorAfterTeleport ? "ON" : "OFF",
-        m_SafeInjectionOnly ? "ON" : "OFF",
-        m_StateDetectionBufferMs,
-        m_ReapplyTeleportWhileHeld ? "ON" : "OFF");
-
-    ImGui::Checkbox("Safe injection method (reset-only / deferred hook)", &m_SafeInjectionOnly);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Safe injection: defers HSTE reset to game-thread hook (not Present thread). Keeps reset; disables external breakfall request.");
-
     if (ImGui::Button(m_BreakfallAfterTeleport && !m_SafeInjectionOnly
         ? "Force freefall + Breakfall now"
         : "Force freefall now"))
@@ -1274,9 +1320,23 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         BeginForceFreefall();
     }
 
+    ImGui::TextWrapped("Last result: %s", m_LastStatus.c_str());
+
     // Collapsible debug section: all parameters, sliders, gates, diagnostics.
-    if (ImGui::TreeNodeEx("Debug / parameters", ImGuiTreeNodeFlags_DefaultOpen))
+    if (m_ShowDebugUi && ImGui::TreeNodeEx("Debug / parameters", ImGuiTreeNodeFlags_DefaultOpen))
     {
+        // Confirm loaded config briefly; shows checkbox / slider values were read.
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+            "Config loaded: reset=%s | safe=%s | buffer=%d ms | reapply=%s",
+            m_ResetBehaviorAfterTeleport ? "ON" : "OFF",
+            m_SafeInjectionOnly ? "ON" : "OFF",
+            m_StateDetectionBufferMs,
+            m_ReapplyTeleportWhileHeld ? "ON" : "OFF");
+
+        ImGui::Checkbox("Safe injection method (reset-only / deferred hook)", &m_SafeInjectionOnly);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Safe injection: defers HSTE reset to game-thread hook (not Present thread). Keeps reset; disables external breakfall request.");
+
         ImGui::Checkbox("Require nearby ledge (raycast gate)", &m_RequireLedge);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("When ON, only allows force-free-fall when a vertical wall with a usable horizontal top ledge is detected near the player.");
@@ -1340,6 +1400,16 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     }
 
     ImGui::Separator();
+    ImGui::Checkbox("Teleport before reset (transform write)", &m_TeleportBeforeReset);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "When ON (default): the exact-position transform write happens, then\n"
+            "the HSTE reset. When OFF: the transform write is skipped entirely and\n"
+            "only the reset is dispatched - isolates the reset from the teleport\n"
+            "when A/B testing which half causes an issue.");
+    }
+
     ImGui::Checkbox("Dispatch HSTE reset after teleport", &m_ResetBehaviorAfterTeleport);
     if (ImGui::IsItemHovered())
     {
@@ -1443,18 +1513,8 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         ProbeLedgeGate();
     }
 
-    ImGui::Separator();
-    ImGui::TextWrapped("Last result: %s", m_LastStatus.c_str());
-
     ImGui::TreePop(); // close "Debug / parameters"
     } // end debug section
-
-    if (ImGui::Button(m_BreakfallAfterTeleport
-        ? "Force freefall + Breakfall now"
-        : "Force freefall now"))
-    {
-        BeginForceFreefall();
-    }
 
     ImGui::End();
 }
@@ -1543,6 +1603,9 @@ void ExactPositionTeleportPlugin::LoadSettings()
             if (cooldown >= 0 && cooldown <= 10000) { m_ForceCooldownMs = cooldown; }
         }
         else if (key == "SafeInjectionOnly") { m_SafeInjectionOnly = parseBool(value, m_SafeInjectionOnly); }
+        else if (key == "PluginEnabled") { m_PluginEnabled = parseBool(value, m_PluginEnabled); }
+        else if (key == "ShowDebugUi") { m_ShowDebugUi = parseBool(value, m_ShowDebugUi); }
+        else if (key == "TeleportBeforeReset") { m_TeleportBeforeReset = parseBool(value, m_TeleportBeforeReset); }
         else if (key == "StateDetectionBufferMs")
         {
             const int buf = parseInt(value, m_StateDetectionBufferMs);
@@ -1605,7 +1668,10 @@ void ExactPositionTeleportPlugin::SaveSettings()
               << "TopNormalMinZ=" << m_TopNormalMinZ << "\n"
               << "SafeInjectionOnly=" << (m_SafeInjectionOnly ? 1 : 0) << "\n"
               << "StateDetectionBufferMs=" << m_StateDetectionBufferMs << "\n"
-              << "ReapplyTeleportWhileHeld=" << (m_ReapplyTeleportWhileHeld ? 1 : 0) << "\n";
+              << "ReapplyTeleportWhileHeld=" << (m_ReapplyTeleportWhileHeld ? 1 : 0) << "\n"
+              << "PluginEnabled=" << (m_PluginEnabled ? 1 : 0) << "\n"
+              << "ShowDebugUi=" << (m_ShowDebugUi ? 1 : 0) << "\n"
+              << "TeleportBeforeReset=" << (m_TeleportBeforeReset ? 1 : 0) << "\n";
     }
     catch (...)
     {
