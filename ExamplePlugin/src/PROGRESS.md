@@ -14,6 +14,7 @@
 | PreventAutoDrawPlugin | ✅ Working — prevents weapon unsheathe in combat (Steam), toggle F9 |
 | ParryAssassinPlugin | ✅ Working — hooks assassination decision (0x140CD9BED/0x140CD9C95), 12-state combat check. Parry 2x → allows assassination for 4s |
 | AnimationOverridePlugin | 🔶 Discovery only — hooks universal state dispatcher (0x1427555D2), counts assassination state entries for animation type mapping |
+| ExactPositionTeleportPlugin | ✅ Working — A/B-VALIDATED STABLE (reset ON + breakfall-request OFF: 30+ min constant use, zero crashes). Breakfall-request layer = identified crash source. Force-freefall by same-position teleport + HSTE reset; Shift negated while mid-jump |
 
 ---
 
@@ -121,3 +122,4 @@ Checks primaryCallbackReceivers for any of 12 combat Enter addresses: Combat (0x
 | 2 | Coding | Fixed AllowSmokeAssassinatePlugin signatures, changed to flat-out allow |
 | 3 | Coding | Added 12-state combat check, created AnimationOverridePlugin stub |
 | 4 | Coding | Stripped unsafe hooks, discovered universal dispatcher, updated this file |
+| 5 | Coding | ExactPositionTeleport: toggleable HSTE reset (v0.3.2.0); A/B test — reset OFF = keypress no-op (reset is the mechanism); reset ON + breakfall OFF = VALIDATED STABLE 30+ min constant use, 0 crashes (v0.3.3.0: breakfall-request layer off by default, marked as crash source); added NegateShiftInSafeJump (clears game Shift/Sprint pressed-state while InSafeJumpOrLoweringToHang) to fix jitter/walking-in-air |

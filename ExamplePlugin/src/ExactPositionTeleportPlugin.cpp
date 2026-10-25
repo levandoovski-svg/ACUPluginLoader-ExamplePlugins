@@ -5,8 +5,10 @@
 #include "ACU/Entity.h"
 #include "ACU/Human.h"
 #include "ACU/HumanStatesHolder.h"
+#include "ACU/InputContainer.h"
 #include "ACU/SmallArray.h"
 #include "ACU_DefineNativeFunction.h"
+#include "Common_Plugins/ACU_InputUtils.h"
 #include "ParkourDebugging/EnumParkourAction.h"
 
 #include <cmath>
@@ -231,6 +233,37 @@ namespace
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
+        }
+    }
+
+    // Treat Shift as released for the game while the player is mid-jump
+    // (InSafeJumpOrLoweringToHang). Sprint/locomotion inputs fighting the
+    // forced-freefall transition is what caused the "walking in air" jitter.
+    //
+    // This writes directly into the game's live pressed-state arrays - the
+    // same ones ACU::Input::IsPressed() reads in ACUFixes-0.9.3
+    // (Common_PluginSide ACU_InputUtils.cpp). Both the scancode-level
+    // (K_LSHIFT = 42 / K_RSHIFT = 54) and the action-level (Sprint = 0xC)
+    // entries are cleared so neither the raw nor the derived input path
+    // sees Shift held. Re-applied every frame while the condition holds;
+    // stopped as soon as the state ends or Shift is physically released.
+    bool NegateShiftForGame()
+    {
+        __try
+        {
+            InputContainerBig* inputContainer = ACU::Input::Get_InputContainerBig();
+            if (!inputContainer)
+            {
+                return false;
+            }
+            inputContainer->isPressed_byScancode[(uint32)BindableKeyCode_Keyboard::K_LSHIFT] = 0;
+            inputContainer->isPressed_byScancode[(uint32)BindableKeyCode_Keyboard::K_RSHIFT] = 0;
+            inputContainer->keyStates_thisFrame.isPressed_byAction[(int)ActionKeyCode::Sprint] = 0;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
         }
     }
 
@@ -482,7 +515,14 @@ namespace
              << "ResetBehaviorAfterTeleport=1\n"
              << "// Request a parkour action (default 18 = EnumParkourAction::breakfall)\n"
              << "// after the exact-position teleport.\n"
-             << "BreakfallAfterTeleport=1\n"
+             << "// OFF BY DEFAULT: the breakfall-request layer is the identified crash\n"
+             << "// source. VALIDATED STABLE CONFIG is reset ON + breakfall OFF (30+ min\n"
+             << "// of constant use, zero crashes); breakfall natively with E in freefall.\n"
+             << "BreakfallAfterTeleport=0\n"
+             << "// While the player is mid-jump (InSafeJumpOrLoweringToHang), make the\n"
+             << "// game see Shift as released so sprint cannot fight the forced\n"
+             << "// freefall (prevents jittering / walking-in-air).\n"
+             << "NegateShiftInSafeJump=1\n"
              << "// Keep re-issuing the breakfall request for as long as ForceKey is held.\n"
              << "HoldBreakfallWhileHeld=1\n"
              << "BreakfallActionId=18\n"
@@ -608,6 +648,8 @@ void ExactPositionTeleportPlugin::Init()
 
 void ExactPositionTeleportPlugin::OnUpdate()
 {
+    ServiceShiftNegation();
+
     const bool keyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
 
     if (!m_WaitingForKey && keyDown && !m_PrevKeyDown)
@@ -990,6 +1032,35 @@ void ExactPositionTeleportPlugin::ProcessPendingBreakfall()
         : "Breakfall action request raised an exception");
 }
 
+void ExactPositionTeleportPlugin::ServiceShiftNegation()
+{
+    if (!m_NegateShiftInSafeJump)
+    {
+        m_ShiftNegationActive = false;
+        return;
+    }
+
+    // Cheap physical check first; the state-tree walk only runs while Shift
+    // is actually held down.
+    const bool shiftDown =
+        (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0
+        || (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+    if (!shiftDown)
+    {
+        m_ShiftNegationActive = false;
+        return;
+    }
+
+    ActiveHumanStates states;
+    if (!CollectActiveStates(states) || !states.inSafeJumpOrLoweringToHang)
+    {
+        m_ShiftNegationActive = false;
+        return;
+    }
+
+    m_ShiftNegationActive = NegateShiftForGame();
+}
+
 void ExactPositionTeleportPlugin::OnImGuiRender()
 {
     ImGui::Begin("Exact Position Teleport");
@@ -1117,6 +1188,16 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
             "Toggle to A/B test whether the reset itself causes the crash.");
     }
 
+    ImGui::Checkbox("Negate Shift while mid-jump (InSafeJumpOrLoweringToHang)", &m_NegateShiftInSafeJump);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "While the player is mid-jump, the game is made to see Shift as\n"
+            "released, so sprint cannot fight the forced freefall transition\n"
+            "(fixes the jittering / walking-in-air).\n"
+            "Only active while Shift is physically held.");
+    }
+
     bool breakfallAfterTeleport = m_BreakfallAfterTeleport;
     if (ImGui::Checkbox("Execute breakfall after teleport", &breakfallAfterTeleport))
     {
@@ -1185,6 +1266,7 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         m_LastStateWallrunUp ? "WallrunUp" : "");
     ImGui::Text("Last transform applied: %s", m_LastTransformApplied ? "yes" : "no");
     ImGui::Text("Last HSTE reset dispatched: %s", m_LastResetDispatched ? "yes" : "no");
+    ImGui::Text("Shift negation (mid-jump): %s", m_ShiftNegationActive ? "ACTIVE" : (m_NegateShiftInSafeJump ? "idle" : "off"));
     ImGui::Text("Held breakfall requests: %d", m_HoldRequestCount);
     ImGui::Text("Last breakfall request: %s",
         m_LastBreakfallRequested ? "dispatched" : (m_PendingBreakfall ? "pending" : "no"));
@@ -1284,6 +1366,7 @@ void ExactPositionTeleportPlugin::LoadSettings()
             if (interval >= 0 && interval <= 2000) { m_BreakfallHoldIntervalMs = interval; }
         }
         else if (key == "ResetBehaviorAfterTeleport") { m_ResetBehaviorAfterTeleport = parseBool(value, m_ResetBehaviorAfterTeleport); }
+        else if (key == "NegateShiftInSafeJump") { m_NegateShiftInSafeJump = parseBool(value, m_NegateShiftInSafeJump); }
         else if (key == "StateGateEnabled") { m_StateGateEnabled = parseBool(value, m_StateGateEnabled); }
         else if (key == "StateGateRequireValid") { m_StateGateRequireValid = parseBool(value, m_StateGateRequireValid); }
         else if (key == "ForceCooldownMs")
@@ -1332,6 +1415,7 @@ void ExactPositionTeleportPlugin::SaveSettings()
              << "BreakfallDelayMs=" << m_BreakfallDelayMs << "\n"
              << "BreakfallHoldIntervalMs=" << m_BreakfallHoldIntervalMs << "\n"
              << "ResetBehaviorAfterTeleport=" << (m_ResetBehaviorAfterTeleport ? 1 : 0) << "\n"
+             << "NegateShiftInSafeJump=" << (m_NegateShiftInSafeJump ? 1 : 0) << "\n"
              << "StateGateEnabled=" << (m_StateGateEnabled ? 1 : 0) << "\n"
              << "StateGateRequireValid=" << (m_StateGateRequireValid ? 1 : 0) << "\n"
              << "ForceCooldownMs=" << m_ForceCooldownMs << "\n"

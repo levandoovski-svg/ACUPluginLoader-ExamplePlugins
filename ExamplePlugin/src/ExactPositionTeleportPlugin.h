@@ -16,10 +16,17 @@
 //      debug TeleportPlayer helper so the game re-evaluates the current
 //      context (m_ResetBehaviorAfterTeleport; with it off the teleport is a
 //      same-value write and should cause NO state change - test mode),
-//   5. requests EnumParkourAction::breakfall through the game's normal
-//      parkour-action request pipeline. While HoldBreakfallWhileHeld is on,
-//      that breakfall request is re-issued every frame for as long as the
-//      force key remains held, and stops on release.
+//   5. (optional, OFF by default) requests EnumParkourAction::breakfall
+//      through the game's parkour-action request pipeline.
+//
+// VALIDATED STABLE CONFIGURATION (crash A/B test):
+//   ResetBehaviorAfterTeleport=1 + BreakfallAfterTeleport=0
+// was used constantly for 30+ minutes with zero crashes. With
+// ResetBehaviorAfterTeleport=0 the keypress does nothing at all (the
+// transform write is a same-value no-op), which confirms the HSTE reset is
+// the mechanism that drops the player into freefall. The breakfall-request
+// layer is the identified crash source and is off by default; once in
+// freefall, breakfall natively with E instead.
 //
 // The same-position teleport/reset behavior was confirmed by the tester to put
 // the player into freefall when executed mid-air.
@@ -34,6 +41,7 @@ private:
     bool TeleportToExactCurrentPosition();
     bool ProbeLedgeGate();
     bool ProbeStateGate();
+    void ServiceShiftNegation();
     void ServiceHeldBreakfall();
     void ProcessPendingBreakfall();
     void ReleaseForce();
@@ -53,7 +61,9 @@ private:
     std::array<bool, 256> m_CaptureKeyWasDown {};
 
     // breakfall
-    bool m_BreakfallAfterTeleport = true;
+    // OFF by default: the request layer is the identified crash source.
+    // VALIDATED STABLE CONFIG: reset ON + this OFF (30+ min constant use, 0 crashes).
+    bool m_BreakfallAfterTeleport = false;
     bool m_HoldBreakfallWhileHeld = true;
     int  m_BreakfallActionId = 18;         // EnumParkourAction::breakfall
     int  m_BreakfallDelayMs = 100;         // delay before the first request
@@ -63,6 +73,11 @@ private:
     // this is the only state-changing call; toggling it off turns the
     // teleport into a same-value write (crash A/B test mode).
     bool m_ResetBehaviorAfterTeleport = true;
+
+    // While mid-jump (InSafeJumpOrLoweringToHang), make the game see Shift as
+    // released so sprint cannot fight the forced freefall (fixes jitter /
+    // walking-in-air). See ServiceShiftNegation().
+    bool m_NegateShiftInSafeJump = true;
 
     // human-state gate
     bool m_StateGateEnabled = true;      // block while in the known-invalid states
@@ -92,6 +107,7 @@ private:
     bool m_LastTransformApplied = false;
     bool m_LastResetDispatched = false;
     bool m_LastBreakfallRequested = false;
+    bool m_ShiftNegationActive = false;
     int  m_HoldRequestCount = 0;
     uint64_t m_BreakfallRequestAt = 0;
     uint64_t m_NextHoldRequestAt = 0;
