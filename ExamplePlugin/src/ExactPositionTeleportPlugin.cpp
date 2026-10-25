@@ -426,6 +426,7 @@ namespace
     constexpr uintptr_t kStateWalling = 0x141A4EC10;
     constexpr uintptr_t kStateInSafeJumpOrLoweringToHang = 0x141ADD2D0;
     constexpr uintptr_t kStateWallrunUp = 0x141A8CF40;
+    constexpr uintptr_t kStateDetachingFromWall = 0x141A4BC20;
 
     struct ActiveHumanStates
     {
@@ -435,6 +436,7 @@ namespace
         bool walling = false;
         bool inSafeJumpOrLoweringToHang = false;
         bool wallrunUp = false;
+        bool detachingFromWall = false;
         int nodeCount = 0;
     };
 
@@ -455,6 +457,7 @@ namespace
         case kStateWalling:                        out.walling = true; break;
         case kStateInSafeJumpOrLoweringToHang:     out.inSafeJumpOrLoweringToHang = true; break;
         case kStateWallrunUp:                      out.wallrunUp = true; break;
+        case kStateDetachingFromWall:              out.detachingFromWall = true; break;
         default: break;
         }
 
@@ -548,17 +551,11 @@ namespace
              << "MinLedgeRise=-1.0\n"
              << "MaxLedgeRise=2.5\n"
               << "TopNormalMinZ=0.6\n"
-              << "// Safe injection method: when ON, uses reset-only (no external
-"
-              << "// breakfall-request layer). This is the validated stable config.\n"
+              << "// Safe injection method: reset-only disables external request layer.\n"
               << "SafeInjectionOnly=0\n"
-              << "// Buffer (ms) between first valid-state detection and allowing
-"
-              << "// teleport/freefall; prevents rapid-transition corruption.\n"
+              << "// Buffer (ms) after first valid-state detection before teleport.\n"
               << "StateDetectionBufferMs=200\n"
-              << "// Re-apply teleport/freefall mechanism continuously while held
-"
-              << "// (after each ForceCooldownMs), not just the breakfall request.\n"
+              << "// Re-apply teleport/freefall mechanism continuously while held.\n"
               << "ReapplyTeleportWhileHeld=0\n";
         file.flush();
         return static_cast<bool>(file);
@@ -878,7 +875,7 @@ bool ExactPositionTeleportPlugin::ProbeStateGate()
         states.onGroundLowProfile || states.onGroundHighProfile ||
         states.onPeakOrLedge || states.walling;
     const bool inValidState =
-        states.inSafeJumpOrLoweringToHang || states.wallrunUp;
+        states.inSafeJumpOrLoweringToHang || states.wallrunUp || states.detachingFromWall;
 
     if (inInvalidState)
     {
@@ -1108,6 +1105,7 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
 {
     ImGui::Begin("Exact Position Teleport");
 
+    // Minimal player-facing view: binding + action only.
     ImGui::Text("Force-freefall / teleport key: 0x%02X", m_ForceKey);
     if (m_ForceKey >= 0x20 && m_ForceKey <= 0x7E)
     {
@@ -1121,122 +1119,82 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         if (m_WaitingForKey)
         {
             for (int vk = 1; vk <= 0xFF; ++vk)
-            {
                 m_CaptureKeyWasDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
-            }
         }
     }
 
     if (m_WaitingForKey)
     {
-        // Capture the first fresh key/mouse-button transition. This runs
-        // after the Cancel button is processed, so clicking Cancel cannot
-        // accidentally bind the mouse button.
         for (int vk = 1; vk <= 0xFF; ++vk)
         {
             const bool keyDown = (GetAsyncKeyState(vk) & 0x8000) != 0;
             const bool newlyPressed = keyDown && !m_CaptureKeyWasDown[vk];
             m_CaptureKeyWasDown[vk] = keyDown;
-            if (!newlyPressed)
-            {
-                continue;
-            }
-
-            m_ForceKey = vk;
-            m_WaitingForKey = false;
-            // The newly captured key may still be held. Requiring a fresh
-            // press prevents an accidental immediate teleport.
-            m_PrevKeyDown = keyDown;
-            SaveSettings();
-            SetStatus("Force key rebound to 0x" + [&] {
-                char keyText[8];
-                std::snprintf(keyText, sizeof(keyText), "%02X", vk);
-                return std::string(keyText);
-            }());
+            if (!newlyPressed) continue;
+            m_ForceKey = vk; m_WaitingForKey = false;
+            m_PrevKeyDown = keyDown; SaveSettings();
+            SetStatus("Force key rebound to 0x" + std::to_string(vk));
             break;
         }
-
         ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f),
             "Press any keyboard key or mouse button to bind it...");
     }
 
-    ImGui::Separator();
-    ImGui::Checkbox("Require nearby ledge (raycast gate)", &m_RequireLedge);
+    // Confirm loaded config briefly; shows checkbox / slider values were read.
+    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+        "Config loaded: reset=%s | safe=%s | buffer=%d ms | reapply=%s",
+        m_ResetBehaviorAfterTeleport ? "ON" : "OFF",
+        m_SafeInjectionOnly ? "ON" : "OFF",
+        m_StateDetectionBufferMs,
+        m_ReapplyTeleportWhileHeld ? "ON" : "OFF");
+
+    ImGui::Checkbox("Safe injection method (reset-only / deferred hook)", &m_SafeInjectionOnly);
     if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Safe injection: defers HSTE reset to game-thread hook (not Present thread). Keeps reset; disables external breakfall request.");
+
+    if (ImGui::Button(m_BreakfallAfterTeleport && !m_SafeInjectionOnly
+        ? "Force freefall + Breakfall now"
+        : "Force freefall now"))
     {
-        ImGui::SetTooltip(
-            "Casts rays around the player and only allows the force-freefall\n"
-            "when a vertical wall with a usable horizontal top ledge is found.\n"
-            "This prevents the mid-air force-freefall outside the parkour system.");
+        BeginForceFreefall();
     }
-    if (!m_RaycastCompatible)
+
+    // Collapsible debug section: all parameters, sliders, gates, diagnostics.
+    if (ImGui::TreeNodeEx("Debug / parameters", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f),
-            "Raycast API signature MISMATCH - gate will block the trigger.");
-    }
+        ImGui::Checkbox("Require nearby ledge (raycast gate)", &m_RequireLedge);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("When ON, only allows force-free-fall when a vertical wall with a usable horizontal top ledge is detected near the player.");
+        if (!m_RaycastCompatible)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "Raycast API MISMATCH - gate will block trigger.");
+        }
+
+    // Note: shift-negate doesn't fully prevent jitter (tester feedback).
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
+        "Note: shift-negate reduces but may not fully eliminate mid-air jitter.");
 
     if (ImGui::TreeNodeEx("Ledge gate parameters", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::SliderInt("Probe directions", &m_ProbeDirections, 4, 32);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many horizontal directions to scan. Higher = wider coverage, slightly slower.");
         ImGui::SliderFloat("Max horizontal reach", &m_MaxHorizontalReach, 0.25f, 4.0f, "%.2f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far horizontally the wall-search ray extends. Raise to detect walls further away.");
         ImGui::SliderFloat("Wall probe height", &m_WallProbeHeight, 0.1f, 2.0f, "%.2f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Height above feet for wall ray. Raise for tall walls; lower catches waist-level ledges.");
         ImGui::SliderFloat("Wall normal max |z|", &m_WallNormalMaxAbsZ, 0.05f, 0.9f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How vertical the wall face must be (lower = stricter vertical-only; higher allows sloped surfaces).");
         ImGui::SliderFloat("Ledge inset", &m_LedgeInset, 0.05f, 1.0f, "%.2f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far past the wall face to step before scanning downward. Higher catches recessed ledges.");
         ImGui::SliderFloat("Min ledge rise", &m_MinLedgeRise, -3.0f, 2.0f, "%.2f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest acceptable ledge top above feet (negative = steps down allowed). Raise to require ledge above feet.");
         ImGui::SliderFloat("Max ledge rise", &m_MaxLedgeRise, 0.1f, 5.0f, "%.2f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Highest acceptable ledge top above feet. Raise to allow taller ledges.");
         ImGui::SliderFloat("Top normal min z", &m_TopNormalMinZ, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How flat/horizontal the ledge top must be (1.0 = flat; lower allows angled tops).");
         ImGui::TreePop();
     }
 
-    ImGui::Checkbox("Safe injection method (reset only, no external breakfall request)", &m_SafeInjectionOnly);
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip(
-            "When ON, disables the ParkourAction__Request breakfall layer entirely;\n"
-            "only the teleport + HSTE reset is used. Validated stable (30+ min, 0 crashes).");
-    }
-
-    int stateBufferMs = m_StateDetectionBufferMs;
-    if (ImGui::SliderInt("State detection buffer (ms)", &stateBufferMs, 0, 1000))
-    {
-        m_StateDetectionBufferMs = stateBufferMs;
-        SaveSettings();
-    }
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip(
-            "After the state gate reports a valid mid-air state, wait this many ms\n"
-            "before allowing teleport/freefall. Prevents rapid-transition crashes.");
-    }
-
-    ImGui::Checkbox("Re-apply teleport/freefall continuously while held (after cooldown)", &m_ReapplyTeleportWhileHeld);
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip(
-            "While ForceKey is held, after ForceCooldownMs, triggers teleport/reset\n"
-            "again. Creates a looped forced-freefall while the button stays down.");
-    }
-
-    if (ImGui::Button("Restore ledge-gate defaults"))
-    {
-        m_ProbeDirections = 12;
-        m_MaxHorizontalReach = 1.5f;
-        m_WallProbeHeight = 0.9f;
-        m_WallNormalMaxAbsZ = 0.35f;
-        m_LedgeInset = 0.35f;
-        m_MinLedgeRise = -1.0f;
-        m_MaxLedgeRise = 2.5f;
-        m_TopNormalMinZ = 0.6f;
-        SaveSettings();
-        SetStatus("Ledge-gate parameters restored to defaults");
-    }
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip("Restores all raycast ledge-gate sliders to their default values.");
-    }
-
-    ImGui::Separator();
-    ImGui::Checkbox("Human-state gate", &m_StateGateEnabled);
     if (ImGui::IsItemHovered())
     {
         ImGui::SetTooltip(
@@ -1370,6 +1328,8 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
 
     ImGui::Separator();
     ImGui::TextWrapped("Last result: %s", m_LastStatus.c_str());
+
+    ImGui::TreePop(); // close "Debug / parameters"
 
     if (ImGui::Button(m_BreakfallAfterTeleport
         ? "Force freefall + Breakfall now"
