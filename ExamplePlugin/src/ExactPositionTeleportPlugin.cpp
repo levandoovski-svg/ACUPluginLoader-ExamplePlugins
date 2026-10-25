@@ -548,17 +548,11 @@ namespace
              << "MinLedgeRise=-1.0\n"
              << "MaxLedgeRise=2.5\n"
               << "TopNormalMinZ=0.6\n"
-              << "// Safe injection method: when ON, uses reset-only (no external
-"
-              << "// breakfall-request layer). This is the validated stable config.\n"
+              << "// Safe injection method: reset-only disables external request layer.\n"
               << "SafeInjectionOnly=0\n"
-              << "// Buffer (ms) between first valid-state detection and allowing
-"
-              << "// teleport/freefall; prevents rapid-transition corruption.\n"
+              << "// Buffer (ms) after first valid-state detection before teleport.\n"
               << "StateDetectionBufferMs=200\n"
-              << "// Re-apply teleport/freefall mechanism continuously while held
-"
-              << "// (after each ForceCooldownMs), not just the breakfall request.\n"
+              << "// Re-apply teleport/freefall mechanism continuously while held.\n"
               << "ReapplyTeleportWhileHeld=0\n";
         file.flush();
         return static_cast<bool>(file);
