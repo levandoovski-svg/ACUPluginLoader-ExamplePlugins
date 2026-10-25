@@ -36,6 +36,11 @@ public:
     void OnUpdate();
     void OnImGuiRender();
 
+    // Called from the game-thread hook (per-frame FOV site 0x141F3FE3B).
+    // Executes a queued HSTE reset on the game/simulation thread instead of
+    // the Present thread when SafeInjectionOnly is enabled.
+    void ServiceDeferredReset();
+
 private:
     void BeginForceFreefall();
     bool TeleportToExactCurrentPosition();
@@ -82,6 +87,10 @@ private:
     // is re-applied after each ForceCooldownMs (not just the breakfall
     // request). Creates a continuous forced-freefall loop.
     bool m_ReapplyTeleportWhileHeld = false;
+    bool m_DeferredResetRequested = false;
+    bool m_DeferredResetDone = false;
+    bool m_GameThreadHookInstalled = false;
+    uint64_t m_DeferredResetAtMs = 0;
 
     // HSTE reset after the transform write. In the exact-position pipeline
     // this is the only state-changing call; toggling it off turns the

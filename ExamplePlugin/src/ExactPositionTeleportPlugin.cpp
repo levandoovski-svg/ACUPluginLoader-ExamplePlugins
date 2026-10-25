@@ -9,6 +9,7 @@
 #include "ACU/SmallArray.h"
 #include "ACU_DefineNativeFunction.h"
 #include "Common_Plugins/ACU_InputUtils.h"
+#include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include "ParkourDebugging/EnumParkourAction.h"
 
 #include <cmath>
@@ -551,7 +552,9 @@ namespace
              << "MinLedgeRise=-1.0\n"
              << "MaxLedgeRise=2.5\n"
               << "TopNormalMinZ=0.6\n"
-              << "// Safe injection method: reset-only disables external request layer.\n"
+              << "// Safe injection: queues the HSTE reset and executes it inside a\n"
+              << "// per-frame game-thread hook (0x141F3FE3B) instead of the Present\n"
+              << "// thread; also disables the external breakfall-request layer.\n"
               << "SafeInjectionOnly=0\n"
               << "// Buffer (ms) after first valid-state detection before teleport.\n"
               << "StateDetectionBufferMs=200\n"
@@ -561,6 +564,41 @@ namespace
         return static_cast<bool>(file);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Deferred game-thread hook ("safe injection method").
+//
+// The plugin's OnUpdate() runs on the Present/render thread. Calling
+// Human__Dispatch_HSTE_ResetBehavior from there mutates state objects the
+// render frame does not expect to change (matches crash stack 0x1400EEC05,
+// near the atom-graph/state container region).
+//
+// When SafeInjectionOnly is enabled, the reset is instead QUEUED during the
+// teleport and executed inside this per-frame game-thread hook at
+// 0x141F3FE3B (the FOV-per-frame site, 6 stolen bytes, already proven safe
+// by FreeCameraRotationPlugin / PhotoModePlugin / photosavemod). The game's
+// own state machine therefore performs the reset at a point it expects
+// mutations - the same timing ACUFixes' TeleportPlayer gets from its own
+// hook contexts.
+// ---------------------------------------------------------------------------
+ExactPositionTeleportPlugin* g_ExactTeleportDeferred = nullptr;
+
+struct DeferredResetHook : AutoAssemblerCodeHolder_Base
+{
+    DeferredResetHook()
+    {
+        constexpr uintptr_t whenSettingFOVforFrame = 0x141F3FE3B;
+        PresetScript_CCodeInTheMiddle(whenSettingFOVforFrame, 6,
+            [](AllRegisters* params)
+            {
+                if (g_ExactTeleportDeferred)
+                {
+                    g_ExactTeleportDeferred->ServiceDeferredReset();
+                }
+            });
+    }
+};
+static std::unique_ptr<AutoAssembleWrapper<DeferredResetHook>> g_DeferredResetHook;
 
 void ExactPositionTeleportPlugin::Init()
 {
@@ -653,11 +691,37 @@ void ExactPositionTeleportPlugin::Init()
             m_BreakfallRequestCompatible ? "compatible" : "UNAVAILABLE");
         SetStatus(details);
     }
+
+    // Install the deferred-reset game-thread hook. The callback is a no-op
+    // unless SafeInjectionOnly is on AND a reset was queued by a teleport.
+    g_ExactTeleportDeferred = this;
+    try
+    {
+        g_DeferredResetHook = std::make_unique<AutoAssembleWrapper<DeferredResetHook>>();
+        g_DeferredResetHook->Activate();
+        m_GameThreadHookInstalled = true;
+        Log("Deferred-reset game-thread hook installed at 0x141F3FE3B");
+    }
+    catch (...)
+    {
+        m_GameThreadHookInstalled = false;
+        Log("WARNING: deferred-reset game-thread hook failed to install; safe injection falls back to direct reset");
+    }
 }
 
 void ExactPositionTeleportPlugin::OnUpdate()
 {
     ServiceShiftNegation();
+
+    // Report a completed deferred (game-thread) reset on this thread, so the
+    // hook callback itself stays free of logging/file I/O.
+    if (m_DeferredResetDone)
+    {
+        m_DeferredResetDone = false;
+        SetStatus(m_LastResetDispatched
+            ? "Deferred HSTE reset executed on game thread (safe injection)"
+            : "Deferred HSTE reset failed: player Human was unavailable");
+    }
 
     const bool keyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
 
@@ -974,6 +1038,28 @@ bool ExactPositionTeleportPlugin::TeleportToExactCurrentPosition()
         return true;
     }
 
+    // Safe injection: queue the reset for the game-thread hook instead of
+    // dispatching it from the Present thread. The hook executes it on the
+    // game/simulation thread, at a point the game's own state machine
+    // expects mutations (same timing as ACUFixes' own hook contexts).
+    if (m_SafeInjectionOnly && m_GameThreadHookInstalled)
+    {
+        m_DeferredResetRequested = true;
+        m_DeferredResetDone = false;
+        // Short queue delay so the transform write settles first; the hook
+        // fires every frame on the game thread and picks it up after this.
+        m_DeferredResetAtMs = GetTickCount64() + 50;
+
+        char details[224];
+        std::snprintf(details, sizeof(details),
+            "Teleported to exact position (%.3f, %.3f, %.3f); reset QUEUED for game-thread hook",
+            m_LastX, m_LastY, m_LastZ);
+        SetStatus(details);
+        return true;
+    }
+
+    // Direct path (safe injection off or hook unavailable): dispatch
+    // immediately from this (Present) thread - the historical behavior.
     Human* human = GetPlayerHumanSafely();
     if (!human)
     {
@@ -1001,6 +1087,35 @@ bool ExactPositionTeleportPlugin::TeleportToExactCurrentPosition()
         m_LastX, m_LastY, m_LastZ);
     SetStatus(details);
     return true;
+}
+
+// Runs INSIDE the per-frame game-thread hook (FOV site 0x141F3FE3B).
+// Executes the queued HSTE reset on the game/simulation thread. Deliberately
+// minimal: no file logging or string building here - the completion status is
+// reported by OnUpdate on the Present thread via m_DeferredResetDone.
+void ExactPositionTeleportPlugin::ServiceDeferredReset()
+{
+    if (!m_DeferredResetRequested)
+    {
+        return;
+    }
+    if (GetTickCount64() < m_DeferredResetAtMs)
+    {
+        return;
+    }
+
+    m_DeferredResetRequested = false;
+
+    Human* human = GetPlayerHumanSafely();
+    if (!human)
+    {
+        m_DeferredResetDone = true;
+        m_LastResetDispatched = false;
+        return;
+    }
+
+    m_LastResetDispatched = DispatchHumanReset(human);
+    m_DeferredResetDone = true;
 }
 
 void ExactPositionTeleportPlugin::ServiceHeldBreakfall()
@@ -1297,6 +1412,8 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     ImGui::Text("Raycast API: %s", m_RaycastCompatible ? "compatible" : "MISMATCH");
     ImGui::Text("Breakfall request pipeline: %s",
         m_BreakfallRequestCompatible ? "compatible" : "UNAVAILABLE");
+    ImGui::Text("Game-thread hook: %s",
+        m_GameThreadHookInstalled ? "installed (0x141F3FE3B)" : "NOT installed");
     ImGui::Text("Force active (key held): %s", m_ForceActive ? "yes" : "no");
     ImGui::Text("Last ledge probe: %s (%.2f m wall, %.2f m rise)",
         m_LastProbeFound ? "FOUND" : "none",
@@ -1330,6 +1447,7 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     ImGui::TextWrapped("Last result: %s", m_LastStatus.c_str());
 
     ImGui::TreePop(); // close "Debug / parameters"
+    } // end debug section
 
     if (ImGui::Button(m_BreakfallAfterTeleport
         ? "Force freefall + Breakfall now"
