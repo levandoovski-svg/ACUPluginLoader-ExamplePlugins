@@ -185,9 +185,62 @@ static void ForceSheatheWeapon()
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+static constexpr const char* kParryAssassinIniSection = "ParryAssassin";
+static constexpr const char* kParryAssassinIniFileName = "ParryAssassinPlugin.ini";
+
+static std::string GetParryAssassinIniPath()
+{
+    char docs[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, docs)))
+        return std::string(docs) + "\\Assassin's Creed Unity\\" + kParryAssassinIniFileName;
+    return kParryAssassinIniFileName;
+}
+
+static bool EnsureParryAssassinIniDirectoryExists()
+{
+    const fs::path directory = fs::path(GetParryAssassinIniPath()).parent_path();
+    if (directory.empty())
+        return true;
+
+    std::error_code error;
+    fs::create_directories(directory, error);
+    return !error;
+}
+
 void ParryAssassinPlugin::LoadSettings()
 {
     InstallAssassinationHooks();
+
+    const std::string iniPath = GetParryAssassinIniPath();
+    m_Enabled = GetPrivateProfileIntA(
+        kParryAssassinIniSection, "Enabled", m_Enabled ? 1 : 0, iniPath.c_str()) != 0;
+    m_CritKillEnabled = GetPrivateProfileIntA(
+        kParryAssassinIniSection, "CritKillEnabled", m_CritKillEnabled ? 1 : 0, iniPath.c_str()) != 0;
+    m_BoostCritDamage = GetPrivateProfileIntA(
+        kParryAssassinIniSection, "BoostCritDamage", m_BoostCritDamage ? 1 : 0, iniPath.c_str()) != 0;
+    m_UnrestrictedCritEnabled = GetPrivateProfileIntA(
+        kParryAssassinIniSection, "UnrestrictedCritEnabled", m_UnrestrictedCritEnabled ? 1 : 0, iniPath.c_str()) != 0;
+
+    // This also creates the file (and its directory) on first run and adds any
+    // settings that are missing from an older INI file.
+    SaveSettings();
+    UpdateCritPatches();
+}
+
+void ParryAssassinPlugin::SaveSettings()
+{
+    if (!EnsureParryAssassinIniDirectoryExists())
+        return;
+
+    const std::string iniPath = GetParryAssassinIniPath();
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "Enabled", m_Enabled ? "1" : "0", iniPath.c_str());
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "CritKillEnabled", m_CritKillEnabled ? "1" : "0", iniPath.c_str());
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "BoostCritDamage", m_BoostCritDamage ? "1" : "0", iniPath.c_str());
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "UnrestrictedCritEnabled", m_UnrestrictedCritEnabled ? "1" : "0", iniPath.c_str());
 }
 
 void ParryAssassinPlugin::OnUpdate()
@@ -252,19 +305,32 @@ void ParryAssassinPlugin::OnUpdate()
 
 void ParryAssassinPlugin::OnImGuiRender()
 {
-    ImGui::Checkbox("Parry Assassination", &m_Enabled);
+    if (ImGui::Checkbox("Parry Assassination", &m_Enabled))
+    {
+        UpdateCritPatches();
+        SaveSettings();
+    }
 
     if (m_Enabled)
     {
         if (ImGui::Checkbox("Insta-critical kill after two parries", &m_CritKillEnabled))
+        {
             UpdateCritPatches();
+            SaveSettings();
+        }
 
         if (m_CritKillEnabled)
         {
             if (ImGui::Checkbox("Max critical damage (100%)", &m_BoostCritDamage))
+            {
                 UpdateCritPatches();
+                SaveSettings();
+            }
             if (ImGui::Checkbox("Unrestricted critical kill (bypass gate)", &m_UnrestrictedCritEnabled))
+            {
                 UpdateCritPatches();
+                SaveSettings();
+            }
             ImGui::TextDisabled("Patches apply while the ready window is open.");
         }
     }

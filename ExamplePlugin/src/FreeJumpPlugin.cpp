@@ -37,7 +37,9 @@ static std::string GetGameSaveFolder()
     if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documents)))
     {
         std::string path(documents);
-        path += "\\Assassin's Creed Unity\\FreeJumpPlugin.ini";
+        path += "\\Assassin's Creed Unity";
+        CreateDirectoryA(path.c_str(), NULL); // ensure parent exists
+        path += "\\FreeJumpPlugin.ini";
         return path;
     }
     return "FreeJumpPlugin.ini";
@@ -233,6 +235,7 @@ void FreeJumpPlugin::OnUpdate()
             {
                 m_SnapDirectionKey = vk;
                 m_WaitingForSnapKey = false;
+                SaveSettings();
                 break;
             }
         }
@@ -322,7 +325,7 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::SameLine();
         ImGui::TextColored(freeMode ? activeColor : inactiveColor, freeMode ? "ACTIVE (HOLD)" : "OFF");
         ImGui::Text("  Bound key: 0x%02X", m_ToggleKey);
-        if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Press any key..."); }
+        if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForKey ? "Cancel Rebind" : "Rebind##FreeJump"))
             m_WaitingForKey = !m_WaitingForKey;
 
@@ -332,7 +335,7 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::TextColored(snapMode ? ImVec4(0.20f,0.60f,0.90f,1.0f) : ImVec4(0.70f,0.70f,0.70f,1.0f),
                            snapMode ? "ON" : "OFF");
         ImGui::Text("  Toggle key: 0x%02X", m_SnapDirectionKey);
-        if (m_WaitingForSnapKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Press any key..."); }
+        if (m_WaitingForSnapKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForSnapKey ? "Cancel Rebind" : "Rebind##Snap"))
             m_WaitingForSnapKey = !m_WaitingForSnapKey;
 
@@ -348,7 +351,8 @@ void FreeJumpPlugin::OnImGuiRender()
         if (ImGui::Button("+ Add Custom Override"))
         {
             ParkourActionOverride newOverride;
-            newOverride.keyCode = VK_F9 + (int)m_Overrides.size();
+            newOverride.keyCode = VK_F9; // sensible default, user rebinds after
+            newOverride.waitingForKey = true; // start in bind mode
             m_Overrides.push_back(newOverride);
             SaveSettings();
         }
@@ -372,7 +376,7 @@ void FreeJumpPlugin::OnImGuiRender()
                     ImGui::SameLine();
                     if (ImGui::Button(ov.waitingForKey ? "Cancel" : "Rebind"))
                         ov.waitingForKey = !ov.waitingForKey;
-                    if (ov.waitingForKey) ImGui::TextColored(rebindColor, "Press any key...");
+                    if (ov.waitingForKey) ImGui::TextColored(rebindColor, "Input key to bind...");
 
                     bool holdMode = !ov.toggleMode;
                     if (ImGui::RadioButton("Hold (press and hold)", holdMode)) ov.toggleMode = false;

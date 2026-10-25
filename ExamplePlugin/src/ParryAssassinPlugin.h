@@ -5,6 +5,7 @@ class ParryAssassinPlugin
 {
 public:
     void LoadSettings();
+    void SaveSettings();
     void OnUpdate();
     void OnImGuiRender();
 
