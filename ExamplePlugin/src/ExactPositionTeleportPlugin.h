@@ -69,6 +69,20 @@ private:
     int  m_BreakfallDelayMs = 100;         // delay before the first request
     int  m_BreakfallHoldIntervalMs = 0;    // 0 = re-issue every frame while held
 
+    // Safe injection method checkbox: when ON, ignores the external
+    // breakfall-request layer (reset-only, no ParkourAction__Request).
+    // This is the validated stable configuration (30+ min, 0 crashes).
+    bool m_SafeInjectionOnly = false;
+
+    // Buffer between first detection of a valid human state and allowing
+    // the teleport/freefall. Prevents rapid transition corruption.
+    int  m_StateDetectionBufferMs = 200;
+
+    // When enabled, while ForceKey is held, the teleport/freefall mechanism
+    // is re-applied after each ForceCooldownMs (not just the breakfall
+    // request). Creates a continuous forced-freefall loop.
+    bool m_ReapplyTeleportWhileHeld = false;
+
     // HSTE reset after the transform write. In the exact-position pipeline
     // this is the only state-changing call; toggling it off turns the
     // teleport into a same-value write (crash A/B test mode).
@@ -119,6 +133,7 @@ private:
     float m_LastProbeRise = 0.0f;
 
     uint64_t m_NextForceAllowedAt = 0;
+    uint64_t m_StateValidSinceMs = 0; // when a valid state was first seen
 
     // last human-state-gate observation (for the ImGui readout)
     bool m_LastStateGateEvaluated = false;

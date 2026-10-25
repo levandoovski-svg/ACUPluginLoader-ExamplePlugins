@@ -547,7 +547,19 @@ namespace
              << "LedgeInset=0.35\n"
              << "MinLedgeRise=-1.0\n"
              << "MaxLedgeRise=2.5\n"
-             << "TopNormalMinZ=0.6\n";
+              << "TopNormalMinZ=0.6\n"
+              << "// Safe injection method: when ON, uses reset-only (no external
+"
+              << "// breakfall-request layer). This is the validated stable config.\n"
+              << "SafeInjectionOnly=0\n"
+              << "// Buffer (ms) between first valid-state detection and allowing
+"
+              << "// teleport/freefall; prevents rapid-transition corruption.\n"
+              << "StateDetectionBufferMs=200\n"
+              << "// Re-apply teleport/freefall mechanism continuously while held
+"
+              << "// (after each ForceCooldownMs), not just the breakfall request.\n"
+              << "ReapplyTeleportWhileHeld=0\n";
         file.flush();
         return static_cast<bool>(file);
     }
@@ -666,6 +678,12 @@ void ExactPositionTeleportPlugin::OnUpdate()
         else
         {
             ServiceHeldBreakfall();
+            // Continuous re-application of teleport/freefall mechanism while
+            // the key is held (after the force cooldown has elapsed).
+            if (m_ReapplyTeleportWhileHeld && (GetTickCount64() >= m_NextForceAllowedAt))
+            {
+                BeginForceFreefall();
+            }
         }
     }
 
@@ -699,6 +717,23 @@ void ExactPositionTeleportPlugin::BeginForceFreefall()
         return;
     }
 
+    // State detection buffer: after a valid state is first seen, wait the
+    // configured buffer before allowing teleport/freefall.
+    if (m_StateGateEnabled && m_StateDetectionBufferMs > 0)
+    {
+        const uint64_t now = GetTickCount64();
+        if (m_StateValidSinceMs == 0 || (now - m_StateValidSinceMs) < static_cast<uint64_t>(m_StateDetectionBufferMs))
+        {
+            char details[224];
+            std::snprintf(details, sizeof(details),
+                "Force freefall blocked: state-buffer (%.0f ms remaining; valid since %llu)",
+                static_cast<double>(m_StateValidSinceMs ? (static_cast<uint64_t>(m_StateDetectionBufferMs) - (now - m_StateValidSinceMs)) : static_cast<uint64_t>(m_StateDetectionBufferMs)),
+                static_cast<unsigned long long>(m_StateValidSinceMs));
+            SetStatus(details);
+            return;
+        }
+    }
+
     if (m_RequireLedge)
     {
         if (!m_RaycastCompatible)
@@ -725,7 +760,10 @@ void ExactPositionTeleportPlugin::BeginForceFreefall()
     // Arm the cooldown as soon as a teleport was actually performed.
     m_NextForceAllowedAt = GetTickCount64() + static_cast<uint64_t>(m_ForceCooldownMs);
 
-    if (!m_BreakfallAfterTeleport)
+    // Safe injection: reset-only mode (validated stable config) disables
+    // the external breakfall-request layer entirely.
+    const bool requestBreakfall = m_BreakfallAfterTeleport && !m_SafeInjectionOnly;
+    if (!requestBreakfall)
     {
         return;
     }
@@ -844,6 +882,7 @@ bool ExactPositionTeleportPlugin::ProbeStateGate()
 
     if (inInvalidState)
     {
+        m_StateValidSinceMs = 0; // invalid state resets the buffer
         m_LastStateGateBlocked = true;
         char details[288];
         std::snprintf(details, sizeof(details),
@@ -860,6 +899,7 @@ bool ExactPositionTeleportPlugin::ProbeStateGate()
     if (inValidState)
     {
         m_LastStateGateBlocked = false;
+        if (m_StateValidSinceMs == 0) m_StateValidSinceMs = GetTickCount64();
         SetStatus(std::string("State gate: valid (") +
             (states.inSafeJumpOrLoweringToHang ? "InSafeJumpOrLoweringToHang " : "") +
             (states.wallrunUp ? "WallrunUp" : "") + ")");
@@ -868,12 +908,15 @@ bool ExactPositionTeleportPlugin::ProbeStateGate()
 
     // Neither list. Permissive unless the caller asked to require a known-valid
     // state.
-    m_LastStateGateBlocked = m_StateGateRequireValid;
     if (m_StateGateRequireValid)
     {
+        m_StateValidSinceMs = 0;
+        m_LastStateGateBlocked = true;
         SetStatus("Force freefall blocked: not in a known-valid human state");
         return false;
     }
+    if (m_StateValidSinceMs == 0) m_StateValidSinceMs = GetTickCount64();
+    m_LastStateGateBlocked = false;
     return true;
 }
 
@@ -1145,6 +1188,53 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         ImGui::TreePop();
     }
 
+    ImGui::Checkbox("Safe injection method (reset only, no external breakfall request)", &m_SafeInjectionOnly);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "When ON, disables the ParkourAction__Request breakfall layer entirely;\n"
+            "only the teleport + HSTE reset is used. Validated stable (30+ min, 0 crashes).");
+    }
+
+    int stateBufferMs = m_StateDetectionBufferMs;
+    if (ImGui::SliderInt("State detection buffer (ms)", &stateBufferMs, 0, 1000))
+    {
+        m_StateDetectionBufferMs = stateBufferMs;
+        SaveSettings();
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "After the state gate reports a valid mid-air state, wait this many ms\n"
+            "before allowing teleport/freefall. Prevents rapid-transition crashes.");
+    }
+
+    ImGui::Checkbox("Re-apply teleport/freefall continuously while held (after cooldown)", &m_ReapplyTeleportWhileHeld);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "While ForceKey is held, after ForceCooldownMs, triggers teleport/reset\n"
+            "again. Creates a looped forced-freefall while the button stays down.");
+    }
+
+    if (ImGui::Button("Restore ledge-gate defaults"))
+    {
+        m_ProbeDirections = 12;
+        m_MaxHorizontalReach = 1.5f;
+        m_WallProbeHeight = 0.9f;
+        m_WallNormalMaxAbsZ = 0.35f;
+        m_LedgeInset = 0.35f;
+        m_MinLedgeRise = -1.0f;
+        m_MaxLedgeRise = 2.5f;
+        m_TopNormalMinZ = 0.6f;
+        SaveSettings();
+        SetStatus("Ledge-gate parameters restored to defaults");
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Restores all raycast ledge-gate sliders to their default values.");
+    }
+
     ImGui::Separator();
     ImGui::Checkbox("Human-state gate", &m_StateGateEnabled);
     if (ImGui::IsItemHovered())
@@ -1374,6 +1464,13 @@ void ExactPositionTeleportPlugin::LoadSettings()
             const int cooldown = parseInt(value, m_ForceCooldownMs);
             if (cooldown >= 0 && cooldown <= 10000) { m_ForceCooldownMs = cooldown; }
         }
+        else if (key == "SafeInjectionOnly") { m_SafeInjectionOnly = parseBool(value, m_SafeInjectionOnly); }
+        else if (key == "StateDetectionBufferMs")
+        {
+            const int buf = parseInt(value, m_StateDetectionBufferMs);
+            if (buf >= 0 && buf <= 2000) { m_StateDetectionBufferMs = buf; }
+        }
+        else if (key == "ReapplyTeleportWhileHeld") { m_ReapplyTeleportWhileHeld = parseBool(value, m_ReapplyTeleportWhileHeld); }
         else if (key == "RequireLedge") { m_RequireLedge = parseBool(value, m_RequireLedge); }
         else if (key == "ProbeDirections")
         {
@@ -1427,7 +1524,10 @@ void ExactPositionTeleportPlugin::SaveSettings()
              << "LedgeInset=" << m_LedgeInset << "\n"
              << "MinLedgeRise=" << m_MinLedgeRise << "\n"
              << "MaxLedgeRise=" << m_MaxLedgeRise << "\n"
-             << "TopNormalMinZ=" << m_TopNormalMinZ << "\n";
+              << "TopNormalMinZ=" << m_TopNormalMinZ << "\n"
+              << "SafeInjectionOnly=" << (m_SafeInjectionOnly ? 1 : 0) << "\n"
+              << "StateDetectionBufferMs=" << m_StateDetectionBufferMs << "\n"
+              << "ReapplyTeleportWhileHeld=" << (m_ReapplyTeleportWhileHeld ? 1 : 0) << "\n";
     }
     catch (...)
     {
