@@ -137,3 +137,13 @@ The ledge decision lives in the Denuvo VM fragment at 0x13FE30120 (outside the m
 
 ### Crash (Shift+Space+T) — residual note
 Crash stack top frames (`0x1400EEC05`, `0x1400E9A3A`, `0x141D591FD`, `0x141D44004`) sit above the `0x14276xxx`/`0x14277xxx` container+atom-graph-variable region (near `FUN_14277AA00` graph-var setter used by the freefall enter). This is consistent with forcing the freefall state while the game is mid-transition (sprint+jump), corrupting the state/atom-graph containers — not with the raycast or the request call signature itself. The ledge gate reduces the window (no force when no ledge is present) but is not a complete guard against forcing during an unrelated transition. Kept as a known residual; do not re-enable an unconditional trigger.
+
+## SESSION 4 — HUMAN-STATE GATE + 300 ms COOLDOWN (ExactPositionTeleportPlugin)
+- Tester feedback: raycast gate needs calibration (a real ledge near the player was rejected); force-freefall crashed again mid-air with the parkour keys NOT held; suspected cause = many successive teleport/force presses.
+- Added a **human-state gate** using the player's "HumanStates" tree (`FunctorBase` nodes, type identified by `Enter()` fn pointer; walked via `HumanStatesHolder::GetForPlayer()`, SEH-wrapped, 48-deep / 1024-node budget). Enter addresses from ACUFixes-0.9.3 `ParkourDebugging/LoggingTheHumanStates.cpp`, each verified as a valid function start in the runtime dump's `.pdata`:
+  - INVALID (block): `OnGroundLowProfile`=0x141A7AE90, `OnGroundHighProfile`=0x141A6A900 (== OnGroundOverlookingEdgeHighProfile), `OnPeakOrLedge`=0x141A60B80, `Walling`=0x141A4EC10.
+  - VALID (allow): `InSafeJumpOrLoweringToHang`=0x141ADD2D0, `WallrunUp`=0x141A8CF40.
+  - Neither list: permissive by default; `StateGateRequireValid=1` makes the valid list mandatory.
+- Added a **`ForceCooldownMs` (default 300)** buffer: after a teleport is actually performed, another force-freefall/teleport is refused until the buffer elapses. This is the direct mitigation for the suspected rapid-press crash.
+- New INI/ImGui: StateGateEnabled, StateGateRequireValid, ForceCooldownMs; ImGui readout shows the current observed states and whether the state gate blocked.
+- Residual: the raycast ledge geometry still needs in-game calibration via the existing sliders; the human-state list is explicitly "for a start" per the tester.

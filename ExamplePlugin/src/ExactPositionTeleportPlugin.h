@@ -31,6 +31,7 @@ private:
     void BeginForceFreefall();
     bool TeleportToExactCurrentPosition();
     bool ProbeLedgeGate();
+    bool ProbeStateGate();
     void ServiceHeldBreakfall();
     void ProcessPendingBreakfall();
     void ReleaseForce();
@@ -55,6 +56,13 @@ private:
     int  m_BreakfallActionId = 18;         // EnumParkourAction::breakfall
     int  m_BreakfallDelayMs = 100;         // delay before the first request
     int  m_BreakfallHoldIntervalMs = 0;    // 0 = re-issue every frame while held
+
+    // human-state gate
+    bool m_StateGateEnabled = true;      // block while in the known-invalid states
+    bool m_StateGateRequireValid = false; // also block when in none of the known states
+
+    // cooldown between force-freefall/teleport attempts (ms)
+    int  m_ForceCooldownMs = 300;
 
     // ledge gate (raycast)
     bool  m_RequireLedge = true;
@@ -86,6 +94,18 @@ private:
     int   m_LastProbeWalls = 0;
     float m_LastProbeDistance = 0.0f;
     float m_LastProbeRise = 0.0f;
+
+    uint64_t m_NextForceAllowedAt = 0;
+
+    // last human-state-gate observation (for the ImGui readout)
+    bool m_LastStateGateEvaluated = false;
+    bool m_LastStateGateBlocked = false;
+    bool m_LastStateOnGroundLow = false;
+    bool m_LastStateOnGroundHigh = false;
+    bool m_LastStateOnPeakOrLedge = false;
+    bool m_LastStateWalling = false;
+    bool m_LastStateSafeJumpOrLowering = false;
+    bool m_LastStateWallrunUp = false;
 
     float m_LastX = 0.0f;
     float m_LastY = 0.0f;

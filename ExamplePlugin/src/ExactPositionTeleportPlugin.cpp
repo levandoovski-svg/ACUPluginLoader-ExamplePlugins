@@ -4,6 +4,7 @@
 #include "ACU/ACUGetSingletons.h"
 #include "ACU/Entity.h"
 #include "ACU/Human.h"
+#include "ACU/HumanStatesHolder.h"
 #include "ACU/SmallArray.h"
 #include "ACU_DefineNativeFunction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
@@ -377,6 +378,83 @@ namespace
         return outcome;
     }
 
+    // ---------------------------------------------------------------------
+    // Human-state gate.
+    //
+    // The player's "HumanStates" are a tree of FunctorBase nodes; the type of
+    // each node is identified by its Enter() function pointer. These Enter
+    // addresses come from ACUFixes-0.9.3 ParkourDebugging/LoggingTheHumanStates.cpp
+    // and were verified against the runtime dump (all six are valid function
+    // starts in .pdata for this build).
+    // ---------------------------------------------------------------------
+    constexpr uintptr_t kStateOnGroundLowProfile = 0x141A7AE90;
+    constexpr uintptr_t kStateOnGroundHighProfile = 0x141A6A900; // == OnGroundOverlookingEdgeHighProfile
+    constexpr uintptr_t kStateOnPeakOrLedge = 0x141A60B80;
+    constexpr uintptr_t kStateWalling = 0x141A4EC10;
+    constexpr uintptr_t kStateInSafeJumpOrLoweringToHang = 0x141ADD2D0;
+    constexpr uintptr_t kStateWallrunUp = 0x141A8CF40;
+
+    struct ActiveHumanStates
+    {
+        bool onGroundLowProfile = false;
+        bool onGroundHighProfile = false;
+        bool onPeakOrLedge = false;
+        bool walling = false;
+        bool inSafeJumpOrLoweringToHang = false;
+        bool wallrunUp = false;
+        int nodeCount = 0;
+    };
+
+    void CollectActiveStatesWorker(const FunctorBase* node, ActiveHumanStates& out, int depth, int& budget)
+    {
+        if (!node || depth > 48 || budget <= 0)
+        {
+            return;
+        }
+        --budget;
+        ++out.nodeCount;
+
+        switch (reinterpret_cast<uintptr_t>(node->Enter))
+        {
+        case kStateOnGroundLowProfile:             out.onGroundLowProfile = true; break;
+        case kStateOnGroundHighProfile:            out.onGroundHighProfile = true; break;
+        case kStateOnPeakOrLedge:                  out.onPeakOrLedge = true; break;
+        case kStateWalling:                        out.walling = true; break;
+        case kStateInSafeJumpOrLoweringToHang:     out.inSafeJumpOrLoweringToHang = true; break;
+        case kStateWallrunUp:                      out.wallrunUp = true; break;
+        default: break;
+        }
+
+        CollectActiveStatesWorker(node->directChild_mb, out, depth + 1, budget);
+        for (int i = 0; i < node->nonoverridingChildren.size; ++i)
+        {
+            CollectActiveStatesWorker(node->nonoverridingChildren.arr[i], out, depth + 1, budget);
+        }
+        for (int i = 0; i < node->someNodes_B8.size; ++i)
+        {
+            CollectActiveStatesWorker(node->someNodes_B8.arr[i], out, depth + 1, budget);
+        }
+    }
+
+    bool CollectActiveStates(ActiveHumanStates& out)
+    {
+        __try
+        {
+            HumanStatesHolder* root = HumanStatesHolder::GetForPlayer();
+            if (!root)
+            {
+                return false;
+            }
+            int budget = 1024;
+            CollectActiveStatesWorker(reinterpret_cast<const FunctorBase*>(root), out, 0, budget);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
     std::string GetDocumentsIniPath()
     {
         char documents[MAX_PATH] = {};
@@ -408,6 +486,13 @@ namespace
              << "BreakfallDelayMs=" << kDefaultBreakfallDelayMs << "\n"
              << "// While held: 0 = re-issue the request every frame.\n"
              << "BreakfallHoldIntervalMs=0\n"
+             << "// Human-state gate: block while the player is in OnGroundLowProfile,\n"
+             << "// OnGroundHighProfile, OnPeakOrLedge or Walling.\n"
+             << "StateGateEnabled=1\n"
+             << "// Also block unless the player is in InSafeJumpOrLoweringToHang or WallrunUp.\n"
+             << "StateGateRequireValid=0\n"
+             << "// Minimum milliseconds between two force-freefall/teleport attempts.\n"
+             << "ForceCooldownMs=300\n"
              << "// Raycast ledge gate: only force-freefall when a wall with a usable\n"
              << "// top ledge is detected around the player.\n"
              << "RequireLedge=1\n"
@@ -502,12 +587,14 @@ void ExactPositionTeleportPlugin::Init()
     }
     else
     {
-        char details[288];
+        char details[384];
         std::snprintf(details, sizeof(details),
-            "Ready - force key 0x%02X; ledge gate %s (raycast %s); breakfall %s (hold %s, request %s)",
+            "Ready - force key 0x%02X; state gate %s; ledge gate %s (raycast %s); cooldown %d ms; breakfall %s (hold %s, request %s)",
             m_ForceKey,
+            m_StateGateEnabled ? (m_StateGateRequireValid ? "strict" : "on") : "off",
             m_RequireLedge ? "on" : "off",
             m_RaycastCompatible ? "compatible" : "UNAVAILABLE",
+            m_ForceCooldownMs,
             m_BreakfallAfterTeleport ? "on" : "off",
             m_HoldBreakfallWhileHeld ? "on" : "off",
             m_BreakfallRequestCompatible ? "compatible" : "UNAVAILABLE");
@@ -544,7 +631,27 @@ void ExactPositionTeleportPlugin::OnUpdate()
 void ExactPositionTeleportPlugin::BeginForceFreefall()
 {
     m_PendingBreakfall = false;
+
+    // Cooldown: repeated teleports/force-freefalls in quick succession are the
+    // suspected cause of the mid-air crash, so refuse to fire again until the
+    // configured buffer has elapsed.
+    const uint64_t now = GetTickCount64();
+    if (now < m_NextForceAllowedAt)
+    {
+        char details[192];
+        std::snprintf(details, sizeof(details),
+            "Force freefall on cooldown (%.0f ms remaining)",
+            static_cast<double>(m_NextForceAllowedAt - now));
+        SetStatus(details);
+        return;
+    }
+
     m_HoldRequestCount = 0;
+
+    if (m_StateGateEnabled && !ProbeStateGate())
+    {
+        return;
+    }
 
     if (m_RequireLedge)
     {
@@ -568,6 +675,9 @@ void ExactPositionTeleportPlugin::BeginForceFreefall()
     {
         return;
     }
+
+    // Arm the cooldown as soon as a teleport was actually performed.
+    m_NextForceAllowedAt = GetTickCount64() + static_cast<uint64_t>(m_ForceCooldownMs);
 
     if (!m_BreakfallAfterTeleport)
     {
@@ -654,6 +764,70 @@ bool ExactPositionTeleportPlugin::ProbeLedgeGate()
         outcome.bestDistance, outcome.bestLedgeRise,
         outcome.raysCast, outcome.wallsFound);
     SetStatus(details);
+    return true;
+}
+
+bool ExactPositionTeleportPlugin::ProbeStateGate()
+{
+    ActiveHumanStates states;
+    const bool evaluated = CollectActiveStates(states);
+
+    m_LastStateGateEvaluated = evaluated;
+    m_LastStateOnGroundLow = states.onGroundLowProfile;
+    m_LastStateOnGroundHigh = states.onGroundHighProfile;
+    m_LastStateOnPeakOrLedge = states.onPeakOrLedge;
+    m_LastStateWalling = states.walling;
+    m_LastStateSafeJumpOrLowering = states.inSafeJumpOrLoweringToHang;
+    m_LastStateWallrunUp = states.wallrunUp;
+
+    if (!evaluated)
+    {
+        m_LastStateGateBlocked = m_StateGateRequireValid;
+        if (m_LastStateGateBlocked)
+        {
+            SetStatus("Force freefall blocked: could not read the player's human states");
+        }
+        return !m_LastStateGateBlocked;
+    }
+
+    const bool inInvalidState =
+        states.onGroundLowProfile || states.onGroundHighProfile ||
+        states.onPeakOrLedge || states.walling;
+    const bool inValidState =
+        states.inSafeJumpOrLoweringToHang || states.wallrunUp;
+
+    if (inInvalidState)
+    {
+        m_LastStateGateBlocked = true;
+        char details[288];
+        std::snprintf(details, sizeof(details),
+            "Force freefall blocked by state gate: %s%s%s%s(nodes=%d)",
+            states.onGroundLowProfile ? "OnGroundLowProfile " : "",
+            states.onGroundHighProfile ? "OnGroundHighProfile " : "",
+            states.onPeakOrLedge ? "OnPeakOrLedge " : "",
+            states.walling ? "Walling" : "",
+            states.nodeCount);
+        SetStatus(details);
+        return false;
+    }
+
+    if (inValidState)
+    {
+        m_LastStateGateBlocked = false;
+        SetStatus(std::string("State gate: valid (") +
+            (states.inSafeJumpOrLoweringToHang ? "InSafeJumpOrLoweringToHang " : "") +
+            (states.wallrunUp ? "WallrunUp" : "") + ")");
+        return true;
+    }
+
+    // Neither list. Permissive unless the caller asked to require a known-valid
+    // state.
+    m_LastStateGateBlocked = m_StateGateRequireValid;
+    if (m_StateGateRequireValid)
+    {
+        SetStatus("Force freefall blocked: not in a known-valid human state");
+        return false;
+    }
     return true;
 }
 
@@ -880,6 +1054,37 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     }
 
     ImGui::Separator();
+    ImGui::Checkbox("Human-state gate", &m_StateGateEnabled);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "Blocks the force-freefall while the player is in OnGroundLowProfile,\n"
+            "OnGroundHighProfile, OnPeakOrLedge or Walling.");
+    }
+    ImGui::Checkbox("Require a known-valid state", &m_StateGateRequireValid);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "When on, the force-freefall is also blocked unless the player is in\n"
+            "InSafeJumpOrLoweringToHang or WallrunUp.");
+    }
+
+    int cooldownMs = m_ForceCooldownMs;
+    if (ImGui::InputInt("Force-freefall cooldown (ms)", &cooldownMs))
+    {
+        if (cooldownMs < 0) cooldownMs = 0;
+        if (cooldownMs > 10000) cooldownMs = 10000;
+        m_ForceCooldownMs = cooldownMs;
+        SaveSettings();
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip(
+            "Minimum time between two force-freefall/teleport attempts.\n"
+            "Guards against rapid repeated presses, the suspected crash cause.");
+    }
+
+    ImGui::Separator();
     bool breakfallAfterTeleport = m_BreakfallAfterTeleport;
     if (ImGui::Checkbox("Execute breakfall after teleport", &breakfallAfterTeleport))
     {
@@ -936,6 +1141,16 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         m_LastProbeFound ? "FOUND" : "none",
         m_LastProbeDistance, m_LastProbeRise);
     ImGui::Text("Last probe rays/walls: %d / %d", m_LastProbeRays, m_LastProbeWalls);
+    ImGui::Text("State gate: %s",
+        !m_LastStateGateEvaluated ? "unread"
+        : (m_LastStateGateBlocked ? "BLOCKED" : "allowed"));
+    ImGui::Text("  active: %s%s%s%s%s%s",
+        m_LastStateOnGroundLow ? "GroundLow " : "",
+        m_LastStateOnGroundHigh ? "GroundHigh " : "",
+        m_LastStateOnPeakOrLedge ? "PeakOrLedge " : "",
+        m_LastStateWalling ? "Walling " : "",
+        m_LastStateSafeJumpOrLowering ? "SafeJump/Lowering " : "",
+        m_LastStateWallrunUp ? "WallrunUp" : "");
     ImGui::Text("Last transform applied: %s", m_LastTransformApplied ? "yes" : "no");
     ImGui::Text("Last HSTE reset dispatched: %s", m_LastResetDispatched ? "yes" : "no");
     ImGui::Text("Held breakfall requests: %d", m_HoldRequestCount);
@@ -1036,6 +1251,13 @@ void ExactPositionTeleportPlugin::LoadSettings()
             const int interval = parseInt(value, m_BreakfallHoldIntervalMs);
             if (interval >= 0 && interval <= 2000) { m_BreakfallHoldIntervalMs = interval; }
         }
+        else if (key == "StateGateEnabled") { m_StateGateEnabled = parseBool(value, m_StateGateEnabled); }
+        else if (key == "StateGateRequireValid") { m_StateGateRequireValid = parseBool(value, m_StateGateRequireValid); }
+        else if (key == "ForceCooldownMs")
+        {
+            const int cooldown = parseInt(value, m_ForceCooldownMs);
+            if (cooldown >= 0 && cooldown <= 10000) { m_ForceCooldownMs = cooldown; }
+        }
         else if (key == "RequireLedge") { m_RequireLedge = parseBool(value, m_RequireLedge); }
         else if (key == "ProbeDirections")
         {
@@ -1076,6 +1298,9 @@ void ExactPositionTeleportPlugin::SaveSettings()
              << "BreakfallActionId=" << m_BreakfallActionId << "\n"
              << "BreakfallDelayMs=" << m_BreakfallDelayMs << "\n"
              << "BreakfallHoldIntervalMs=" << m_BreakfallHoldIntervalMs << "\n"
+             << "StateGateEnabled=" << (m_StateGateEnabled ? 1 : 0) << "\n"
+             << "StateGateRequireValid=" << (m_StateGateRequireValid ? 1 : 0) << "\n"
+             << "ForceCooldownMs=" << m_ForceCooldownMs << "\n"
              << "RequireLedge=" << (m_RequireLedge ? 1 : 0) << "\n"
              << "ProbeDirections=" << m_ProbeDirections << "\n"
              << "MaxHorizontalReach=" << m_MaxHorizontalReach << "\n"
