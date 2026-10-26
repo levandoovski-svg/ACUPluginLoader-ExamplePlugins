@@ -206,7 +206,9 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     <ClCompile Include="src\AllowSmokeAssassinatePlugin.cpp" />
     <ClCompile Include="src\BreakfallForcePlugin.cpp" />
     <ClCompile Include="src\ExactPositionTeleportPlugin.cpp" />
+    <ClCompile Include="src\ForcedSidehopPlugin.cpp" />
     <ClCompile Include="src\FreeJumpPlugin.cpp" />
+    <ClCompile Include="..\GenericHooksInParkourFiltering.cpp" />
     <ClCompile Include="src\ParryAssassinPlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">
@@ -220,6 +222,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     <ClInclude Include="src\AllowSmokeAssassinatePlugin.h" />
     <ClInclude Include="src\BreakfallForcePlugin.h" />
     <ClInclude Include="src\ExactPositionTeleportPlugin.h" />
+    <ClInclude Include="src\ForcedSidehopPlugin.h" />
     <ClInclude Include="src\FreeJumpPlugin.h" />
     <ClInclude Include="src\ParryAssassinPlugin.h" />
     <ClInclude Include="src\pch.h" />

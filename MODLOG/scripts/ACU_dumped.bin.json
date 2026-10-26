@@ -1,0 +1,84 @@
+{
+  "pid": 22152,
+  "actual_base": 5368709120,
+  "default_base": 5368709120,
+  "aslr_delta": 0,
+  "size_of_image": 125980672,
+  "entry_rva": 122964765,
+  "section_alignment": 4096,
+  "file_alignment": 512,
+  "import_hint": "raw-binary entry_point=0x140000000",
+  "sections": [
+    {
+      "section": ".text",
+      "rva": 4096,
+      "span": 48658351,
+      "bytes_read": 48658351,
+      "percent": 100.0
+    },
+    {
+      "section": ".rdata",
+      "rva": 48664576,
+      "span": 11886426,
+      "bytes_read": 11886426,
+      "percent": 100.0
+    },
+    {
+      "section": ".data",
+      "rva": 60551168,
+      "span": 25950824,
+      "bytes_read": 25950824,
+      "percent": 100.0
+    },
+    {
+      "section": ".pdata",
+      "rva": 86503424,
+      "span": 3163956,
+      "bytes_read": 3163956,
+      "percent": 100.0
+    },
+    {
+      "section": ".shared",
+      "rva": 89669632,
+      "span": 262172,
+      "bytes_read": 262172,
+      "percent": 100.0
+    },
+    {
+      "section": ".tls",
+      "rva": 89935872,
+      "span": 512,
+      "bytes_read": 512,
+      "percent": 100.0
+    },
+    {
+      "section": "_RDATA",
+      "rva": 89939968,
+      "span": 5968,
+      "bytes_read": 5968,
+      "percent": 100.0
+    },
+    {
+      "section": ".UBX0",
+      "rva": 89948160,
+      "span": 5125139,
+      "bytes_read": 5125139,
+      "percent": 100.0
+    },
+    {
+      "section": ".UBX1",
+      "rva": 95076352,
+      "span": 30336000,
+      "bytes_read": 30336000,
+      "percent": 100.0
+    },
+    {
+      "section": ".rsrc",
+      "rva": 125415424,
+      "span": 563712,
+      "bytes_read": 563712,
+      "percent": 100.0
+    }
+  ],
+  "note": "file offset == RVA; load-aligned runtime image; IAT may hold resolved runtime DLL addresses"
+}
