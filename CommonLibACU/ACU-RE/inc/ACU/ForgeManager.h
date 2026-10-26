@@ -237,7 +237,7 @@ public:
     }
     void DecrementForgeRefcount(ForgeIndex_t forgeIdx)
     {
-        auto* ForgeManager__DecrementForgeEntryRefcount_mb = (void (*__fastcall)(ForgeManager* a1, ForgeIndex_t p_forgeIdx))0x142721FE0;
+        auto ForgeManager__DecrementForgeEntryRefcount_mb = (void (*)(ForgeManager* a1, ForgeIndex_t p_forgeIdx))0x142721FE0;
         ForgeManager__DecrementForgeEntryRefcount_mb(this, forgeIdx);
     }
 }; //Size: 0x0118

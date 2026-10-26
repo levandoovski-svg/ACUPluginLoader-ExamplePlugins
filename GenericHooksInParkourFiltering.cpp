@@ -5,7 +5,7 @@
 #include "ACU/basic_types.h"
 #include "ACU/Memory/ACUAllocs.h"
 #include "ACU_DefineNativeFunction.h"
-#include "EnumParkourAction.h"
+#include "ParkourDebugging/EnumParkourAction.h"
 #include "AvailableParkourAction.h"
 #include "ParkourTester.h"
 

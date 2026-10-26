@@ -180,7 +180,7 @@ AvailableParkourAction* ForcedSidehopPlugin::ChooseBeforeFiltering(SmallArray<Av
 void ForcedSidehopPlugin::ActivateHook()
 {
     if (m_HookActive) return;
-    auto* gph = GenericHooksInParkourFiltering::GetSingleton();
+    auto gph = GenericHooksInParkourFiltering::GetSingleton();
     gph->Subscribe(m_Callbacks);
     m_HookActivator = gph->RequestGPHSortAndSelect();
     m_HookActive = true;
