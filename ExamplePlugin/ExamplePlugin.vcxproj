@@ -203,13 +203,8 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\AllowSmokeAssassinatePlugin.cpp" />
-    <ClCompile Include="src\BreakfallForcePlugin.cpp" />
+    <!-- Keep this DLL limited to the ExactPositionTeleport plugin. -->
     <ClCompile Include="src\ExactPositionTeleportPlugin.cpp" />
-    <ClCompile Include="src\ForcedSidehopPlugin.cpp" />
-    <ClCompile Include="src\FreeJumpPlugin.cpp" />
-    <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
-    <ClCompile Include="src\ParryAssassinPlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -219,12 +214,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\AllowSmokeAssassinatePlugin.h" />
-    <ClInclude Include="src\BreakfallForcePlugin.h" />
     <ClInclude Include="src\ExactPositionTeleportPlugin.h" />
-    <ClInclude Include="src\ForcedSidehopPlugin.h" />
-    <ClInclude Include="src\FreeJumpPlugin.h" />
-    <ClInclude Include="src\ParryAssassinPlugin.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>
