@@ -237,6 +237,12 @@ namespace
         }
     }
 
+    bool IsShiftHeld()
+    {
+        return (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0
+            || (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+    }
+
     // Treat Shift as released for the game while the player is mid-jump
     // (InSafeJumpOrLoweringToHang). Sprint/locomotion inputs fighting the
     // forced-freefall transition is what caused the "walking in air" jitter.
@@ -747,10 +753,21 @@ void ExactPositionTeleportPlugin::OnUpdate()
     }
 
     const bool keyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
+    const bool shiftHeld = IsShiftHeld();
 
+    // Shift + CatchLedge key is not a valid CatchLedge input. Track the
+    // physical key state below so releasing Shift while the key remains held
+    // cannot turn the rejected press into a new valid input.
     if (!m_WaitingForKey && keyDown && !m_PrevKeyDown)
     {
-        BeginForceFreefall();
+        if (shiftHeld)
+        {
+            SetStatus("CatchLedge input ignored: Shift is held");
+        }
+        else
+        {
+            BeginForceFreefall();
+        }
     }
 
     if (m_ForceActive)
@@ -763,8 +780,9 @@ void ExactPositionTeleportPlugin::OnUpdate()
         {
             ServiceHeldBreakfall();
             // Continuous re-application of teleport/freefall mechanism while
-            // the key is held (after the force cooldown has elapsed).
-            if (m_ReapplyTeleportWhileHeld && (GetTickCount64() >= m_NextForceAllowedAt))
+            // the key is held (after the force cooldown has elapsed). Shift
+            // remains a hard blocker for every re-application attempt.
+            if (m_ReapplyTeleportWhileHeld && !shiftHeld && (GetTickCount64() >= m_NextForceAllowedAt))
             {
                 BeginForceFreefall();
             }
@@ -1237,10 +1255,7 @@ void ExactPositionTeleportPlugin::ServiceShiftNegation()
 
     // Cheap physical check first; the state-tree walk only runs while Shift
     // is actually held down.
-    const bool shiftDown =
-        (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0
-        || (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
-    if (!shiftDown)
+    if (!IsShiftHeld())
     {
         m_ShiftNegationActive = false;
         return;
@@ -1359,12 +1374,6 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         ImGui::TreePop();
     }
 
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip(
-            "Blocks the force-freefall while the player is in OnGroundLowProfile,\n"
-            "OnGroundHighProfile, OnPeakOrLedge or Walling.");
-    }
     ImGui::Checkbox("Require a known-valid state", &m_StateGateRequireValid);
     if (ImGui::IsItemHovered())
     {
@@ -1408,16 +1417,6 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
             "is what drops the player into freefall. With it off the teleport is a\n"
             "same-value write: expect NO state change at all.\n"
             "Toggle to A/B test whether the reset itself causes the crash.");
-    }
-
-    ImGui::Checkbox("Negate Shift while mid-jump (InSafeJumpOrLoweringToHang)", &m_NegateShiftInSafeJump);
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip(
-            "While the player is mid-jump, the game is made to see Shift as\n"
-            "released, so sprint cannot fight the forced freefall transition\n"
-            "(fixes the jittering / walking-in-air).\n"
-            "Only active while Shift is physically held.");
     }
 
     bool breakfallAfterTeleport = m_BreakfallAfterTeleport;
