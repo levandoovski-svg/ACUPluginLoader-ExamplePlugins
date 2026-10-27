@@ -207,6 +207,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     <ClCompile Include="src\ForcedSidehopPlugin.cpp" />
     <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\ParkourLogStubs.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>

@@ -10,13 +10,19 @@
 #include <cmath>
 #include <cctype>
 
-// NOTE: AvailableParkourAction::GetEnumParkourAction() is already defined in
-// FreeJumpPlugin.cpp (the only other compiled GPH consumer) - do NOT redefine
-// it here or the build will break with a duplicate-symbol linker error.
+// NOTE: AvailableParkourAction::GetEnumParkourAction() is defined exactly
+// once, in GenericHooksInParkourFiltering.cpp (compiled in this project). Do
+// NOT redefine it here or the build will break with a duplicate-symbol error.
+// Also do NOT call it directly on arbitrary candidates: some actions carry a
+// fancy vtable whose idx 0x45 is NULL (e.g. the transient base table
+// 0x143A41930, see FailedWallRunPlugin.cpp) and dispatching it jumps to
+// address 0 and crashes. Use GetTypeIntSafe() below.
 
-// Game function used to prune candidates (same address FreeJumpPlugin uses).
+// Game function used to prune candidates. 1.5.0 address (ACUFixes-0.9.3 set,
+// confirmed present in ACUFixes.dll and ACU_ParkourPatches.dll on this
+// install); the previously used 0x142726000 is the 1.5.1 value.
 using SmallArray_RemoveFunc = void(__fastcall*)(void* smallArray, int p_idx, unsigned int p_elemSize);
-static SmallArray_RemoveFunc SmallArray_POD__RemoveGeneric = (SmallArray_RemoveFunc)0x142726000;
+static SmallArray_RemoveFunc SmallArray_POD__RemoveGeneric = (SmallArray_RemoveFunc)0x142725F00;
 
 // ============================================================================
 //  Matching
@@ -29,6 +35,19 @@ bool ForcedSidehopPlugin::IsMatchType(int typeInt) const
     for (int t : m_Params.extraActionTypes)
         if (t == typeInt) return true;
     return false;
+}
+
+// Null-safe action-type read. Some candidate actions carry fancy vtables whose
+// idx 0x45 (GetEnumParkourAction) is NULL; dispatching such a slot jumps to
+// address 0 and crashes the game (dump-verified: transient base table
+// 0x143A41930, see FailedWallRunPlugin.cpp). Unidentifiable candidates are
+// skipped by returning -1, which never matches any configured type.
+static int GetTypeIntSafe(const AvailableParkourAction* action)
+{
+    if (!action || !action->fancyVTable) return -1;
+    const FancyVFunction& slot = action->fancyVTable->fancyVirtuals[ParkourActionKnownFancyVFuncs::GetEnumParkourAction::idx];
+    if (!slot.fn) return -1;
+    return (int)GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)((AvailableParkourAction*)action);
 }
 
 // ============================================================================
@@ -118,7 +137,7 @@ AvailableParkourAction* ForcedSidehopPlugin::ChooseBeforeFiltering(SmallArray<Av
     {
         AvailableParkourAction* act = actions[i];
         if (!act) continue;
-        const int t = (int)act->GetEnumParkourAction(); // read BEFORE mutation
+        const int t = GetTypeIntSafe(act); // read BEFORE mutation; never dispatch a NULL fancy slot
         if (IsMatchType(t))
         {
             chosen = act;
@@ -180,6 +199,26 @@ AvailableParkourAction* ForcedSidehopPlugin::ChooseBeforeFiltering(SmallArray<Av
 void ForcedSidehopPlugin::ActivateHook()
 {
     if (m_HookActive) return;
+
+    // Refuse to install if some other plugin has already patched the
+    // sort&select function start (0x140133B00). Two full-start replacements on
+    // the same address cannot coexist: the later one silently overrides the
+    // earlier one, and restoring our "original" bytes on deactivation would
+    // destroy the other plugin's hook. Both working reference plugins
+    // (ACUFixes.dll, ACU_ParkourPatches.dll) patch this exact address.
+    constexpr uintptr_t k_SortAndSelectSite = 0x140133B00;
+    const uint16_t siteFirstBytes = *reinterpret_cast<const uint16_t*>(k_SortAndSelectSite);
+    const bool siteAlreadyHooked =
+        (siteFirstBytes & 0x00FF) == 0x00E9      // jmp rel32
+        || siteFirstBytes == 0x25FF              // jmp [rip+disp32]
+        || siteFirstBytes == 0xB848;             // movabs rax, imm64 (patch prologue)
+    if (siteAlreadyHooked)
+    {
+        m_HookRefused = true;
+        return;
+    }
+    m_HookRefused = false;
+
     auto gph = GenericHooksInParkourFiltering::GetSingleton();
     gph->Subscribe(m_Callbacks);
     m_HookActivator = gph->RequestGPHSortAndSelect();
@@ -447,6 +486,13 @@ void ForcedSidehopPlugin::OnImGuiRender()
         ImGui::SameLine();
         ImGui::TextColored(m_HookActive ? activeColor : inactiveColor,
                            m_HookActive ? "INSTALLED" : "not installed");
+        if (m_HookRefused.load())
+        {
+            ImGui::TextColored(inactiveColor,
+                "Sort&select (0x140133B00) is already patched by another plugin "
+                "(e.g. ACU_ParkourPatches.dll). Sidehop hook NOT installed. "
+                "Remove/rename that plugin to test sidehop.");
+        }
 
         const bool triggered = m_Tel.lastCycleMatched.load();
         ImGui::Text("Last parkour cycle:");

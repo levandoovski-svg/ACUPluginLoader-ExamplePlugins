@@ -6,112 +6,213 @@
 #include "ParkourDebugging/EnumParkourAction.h"
 #include "ParkourDebugging/FancyVFunctionDescription.h"
 #include "ParkourDebugging/ParkourTester.h"
+#include "ParkourDebugging/ParkourLog.h"
 #include "ACU_DefineNativeFunction.h"
 #include <mutex>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 
+// AvailableParkourAction::GetEnumParkourAction() - single definition for this
+// DLL. ForcedSidehopPlugin.cpp calls it but must not redefine it.
 EnumParkourAction AvailableParkourAction::GetEnumParkourAction()
 {
     return GET_AND_CAST_FANCY_FUNC(*this, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)(this);
 }
 
-DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter1, 0x1401D4360, bool, __fastcall, (AvailableParkourAction*, __m128*, uint64, Entity*));
-DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter2, 0x1401D2580, bool, __fastcall, (AvailableParkourAction*, Entity*, __int64));
-DEFINE_GAME_FUNCTION(ConstructParkourAction_A, 0x1401CBF00, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, AvailableParkourAction*));
-DEFINE_GAME_FUNCTION(ConstructParkourAction_B, 0x1401D1530, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, __int64, Entity*, AvailableParkourAction*));
-DEFINE_GAME_FUNCTION(AvailableParkourAction__InitializePlayerRef, 0x140159940, void, __fastcall, (PlayerRefInParkourAction*, Entity*));
-DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142726000, void, __fastcall, (void*, int, unsigned int));
+// All game addresses below are the ACUFixes-0.9.3 values, i.e. the set that
+// matches the user's ACU 1.5.0 Steam build.
+//
+// Evidence (2026-10-28): a constant scan of the two plugins that demonstrably
+// work on this install (ACUFixes.dll and ACU_ParkourPatches.dll in
+// ACUFixes\plugins) finds exactly this address set in both, and finds NONE of
+// the ACUFixes-1.5.1 addresses (0x1401D4360 / 0x1401D2580 / 0x1401CBF00 /
+// 0x1401D1530 / 0x140159940 / 0x142726000 / 0x14013493E / 0x140134940).
+// FailedWallRunPlugin.cpp additionally dump-verifies 0x1401D1CF0 and
+// 0x1401CC990 against the runtime dump (MODLOG/scripts/ACU_dumped_pe.exe).
+//
+// The previous version of this file used the 1.5.1 addresses and installed a
+// 7-stolen-byte mid-function hook at 0x14013493E, which lands on unrelated
+// code in the 1.5.0 binary: any parkour sort&select execution after enabling
+// the plugin instantly crashed the game (see PROGRESS.md).
+DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter1, 0x1401D4DE0, bool, __fastcall, (AvailableParkourAction*, __m128*, uint64, Entity*));
+DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter2, 0x1401D3000, bool, __fastcall, (AvailableParkourAction*, Entity*, __int64));
+DEFINE_GAME_FUNCTION(ConstructParkourAction_A, 0x1401CC990, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, AvailableParkourAction*));
+DEFINE_GAME_FUNCTION(ConstructParkourAction_B, 0x1401D1FC0, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, __int64, Entity*, AvailableParkourAction*));
+DEFINE_GAME_FUNCTION(AvailableParkourAction__InitializePlayerRef, 0x14015A570, void, __fastcall, (PlayerRefInParkourAction*, Entity*));
+DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
 
 class Entity;
-struct CollisionProbeForParkour_mb
-{
-    Vector4f locationAnchorDest;
-    Vector4f direction;
-    char pad_0020[20];
-    float flt_34;
-    uint32 collisionLayer_mb;
-    char pad_003C[4];
-    Vector4f pos40;
-    Vector4f pos50;
-    PlayerRefInParkourAction shared_buildingEntity;
-    char pad_0078[8];
-};
 
-// ── Parkour action creation replacements ──────────────────────────────────────
+// ── Sort&select replacement (verbatim pipeline from ACUFixes-0.9.3) ──────────
+// Replaces SortAndSelectBestMatchingAction at its function start. Logging goes
+// through ParkourLog; ParkourLogStubs.cpp provides pass-through stubs so the
+// runtime behavior equals the vanilla pipeline apart from the callbacks.
 
-static bool CreateParkourAction_A_Replacement(
-    EnumParkourAction actionType, __m128* loc, __m128* a3, __m128* dir,
-    float a5, int a6, char a7, CollisionProbeForParkour_mb* probe,
-    Entity* player, AvailableParkourAction* prevAction,
-    AvailableParkourAction** outAction, float a12, float eps)
+constexpr int RESULT_OF_PARKOUR_SORT_AND_SELECT__NO_ACTIONS_ACCEPTED = -1;
+
+static std::optional<int> FindIndexForAction(AvailableParkourAction& action, SmallArray<AvailableParkourAction*>& p_parkourSensorsResults)
 {
-    AvailableParkourAction* act = ConstructParkourAction_A(actionType, loc, a3, dir, a6, a7, (uint64)probe, prevAction);
-    *outAction = act;
-    if (!act) return false;
-    if (player) AvailableParkourAction__InitializePlayerRef(&act->playerRef, player);
-    GET_AND_CAST_FANCY_FUNC(*act, ParkourActionKnownFancyVFuncs::Set2FloatsAfterCreation)(act, a12, eps);
-    bool fits = GET_AND_CAST_FANCY_FUNC(*act, ParkourActionKnownFancyVFuncs::InitialTestIfActionFits)(act, loc, a3, dir, a5, a6, (uint64)probe, player, prevAction);
-    if (!fits) {
-        act->Unk008_Destroy(0);
-        ACU::Memory::ACUDeallocateBytes((byte*)act);
-        *outAction = nullptr;
-        return false;
+    auto foundIt = std::find(p_parkourSensorsResults.begin(), p_parkourSensorsResults.end(), &action);
+    if (foundIt != p_parkourSensorsResults.end())
+    {
+        return foundIt - p_parkourSensorsResults.begin();
     }
-    return true;
+    return {};
 }
 
-static bool CreateParkourAction_B_Replacement(
-    EnumParkourAction actionType, __m128* loc, __m128* a3, __m128* dir,
-    float a5, int a6, char a7, uint64 a8, uint64 a9,
-    Entity* player, AvailableParkourAction* prevAction,
-    AvailableParkourAction** outAction, float a13, float eps)
+int SortAndSelectBestMatchingAction_FullReplacement_inner(
+    ParkourTester* parkourTester
+    , __m128* p_locationOfOrigin
+    , uint64 a3
+    , __m128* p_directionOfMovementInputWorldSpace
+    , float a5
+    , int a6
+    , char a7
+    , __int64 a8
+    , SmallArray<AvailableParkourAction*>& p_parkourSensorsResults
+    , std::shared_ptr<ParkourCycleLogged>& currentCycle
+)
 {
-    AvailableParkourAction* act = ConstructParkourAction_B(actionType, loc, a3, dir, a6, a7, a8, a9, player, prevAction);
-    *outAction = act;
-    if (!act) return false;
-    if (player) AvailableParkourAction__InitializePlayerRef(&act->playerRef, player);
-    GET_AND_CAST_FANCY_FUNC(*act, ParkourActionKnownFancyVFuncs::Set2FloatsAfterCreation)(act, a13, eps);
-    bool fits = GET_AND_CAST_FANCY_FUNC(*act, ParkourActionKnownFancyVFuncs::InitialTestIfActionFits)(act, loc, a3, dir, a5, a6, a9, player, prevAction);
-    if (!fits) {
-        act->Unk008_Destroy(0);
-        ACU::Memory::ACUDeallocateBytes((byte*)act);
-        *outAction = nullptr;
-        return false;
+    currentCycle->LogActionsBeforeFiltering(p_parkourSensorsResults);
+
+    auto& allParkourCallbacks = GenericHooksInParkourFiltering::GetSingleton()->m_Callbacks;
+    for (ParkourCallbacks* parkourCallbacks : allParkourCallbacks)
+    {
+        if (!parkourCallbacks->ChooseBeforeFiltering_fnp) continue;
+        AvailableParkourAction* selectedBeforeFiltering = parkourCallbacks->ChooseBeforeFiltering_fnp(parkourCallbacks->m_UserData, p_parkourSensorsResults);
+        if (selectedBeforeFiltering)
+        {
+            if (std::optional<int> idx = FindIndexForAction(*selectedBeforeFiltering, p_parkourSensorsResults))
+            {
+                return *idx;
+            }
+        }
     }
-    return true;
+    if (p_parkourSensorsResults.size > 0)
+    {
+        for (int i = 0; i < p_parkourSensorsResults.size; i++)
+        {
+            AvailableParkourAction* action = p_parkourSensorsResults[i];
+            float fitness = GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetFitness)(action);
+            bool isDiscarded_becauseFitnessWeightTooLow = fabsf(fitness) <= 0.0000099999997;
+            currentCycle->LogActionBeforeFiltering(*action, fitness, isDiscarded_becauseFitnessWeightTooLow);
+            if (isDiscarded_becauseFitnessWeightTooLow)
+            {
+                SmallArray_POD__RemoveGeneric(&p_parkourSensorsResults, i--, 8u);
+            }
+        }
+    }
+    {
+        // Idk what this call is, doesn't seem to do anything. (ACUFixes-0.9.3)
+        __m128 smthOut;
+        GET_AND_CAST_FANCY_FUNC(*parkourTester, ParkourTesterKnownFancyVFuncs::ParkourTester_FancyVFunc_0x16)(&smthOut, *parkourTester, p_locationOfOrigin, p_directionOfMovementInputWorldSpace);
+    }
+    {
+        struct ActionWeights
+        {
+            float fitness, defaultWeight, totalWeight;
+        };
+        auto GetActionWeights = [](ParkourTester& parkourTester, AvailableParkourAction& action) -> ActionWeights {
+            float fitness = GET_AND_CAST_FANCY_FUNC(action, ParkourActionKnownFancyVFuncs::GetFitness)(&action);
+            float defaultWeight = GET_AND_CAST_FANCY_FUNC(parkourTester, ParkourTesterKnownFancyVFuncs::GetDefaultWeightForAction)(parkourTester, action);
+            float totalWeight = fitness * defaultWeight;
+
+            return { fitness, defaultWeight, totalWeight };
+            };
+        auto SortByDescendingTotalFitness = [&](AvailableParkourAction* actionFirst, AvailableParkourAction* action2nd) {
+            ActionWeights weights1st = GetActionWeights(*parkourTester, *actionFirst);
+            ActionWeights weights2nd = GetActionWeights(*parkourTester, *action2nd);
+            weights1st.totalWeight = currentCycle->LogActionWeights(*actionFirst, weights1st.defaultWeight, weights1st.totalWeight);
+            weights2nd.totalWeight = currentCycle->LogActionWeights(*action2nd, weights2nd.defaultWeight, weights2nd.totalWeight);
+            return weights1st.totalWeight > weights2nd.totalWeight;
+            };
+        std::sort(p_parkourSensorsResults.begin(), p_parkourSensorsResults.end(), SortByDescendingTotalFitness);
+    }
+    std::optional<int> selectedBestMatch;
+    for (uint16 i = 0; i < p_parkourSensorsResults.size; i++)
+    {
+        AvailableParkourAction* action = p_parkourSensorsResults[i];
+        const bool isPassedFinalFilter1 = AvailableParkourAction__FinalFilter1(action, p_locationOfOrigin, a8, parkourTester->entity);
+        currentCycle->LogActionFinalFilter1(*p_parkourSensorsResults[i], isPassedFinalFilter1);
+        if (!isPassedFinalFilter1) continue;
+        const bool isPassedFinalFilter2 = AvailableParkourAction__FinalFilter2(action, parkourTester->entity, a8);
+        currentCycle->LogActionFinalFilter2(*p_parkourSensorsResults[i], isPassedFinalFilter2);
+        if (!isPassedFinalFilter2) continue;
+
+        // The action with the greatest "totalWeight" that passes these
+        // preceding two tests is selected.
+        selectedBestMatch = i;
+        break;
+    }
+
+    for (ParkourCallbacks* parkourCallbacks : allParkourCallbacks)
+    {
+        if (!parkourCallbacks->ChooseAfterSorting_fnp) continue;
+        AvailableParkourAction* selectedAfterSorting =
+            parkourCallbacks->ChooseAfterSorting_fnp(parkourCallbacks->m_UserData, p_parkourSensorsResults, selectedBestMatch ? p_parkourSensorsResults[*selectedBestMatch] : nullptr);
+        if (selectedAfterSorting)
+        {
+            if (std::optional<int> idx = FindIndexForAction(*selectedAfterSorting, p_parkourSensorsResults))
+            {
+                selectedBestMatch = idx;
+                break;
+            }
+        }
+    }
+
+    int result = selectedBestMatch ? *selectedBestMatch : RESULT_OF_PARKOUR_SORT_AND_SELECT__NO_ACTIONS_ACCEPTED;
+
+    return result;
 }
 
-// ── GPH hook placements ──────────────────────────────────────────────────────
+int SortAndSelectBestMatchingAction_FullReplacement(
+    ParkourTester* parkourTester,
+    __m128* p_locationOfOrigin,
+    uint64 a3,
+    __m128* p_directionOfMovementInputWorldSpace,
+    float a5,
+    int a6,
+    char a7,
+    __int64 a8,
+    SmallArray<AvailableParkourAction*>& p_parkourSensorsResults)
+{
+    std::shared_ptr<ParkourCycleLogged> currentCycle = GetCurrentLoggedParkourCycle();
+    int selectedIdx = SortAndSelectBestMatchingAction_FullReplacement_inner(
+        parkourTester,
+        p_locationOfOrigin,
+        a3, p_directionOfMovementInputWorldSpace,
+        a5, a6, a7, a8,
+        p_parkourSensorsResults,
+        currentCycle
+    );
+    if (selectedIdx != RESULT_OF_PARKOUR_SORT_AND_SELECT__NO_ACTIONS_ACCEPTED)
+    {
+        AvailableParkourAction* selectedAction = p_parkourSensorsResults[selectedIdx];
+        currentCycle->LogActionWhenReturningBestMatch(*selectedAction);
+    }
+    return selectedIdx;
+}
 
 GPH_Creation::GPH_Creation()
 {
-    // DISABLED for the 1.5.0 Steam build (runtime dump 62734b81…, base 0x140000000).
-    // In that binary 0x1401D1260 and 0x1401D13C0 are NOT function starts — they sit
-    // mid-function inside the parkour action factory (one function spanning
-    // 0x1401CC990..0x1401D1ADA, Denuvo-split; the per-type cases live between them).
-    // ReplaceFunctionAtItsStart there would corrupt the factory and crash.
-    // The 1.5.0 equivalent of 0.9.3's creation wrapper is 0x1401D1CF0
-    // (CreateParkourActionForParkourPointIfFits, already used by FailedWallRunPlugin).
-    // Re-enable only after re-verifying the addresses against the running build.
-    // PresetScript_ReplaceFunctionAtItsStart(0x1401D1260, CreateParkourAction_A_Replacement);
-    // PresetScript_ReplaceFunctionAtItsStart(0x1401D13C0, CreateParkourAction_B_Replacement);
-}
-
-static void SortAndSelectHookCallback(AllRegisters* params)
-{
-    uintptr_t rsp = params->GetRSP();
-    auto& actions = *(SmallArray<AvailableParkourAction*>*)(*(uint64*)(rsp + 0x48));
-    auto& gphCallbacks = GenericHooksInParkourFiltering::GetSingleton()->m_Callbacks;
-    for (auto* cb : gphCallbacks)
-        if (cb->ChooseBeforeFiltering_fnp)
-            cb->ChooseBeforeFiltering_fnp(cb->m_UserData, actions);
+    // DISABLED for this standalone plugin. On 1.5.0 the creation stage sits in
+    // a Denuvo-split factory region and ForcedSidehop does not need it (it
+    // rewrites already-created candidates in sort&select). FailedWallRunPlugin
+    // documents the verified creation wrapper (0x1401D1CF0) separately.
+    // Re-enable only after re-verifying against the running build:
+    // PresetScript_ReplaceFunctionAtItsStart(0x1401D1CF0, ...);
+    // PresetScript_ReplaceFunctionAtItsStart(0x1401D1E50, ...);
 }
 
 GPH_SortAndSelect::GPH_SortAndSelect()
 {
-    PresetScript_CCodeInTheMiddle(0x14013493E, 7,
-        SortAndSelectHookCallback,
-        AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+    // Function-start replacement of SortAndSelectBestMatchingAction.
+    // 0x140133B00 is the ACUFixes-0.9.3 / 1.5.0 value, confirmed by the
+    // constant scan of ACUFixes.dll and ACU_ParkourPatches.dll (both working
+    // on this install hook this exact address). A function-start replacement
+    // needs no stolen-byte relocation, unlike the previous mid-function hook.
+    PresetScript_ReplaceFunctionAtItsStart(0x140133B00, SortAndSelectBestMatchingAction_FullReplacement);
 }
 
 // ── SharedHookActivator ──────────────────────────────────────────────────────

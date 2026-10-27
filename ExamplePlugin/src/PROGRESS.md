@@ -123,3 +123,18 @@ Checks primaryCallbackReceivers for any of 12 combat Enter addresses: Combat (0x
 | 3 | Coding | Added 12-state combat check, created AnimationOverridePlugin stub |
 | 4 | Coding | Stripped unsafe hooks, discovered universal dispatcher, updated this file |
 | 5 | Coding | ExactPositionTeleport: toggleable HSTE reset (v0.3.2.0); A/B test — reset OFF = keypress no-op (reset is the mechanism); reset ON + breakfall OFF = VALIDATED STABLE 30+ min constant use, 0 crashes (v0.3.3.0: breakfall-request layer off by default, marked as crash source); added NegateShiftInSafeJump (clears game Shift/Sprint pressed-state while InSafeJumpOrLoweringToHang) to fix jitter/walking-in-air |
+
+---
+
+## Session 6 — ForcedSidehopPlugin wiring + crash root-cause (2026-10-28)
+
+| Item | Detail |
+|------|--------|
+| Wired | ForcedSidehopPlugin is now the only gameplay plugin TU in ExamplePlugin (main.cpp + vcxproj). Dropped ExactPositionTeleport from the build (source kept). |
+| First in-game test | Instant crash the moment any wall-climb parkour cycle ran with the plugin enabled (2/2 reproductions; plugin's own hotkey was NOT held either time — INI proves Hotkey=MouseX2). |
+| Root cause | `src/GenericHooksInParkourFiltering.cpp` was the **ACUFixes-1.5.1** port, but the game is **1.5.0**. Its active patch was a 7-stolen-byte mid-function hook at 0x14013493E — a 1.5.1-derived address that lands on unrelated code in 1.5.0. Any parkour sort&select execution after the hook installed corrupted that code and crashed. `Enabled=1` persisted in the INI → hook active from startup. |
+| Address evidence | Constant scan (8-byte LE) of the two reference DLLs that work on this install: ACUFixes.dll and ACU_ParkourPatches.dll both contain the 0.9.3 set — 0x140133B00 (sort&select start), 0x1401D1CF0/0x1401D1E50 (creation wrappers), 0x1401D4DE0, 0x1401D3000, 0x1401CC990, 0x14015A570, 0x142725F00 — and NONE of the 1.5.1 set (0x140134940, 0x14013493E, 0x1401D1260, 0x1401D13C0, 0x1401D4360, 0x1401D2580, 0x1401CBF00, 0x140159940, 0x142726000). FailedWallRunPlugin.cpp header independently dump-verifies 0x1401D1CF0/0x1401CC990. |
+| Fix | 1) GPH sort&select is now the 0.9.3-validated **full function-start replacement** at 0x140133B00 (ReplaceFunctionAtItsStart, no stolen bytes), all DEFINE_GAME_FUNCTION addresses corrected to the 1.5.0 set, ParkourLog linked via `src/ParkourLogStubs.cpp` (pass-through stubs). GPH_Creation stays disabled. 2) ForcedSidehop: null-safe action-type read `GetTypeIntSafe()` (fancy idx 0x45 can be NULL — table 0x143A41930 — direct GetEnumParkourAction() calls crash; doc in FailedWallRunPlugin.cpp), RemoveGeneric address fixed to 0x142725F00. 3) Activation refuses (and says so in the UI) if 0x140133B00 is already patched by another plugin. Plugin version → 0.4.0.0. |
+| Residual conflict | While the sidehop hook is installed it replaces ACU_ParkourPatches' own sort&select replacement → ParkourPatches helpers (dive/climbpass/toClimb/toFeet) pause; after disabling sidehop, ParkourPatches features may need a re-toggle to re-install their hook. Simplest test setup: remove/rename ACU_ParkourPatches.dll for sidehop test sessions. |
+| Status | 🔬 Fix written, not yet compiled (GitHub Actions) and NOT runtime-verified |
+| Retest plan | 1) With ACU_ParkourPatches.dll removed: enable sidehop, walk to wall, Shift+Space climb → must not crash. 2) On wall, hold Mouse X2 + Space → sideways hop; Mouse X2 + LCtrl → opposite hop. 3) Disable plugin → vanilla parkour unchanged. 4) With ACU_ParkourPatches.dll present: plugin UI must show the "site already patched" refusal instead of crashing. |

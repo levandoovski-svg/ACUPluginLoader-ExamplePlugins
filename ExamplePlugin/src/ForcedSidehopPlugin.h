@@ -136,6 +136,7 @@ private:
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_HookActivator;
     bool m_HookActive = false;
+    std::atomic<bool> m_HookRefused{ false }; // activation refused: sort&select site already patched by another plugin
 
     // Key rebind state
     enum class KeySlot { None, Hotkey, DirA, DirB, Modifier };

@@ -50,8 +50,8 @@
 //           -> fancy 0x4A per-type geometry test = 0x1401B0340
 //                -> 0x1401B5700 = 5 per-context quick-checks
 //                   (parkour mode / wall slope / mesh / ...) = "wall context" gate
-//           -> TEST AL,AL / JZ reject   (hooked at 0x1401B499E by
-//                                        GPH_Type52FitTestOverride)
+//           -> TEST AL,AL / JZ reject   (verdict overridden for type 52 by
+//              swapping the fancy-table slot 0x143A70920)
 // ============================================================================
 
 // Extended action base with padding matching the game's full action size
@@ -184,26 +184,59 @@ static void WhenType52RangesSet_Widen(AllRegisters* params)
     g_WidenCount++;
 }
 
-// ── Hook 3 callback: force the per-type fit-test verdict for type 52 ──────────
-// Site 0x1401B499E = `TEST AL,AL / JZ <reject>` right after the per-type test
-// (fancy 0x4A) returned. RBX still holds the action (callee-saved, set at
-// 0x1401B4940). Forcing AL=1 makes the re-executed stolen bytes take the accept
-// path (CalculateFitness + fancy 0x63), and the creation wrapper keeps the
-// action. Non-type-52 actions are untouched.
-static void WhenType52FitTestDecided_Override(AllRegisters* params)
+// ── Hook 3: fit-test override via fancy-table slot swap ─────────────────────
+// The type-52 runtime fancy table (0x143A6FFD0) holds its per-type fit test at
+// fancyVirtuals[0x4A].fn == 0x143A70920 (vanilla value 0x1401B0340, the
+// geometry/quick-check gate). Dump-verified facts:
+//   * 0x143A70920 is the ONLY qword in .data/.rdata holding 0x1401B0340, and
+//     the table is installed only by the type-52 construction paths
+//     (0x1401BC730 / 0x1401BC850) -> swapping this slot affects
+//     wallrunUpFromGroundFailed_mb exclusively;
+//   * the slot is static data: creation copies the table POINTER into the
+//     object, it never rewrites the table's contents.
+// While installed, the slot points at a forwarding stub that returns true
+// (skip the wall-context gate) when g_SkipFitTest is set, else forwards to the
+// vanilla test. This is the same "swap a game vtable entry per config" pattern
+// the reverse-engineered ACU_ParkourPatches.dll uses.
+// NOTE: a mid-function hook at the TEST/JZ after the per-type call was rejected
+// deliberately: AutoAssemblerKinda copies stolen bytes verbatim (relative
+// branches would break) and code hooks need at least 5 stolen bytes.
+static constexpr uintptr_t k_Type52FitTestSlot_Address = 0x143A70920;
+static void* const k_Type52FitTestOriginal = (void*)0x1401B0340;
+static void* s_OriginalType52FitTestFn = nullptr;
+
+static bool __fastcall Type52FitTestStub(
+    AvailableParkourAction* action, void* a2, void* a3, void* a4,
+    uint32 a5, uint64 a6, uint64 a7, uint64 a8)
 {
-    if (!g_SkipFitTest) return;
-    __try
+    if (g_SkipFitTest)
     {
-        auto* action = (AvailableParkourAction*)params->rbx_;
-        if (!action || !action->fancyVTable) return;
-        if ((uint64)action->fancyVTable != k_Type52FancyVTable_Runtime
-            && (uint64)action->fancyVTable != k_Type52FancyVTable_TransientBase)
-            return;
-        params->GetRAX() = (params->GetRAX() & ~0xFFull) | 1ull;
         g_FitOverrideCount++;
+        return true;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    using Fn = bool(__fastcall*)(AvailableParkourAction*, void*, void*, void*, uint32, uint64, uint64, uint64);
+    return reinterpret_cast<Fn>(s_OriginalType52FitTestFn)(action, a2, a3, a4, a5, a6, a7, a8);
+}
+
+static bool SwapType52FitTestFn(bool install)
+{
+    void** slot = reinterpret_cast<void**>(k_Type52FitTestSlot_Address);
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect))
+        return false;
+    if (install)
+    {
+        if (!s_OriginalType52FitTestFn || s_OriginalType52FitTestFn == (void*)&Type52FitTestStub)
+            s_OriginalType52FitTestFn = k_Type52FitTestOriginal; // dump-verified vanilla value
+        *slot = (void*)&Type52FitTestStub;
+    }
+    else
+    {
+        if (s_OriginalType52FitTestFn)
+            *slot = s_OriginalType52FitTestFn;
+    }
+    VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+    return true;
 }
 
 // ── Hook 4 callbacks: cycle-start tester vtable swap (optional) ───────────────
@@ -339,13 +372,6 @@ GPH_Type52RangeWidener::GPH_Type52RangeWidener()
         AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
 }
 
-GPH_Type52FitTestOverride::GPH_Type52FitTestOverride()
-{
-    PresetScript_CCodeInTheMiddle(0x1401B499E, 4,
-        WhenType52FitTestDecided_Override,
-        AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
-}
-
 GPH_CycleStartVTableSwap::GPH_CycleStartVTableSwap()
 {
     PresetScript_CCodeInTheMiddle(0x141A4D7CB, 7,
@@ -458,7 +484,7 @@ FailedWallRunPlugin::~FailedWallRunPlugin()
     }
     if (m_CreatorHookActive) { m_FailedWallrunCreator.Deactivate(); m_CreatorHookActive = false; }
     if (m_WidenerHookActive) { m_RangeWidener.Deactivate(); m_WidenerHookActive = false; }
-    if (m_FitTestHookActive) { m_FitTestOverride.Deactivate(); m_FitTestHookActive = false; }
+    if (m_FitTestHookActive) { SwapType52FitTestFn(false); m_FitTestHookActive = false; }
     if (m_VTableSwapHookActive) { m_VTableSwapHook.Deactivate(); m_VTableSwapHookActive = false; }
 }
 
@@ -560,12 +586,12 @@ void FailedWallRunPlugin::OnUpdate()
 
     if (shouldBeActive && m_SkipFitTestEnabled && !m_FitTestHookActive)
     {
-        m_FitTestOverride.Activate();
-        m_FitTestHookActive = true;
+        if (SwapType52FitTestFn(true))
+            m_FitTestHookActive = true;
     }
     else if ((!shouldBeActive || !m_SkipFitTestEnabled) && m_FitTestHookActive)
     {
-        m_FitTestOverride.Deactivate();
+        SwapType52FitTestFn(false);
         m_FitTestHookActive = false;
     }
 
