@@ -6,19 +6,208 @@
 #include "ParkourDebugging/FancyVFunctionDescription.h"
 #include "ACU/PlayerProgressionManager.h"
 #include "ACU/AssassinAbilitySet.h"
-#include <fstream>
+#include "ACU_DefineNativeFunction.h"
 #include <Windows.h>
 #include <shlobj.h>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <sstream>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 // NOTE: AvailableParkourAction::GetEnumParkourAction() is defined exactly once,
 // in GenericHooksInParkourFiltering.cpp (compiled in this project). Do NOT
 // redefine it here — duplicate definitions break the link.
 
-// 1.5.0 address
-using SmallArray_RemoveFunc = void(__fastcall*)(void* smallArray, int p_idx, unsigned int p_elemSize);
-static SmallArray_RemoveFunc SmallArray_POD__RemoveGeneric = (SmallArray_RemoveFunc)0x142726000;
+// ACU 1.5.0 / ACUFixes-0.9.3 verified SmallArray POD-removal entry point.
+DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
+
+namespace
+{
+    constexpr int kMaxOverrideCount = 64;
+
+    std::string_view Trim(std::string_view text)
+    {
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
+            text.remove_prefix(1);
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+            text.remove_suffix(1);
+        return text;
+    }
+
+    bool TryGetValue(std::string_view line, std::string_view prefix, std::string_view& value)
+    {
+        if (line.rfind(prefix, 0) != 0)
+            return false;
+        value = Trim(line.substr(prefix.size()));
+        return true;
+    }
+
+    bool TryParseInteger(std::string_view text, int base, int& value)
+    {
+        text = Trim(text);
+        if (text.empty())
+            return false;
+
+        try
+        {
+            size_t parsedCharacters = 0;
+            const long long parsed = std::stoll(std::string(text), &parsedCharacters, base);
+            if (parsedCharacters != text.size()
+                || parsed < std::numeric_limits<int>::min()
+                || parsed > std::numeric_limits<int>::max())
+            {
+                return false;
+            }
+            value = static_cast<int>(parsed);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool TryParseFloat(std::string_view text, float& value)
+    {
+        text = Trim(text);
+        if (text.empty())
+            return false;
+
+        try
+        {
+            size_t parsedCharacters = 0;
+            const float parsed = std::stof(std::string(text), &parsedCharacters);
+            if (parsedCharacters != text.size() || !std::isfinite(parsed))
+                return false;
+            value = parsed;
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool TryParseBool(std::string_view text, bool& value)
+    {
+        text = Trim(text);
+        if (text == "0")
+        {
+            value = false;
+            return true;
+        }
+        if (text == "1")
+        {
+            value = true;
+            return true;
+        }
+        return false;
+    }
+
+    bool IsValidVirtualKey(int virtualKey)
+    {
+        return virtualKey >= 1 && virtualKey <= 0xFE;
+    }
+
+    std::vector<std::string_view> Split(std::string_view text, char delimiter)
+    {
+        std::vector<std::string_view> parts;
+        size_t partStart = 0;
+        while (true)
+        {
+            const size_t delimiterPosition = text.find(delimiter, partStart);
+            if (delimiterPosition == std::string_view::npos)
+            {
+                parts.push_back(text.substr(partStart));
+                break;
+            }
+            parts.push_back(text.substr(partStart, delimiterPosition - partStart));
+            partStart = delimiterPosition + 1;
+        }
+        return parts;
+    }
+
+    bool TryParseOverride(std::string_view data, int& index, ParkourActionOverride& parsedOverride)
+    {
+        const std::vector<std::string_view> fields = Split(data, ',');
+        if (fields.size() != 8)
+            return false;
+
+        int overrideIndex = 0;
+        int keyCode = 0;
+        if (!TryParseInteger(fields[0], 10, overrideIndex)
+            || !TryParseInteger(fields[1], 10, keyCode)
+            || !IsValidVirtualKey(keyCode))
+        {
+            return false;
+        }
+
+        std::vector<int> actionTypes;
+        for (const std::string_view actionTypeText : Split(fields[2], '|'))
+        {
+            if (actionTypeText.empty())
+                continue;
+            int actionType = 0;
+            if (!TryParseInteger(actionTypeText, 10, actionType) || actionType < 0)
+                return false;
+            actionTypes.push_back(actionType);
+        }
+        if (actionTypes.empty())
+            return false;
+
+        float fitnessMultiplier = 0.0f;
+        bool removeOtherActions = false;
+        bool enabled = false;
+        bool toggleMode = false;
+        bool toggleState = false;
+        if (!TryParseFloat(fields[3], fitnessMultiplier)
+            || !TryParseBool(fields[4], removeOtherActions)
+            || !TryParseBool(fields[5], enabled)
+            || !TryParseBool(fields[6], toggleMode)
+            || !TryParseBool(fields[7], toggleState))
+        {
+            return false;
+        }
+
+        index = overrideIndex;
+        parsedOverride.keyCode = keyCode;
+        parsedOverride.actionTypes = std::move(actionTypes);
+        parsedOverride.fitnessMultiplier = fitnessMultiplier;
+        parsedOverride.removeOtherActions = removeOtherActions;
+        parsedOverride.enable = enabled;
+        parsedOverride.toggleMode = toggleMode;
+        parsedOverride.toggleState = toggleState;
+        parsedOverride.waitingForKey = false;
+        return true;
+    }
+
+    // Some transient candidates have a NULL GetEnumParkourAction fancy slot.
+    // Calling the member method on those candidates dispatches to address zero
+    // and crashes, so validate the slot before reading an action type.
+    int GetTypeIntSafe(const AvailableParkourAction* action)
+    {
+        if (!action || !action->fancyVTable)
+            return -1;
+
+        const FancyVFunction& slot =
+            action->fancyVTable->fancyVirtuals[ParkourActionKnownFancyVFuncs::GetEnumParkourAction::idx];
+        if (!slot.fn)
+            return -1;
+
+        return static_cast<int>(
+            GET_AND_CAST_FANCY_FUNC(
+                *action,
+                ParkourActionKnownFancyVFuncs::GetEnumParkourAction)(
+                    const_cast<AvailableParkourAction*>(action)));
+    }
+}
 
 // ── AssassinAbilitySet helpers ────────────────────────────────────────
 
@@ -29,133 +218,185 @@ AssassinAbilitySet* FreeJumpPlugin::GetActiveAbilitySet()
     return mgr->assassinAbilitySets.GetHighestPrioritySet();
 }
 
-static std::string GetGameSaveFolder()
+static std::string GetIniPath()
 {
-    char documents[MAX_PATH];
-    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documents)))
+    char documents[MAX_PATH]{};
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL | CSIDL_FLAG_CREATE, nullptr, 0, documents)))
     {
-        std::string path(documents);
-        path += "\\Assassin's Creed Unity";
-        CreateDirectoryA(path.c_str(), NULL); // ensure parent exists
-        path += "\\FreeJumpPlugin.ini";
-        return path;
+        std::string folder(documents);
+        folder += "\\Assassin's Creed Unity";
+        if (!CreateDirectoryA(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        {
+            // The stream operation below will report the actual write failure.
+        }
+        folder += "\\FreeJumpPlugin.ini";
+        return folder;
     }
     return "FreeJumpPlugin.ini";
 }
 
 void FreeJumpPlugin::LoadSettings()
 {
-    std::ifstream file(GetGameSaveFolder());
+    std::ifstream file(GetIniPath());
     if (!file) return;
+
+    std::vector<ParkourActionOverride> loadedOverrides;
+    bool hasOverrideCount = false;
     std::string line;
     while (std::getline(file, line))
     {
-        if (line.rfind("FreeJumpKey=", 0) == 0)
-            try { m_ToggleKey = std::stoi(line.substr(13), nullptr, 16); } catch (...) {}
-        else if (line.rfind("SnapDirectionKey=", 0) == 0)
-            try { m_SnapDirectionKey = std::stoi(line.substr(17), nullptr, 16); } catch (...) {}
-        else if (line.rfind("MouseLockEnabled=", 0) == 0)
-            try { m_MouseLockEnabled = std::stoi(line.substr(17)) != 0; } catch (...) {}
-        else if (line.rfind("NumOverrides=", 0) == 0)
+        const std::string_view trimmedLine = Trim(line);
+        std::string_view value;
+
+        if (TryGetValue(trimmedLine, "FreeJumpKey=", value))
         {
-            int count = std::stoi(line.substr(13));
-            m_Overrides.resize(count);
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidVirtualKey(keyCode))
+                m_ToggleKey = keyCode;
         }
-        else if (line.rfind("Override=", 0) == 0)
+        else if (TryGetValue(trimmedLine, "SnapDirectionKey=", value))
         {
-            std::string data = line.substr(9);
-            std::replace(data.begin(), data.end(), ',', ' ');
-            std::istringstream iss(data);
-            int idx, key, removeOthers, enable, toggleMode, toggleState;
-            float mult;
-            std::string typeStr;
-            if (iss >> idx >> key >> typeStr >> mult >> removeOthers >> enable >> toggleMode >> toggleState)
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidVirtualKey(keyCode))
+                m_SnapDirectionKey = keyCode;
+        }
+        else if (TryGetValue(trimmedLine, "SnapDirectionMode=", value))
+        {
+            bool enabled = false;
+            if (TryParseBool(value, enabled))
+                m_SnapDirectionMode = enabled;
+        }
+        else if (TryGetValue(trimmedLine, "MouseLockEnabled=", value))
+        {
+            bool enabled = false;
+            if (TryParseBool(value, enabled))
+                m_MouseLockEnabled = enabled;
+        }
+        else if (TryGetValue(trimmedLine, "NumOverrides=", value))
+        {
+            int count = 0;
+            if (TryParseInteger(value, 10, count) && count >= 0 && count <= kMaxOverrideCount)
             {
-                if (idx >= 0 && idx < (int)m_Overrides.size())
-                {
-                    m_Overrides[idx].keyCode = key;
-                    m_Overrides[idx].actionTypes.clear();
-                    std::istringstream typeStream(typeStr);
-                    std::string seg;
-                    while (std::getline(typeStream, seg, '|'))
-                        if (!seg.empty())
-                            m_Overrides[idx].actionTypes.push_back(std::stoi(seg));
-                    if (m_Overrides[idx].actionTypes.empty())
-                        m_Overrides[idx].actionTypes.push_back(50);
-                    m_Overrides[idx].fitnessMultiplier = mult;
-                    m_Overrides[idx].removeOtherActions = removeOthers != 0;
-                    m_Overrides[idx].enable = enable != 0;
-                    m_Overrides[idx].toggleMode = toggleMode != 0;
-                    m_Overrides[idx].toggleState = toggleState != 0;
-                }
+                loadedOverrides.assign(count, ParkourActionOverride{});
+                hasOverrideCount = true;
+            }
+            else
+            {
+                loadedOverrides.clear();
+                hasOverrideCount = false;
             }
         }
+        else if (TryGetValue(trimmedLine, "Override=", value) && hasOverrideCount)
+        {
+            int index = 0;
+            ParkourActionOverride parsedOverride;
+            if (!TryParseOverride(value, index, parsedOverride)
+                || index < 0
+                || index >= static_cast<int>(loadedOverrides.size()))
+            {
+                continue;
+            }
+            loadedOverrides[static_cast<size_t>(index)] = std::move(parsedOverride);
+        }
     }
+
+    if (hasOverrideCount)
+        m_Overrides = std::move(loadedOverrides);
 }
 
 void FreeJumpPlugin::SaveSettings()
 {
-    try {
-        std::ofstream file(GetGameSaveFolder());
-        if (file)
+    const std::string path = GetIniPath();
+    const std::string temporaryPath = path + ".tmp";
+
+    std::ofstream file(temporaryPath, std::ios::out | std::ios::trunc);
+    if (!file)
+        return;
+
+    file << "FreeJumpKey=" << std::hex << m_ToggleKey << std::dec << "\n";
+    file << "SnapDirectionKey=" << std::hex << m_SnapDirectionKey << std::dec << "\n";
+    file << "SnapDirectionMode=" << (m_SnapDirectionMode ? 1 : 0) << "\n";
+    file << "MouseLockEnabled=" << (m_MouseLockEnabled ? 1 : 0) << "\n";
+    file << "NumOverrides=" << m_Overrides.size() << "\n";
+    file << std::setprecision(std::numeric_limits<float>::max_digits10);
+    for (size_t i = 0; i < m_Overrides.size(); ++i)
+    {
+        const ParkourActionOverride& override = m_Overrides[i];
+        file << "Override=" << i << "," << override.keyCode << ",";
+        for (size_t actionIndex = 0; actionIndex < override.actionTypes.size(); ++actionIndex)
         {
-            file << "FreeJumpKey=" << std::hex << m_ToggleKey << std::dec << "\n";
-            file << "SnapDirectionKey=" << std::hex << m_SnapDirectionKey << std::dec << "\n";
-            file << "MouseLockEnabled=" << (m_MouseLockEnabled ? 1 : 0) << "\n";
-            file << "NumOverrides=" << m_Overrides.size() << "\n";
-            for (size_t i = 0; i < m_Overrides.size(); ++i)
-            {
-                auto& ov = m_Overrides[i];
-                file << "Override=" << i << "," << ov.keyCode << ",";
-                for (size_t t = 0; t < ov.actionTypes.size(); ++t)
-                {
-                    if (t > 0) file << "|";
-                    file << ov.actionTypes[t];
-                }
-                file << "," << ov.fitnessMultiplier << "," << (ov.removeOtherActions ? 1 : 0) << ","
-                     << (ov.enable ? 1 : 0) << "," << (ov.toggleMode ? 1 : 0) << ","
-                     << (ov.toggleState ? 1 : 0) << "\n";
-            }
+            if (actionIndex > 0)
+                file << "|";
+            file << override.actionTypes[actionIndex];
         }
-    } catch (...) {}
+        file << "," << override.fitnessMultiplier
+             << "," << (override.removeOtherActions ? 1 : 0)
+             << "," << (override.enable ? 1 : 0)
+             << "," << (override.toggleMode ? 1 : 0)
+             << "," << (override.toggleState ? 1 : 0) << "\n";
+    }
+
+    file.flush();
+    const bool flushSucceeded = file.good();
+    file.close();
+    if (!flushSucceeded || file.fail())
+    {
+        DeleteFileA(temporaryPath.c_str());
+        return;
+    }
+
+    // Replace the old file only after the complete new file has been flushed.
+    // This prevents a failed write from leaving a truncated configuration.
+    if (!MoveFileExA(
+            temporaryPath.c_str(),
+            path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileA(temporaryPath.c_str());
+    }
 }
 
-void FreeJumpPlugin::SaveCurrentFlags()
+bool FreeJumpPlugin::SaveCurrentFlags()
 {
     AssassinAbilitySet* set = GetActiveAbilitySet();
-    if (!set) return;
+    if (!set) return false;
     m_SavedFlags.byte22 = *(uint8_t*)((uintptr_t)set + 0x22);
     m_SavedFlags.byte29 = *(uint8_t*)((uintptr_t)set + 0x29);
     m_SavedFlags.byte2A = *(uint8_t*)((uintptr_t)set + 0x2A);
     m_FlagsSaved = true;
+    return true;
 }
 
-void FreeJumpPlugin::RestoreFlags()
+bool FreeJumpPlugin::RestoreFlags()
 {
-    if (!m_FlagsSaved) return;
+    if (!m_FlagsSaved) return true;
     AssassinAbilitySet* set = GetActiveAbilitySet();
-    if (!set) return;
+    if (!set) return false;
     *(uint8_t*)((uintptr_t)set + 0x22) = m_SavedFlags.byte22;
     *(uint8_t*)((uintptr_t)set + 0x29) = m_SavedFlags.byte29;
     *(uint8_t*)((uintptr_t)set + 0x2A) = m_SavedFlags.byte2A;
     m_FlagsSaved = false;
+    return true;
 }
 
-void FreeJumpPlugin::ApplyMouseLock(bool enable)
+bool FreeJumpPlugin::ApplyMouseLock(bool enable)
 {
     AssassinAbilitySet* set = GetActiveAbilitySet();
-    if (!set) return;
+    if (!set) return false;
     if (enable)
     {
-        if (!m_FlagsSaved) SaveCurrentFlags();
+        if (!m_FlagsSaved && !SaveCurrentFlags())
+            return false;
         uint8_t* byte22 = (uint8_t*)((uintptr_t)set + 0x22);
         *byte22 &= ~(1 << 2);
         uint8_t* byte29 = (uint8_t*)((uintptr_t)set + 0x29);
         *byte29 &= ~((1 << 1) | (1 << 4));
         uint8_t* byte2A = (uint8_t*)((uintptr_t)set + 0x2A);
         *byte2A &= ~(1 << 0);
+        return true;
     }
-    else RestoreFlags();
+
+    return RestoreFlags();
 }
 
 static Vector2f GetCameraFlatForward()
@@ -183,7 +424,6 @@ static void Rotate2D(float& x, float& y, float angle)
 void FreeJumpPlugin::OnBeforeActivate()
 {
     LoadSettings();
-    if (m_MouseLockEnabled) ApplyMouseLock(true);
 
     m_Callbacks.ChooseBeforeFiltering_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions) -> AvailableParkourAction*
     {
@@ -193,104 +433,149 @@ void FreeJumpPlugin::OnBeforeActivate()
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 5.0f;
     m_Callbacks.m_Name = "FreeJumpPlugin";
+
+    if (m_MouseLockEnabled)
+        m_LastMouseLockEnabled = ApplyMouseLock(true);
 }
 
 void FreeJumpPlugin::OnBeforeDeactivate()
 {
-    if (m_MouseLockEnabled) ApplyMouseLock(false);
     if (m_HookActive)
     {
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
         m_HookActivator.reset();
         m_HookActive = false;
     }
+    if (m_FlagsSaved)
+    {
+        ApplyMouseLock(false);
+        m_LastMouseLockEnabled = false;
+    }
     SaveSettings();
+}
+
+void FreeJumpPlugin::UpdateKeyState(int vkCode)
+{
+    if (!IsValidVirtualKey(vkCode) || m_KeyStateUpdatedThisFrame[vkCode])
+        return;
+
+    const bool keyIsDown = (GetAsyncKeyState(vkCode) & 0x8000) != 0;
+    m_KeyPressedThisFrame[vkCode] = keyIsDown && !m_PreviousKeyDown[vkCode];
+    m_PreviousKeyDown[vkCode] = keyIsDown;
+    m_KeyStateUpdatedThisFrame[vkCode] = true;
+}
+
+void FreeJumpPlugin::UpdateAllKeyStates()
+{
+    for (int vkCode = 1; vkCode <= 0xFE; ++vkCode)
+        UpdateKeyState(vkCode);
+}
+
+bool FreeJumpPlugin::WasKeyPressed(int vkCode) const
+{
+    return IsValidVirtualKey(vkCode) && m_KeyPressedThisFrame[vkCode];
 }
 
 void FreeJumpPlugin::OnUpdate()
 {
-    // Rebind Free Jump key
-    if (m_WaitingForKey)
-    {
-        for (int vk = 1; vk <= 0xFE; ++vk)
-        {
-            if (IsRisingEdgePressed(vk))
-            {
-                m_ToggleKey = vk;
-                m_WaitingForKey = false;
-                SaveSettings();
-                break;
-            }
-        }
-    }
+    m_KeyStateUpdatedThisFrame.fill(false);
 
-    // Rebind Snap Direction key
-    if (m_WaitingForSnapKey)
-    {
-        for (int vk = 1; vk <= 0xFE; ++vk)
-        {
-            if (IsRisingEdgePressed(vk))
-            {
-                m_SnapDirectionKey = vk;
-                m_WaitingForSnapKey = false;
-                SaveSettings();
-                break;
-            }
-        }
-    }
+    UpdateKeyState(m_ToggleKey);
+    UpdateKeyState(m_SnapDirectionKey);
+    for (const ParkourActionOverride& override : m_Overrides)
+        UpdateKeyState(override.keyCode);
 
-    // Rebind custom overrides (they have waitingForKey)
-    auto captureOverrideKey = [this](auto& ov, const char* name) -> bool
+    const bool waitingForOverrideKey = std::any_of(
+        m_Overrides.begin(),
+        m_Overrides.end(),
+        [](const ParkourActionOverride& override) { return override.waitingForKey; });
+    if (m_WaitingForKey || m_WaitingForSnapKey || waitingForOverrideKey)
+        UpdateAllKeyStates();
+
+    const auto captureKey = [this](int& destinationKey) -> bool
     {
-        if (!ov.waitingForKey) return false;
-        for (int vk = 1; vk <= 0xFE; ++vk)
+        for (int vkCode = 1; vkCode <= 0xFE; ++vkCode)
         {
-            if (IsRisingEdgePressed(vk))
+            // The left/right/middle mouse buttons are used by the loader UI and
+            // would otherwise be captured by the click that starts a rebind.
+            if (vkCode <= VK_MBUTTON)
+                continue;
+            if (WasKeyPressed(vkCode))
             {
-                ov.keyCode = vk;
-                ov.waitingForKey = false;
-                SaveSettings();
+                destinationKey = vkCode;
                 return true;
             }
         }
         return false;
     };
 
-    for (auto& ov : m_Overrides)
-        if (captureOverrideKey(ov, "Custom override")) break;
-
-    // Toggle snap direction
-    static bool prevSnapKeyState = false;
-    bool currSnapKeyState = (GetAsyncKeyState(m_SnapDirectionKey) & 1) != 0;
-    if (currSnapKeyState && !prevSnapKeyState) m_SnapDirectionMode = !m_SnapDirectionMode;
-    prevSnapKeyState = currSnapKeyState;
-
-    // Update toggle state for overrides
-    for (auto& ov : m_Overrides)
+    if (m_WaitingForKey)
     {
-        if (!ov.enable) continue;
-        if (ov.toggleMode && IsRisingEdgePressed(ov.keyCode))
+        if (captureKey(m_ToggleKey))
         {
-            ov.toggleState = !ov.toggleState;
+            m_WaitingForKey = false;
+            SaveSettings();
+        }
+    }
+    else if (m_WaitingForSnapKey)
+    {
+        if (captureKey(m_SnapDirectionKey))
+        {
+            m_WaitingForSnapKey = false;
+            SaveSettings();
+        }
+    }
+    else if (waitingForOverrideKey)
+    {
+        for (ParkourActionOverride& override : m_Overrides)
+        {
+            if (!override.waitingForKey)
+                continue;
+            if (captureKey(override.keyCode))
+            {
+                override.waitingForKey = false;
+                SaveSettings();
+            }
+            break;
+        }
+    }
+
+    if (WasKeyPressed(m_SnapDirectionKey))
+    {
+        m_SnapDirectionMode = !m_SnapDirectionMode;
+        SaveSettings();
+    }
+
+    for (ParkourActionOverride& override : m_Overrides)
+    {
+        if (!override.enable || !override.toggleMode)
+            continue;
+        if (WasKeyPressed(override.keyCode))
+        {
+            override.toggleState = !override.toggleState;
             SaveSettings();
         }
     }
 
-    // Apply mouse lock state if changed
-    static bool lastMouseLock = false;
-    if (m_MouseLockEnabled != lastMouseLock)
+    if (m_MouseLockEnabled != m_LastMouseLockEnabled)
     {
-        ApplyMouseLock(m_MouseLockEnabled);
-        lastMouseLock = m_MouseLockEnabled;
+        if (ApplyMouseLock(m_MouseLockEnabled))
+            m_LastMouseLockEnabled = m_MouseLockEnabled;
     }
 
-    // Determine if hook should be active (via GenericHooksInParkourFiltering)
-    bool freeJumpHeld = (GetAsyncKeyState(m_ToggleKey) & 0x8000) != 0;
+    const bool freeJumpHeld = (GetAsyncKeyState(m_ToggleKey) & 0x8000) != 0;
     bool anyOverrideActive = false;
-    for (auto& ov : m_Overrides)
-        if (ov.enable && (ov.toggleMode ? ov.toggleState : (GetAsyncKeyState(ov.keyCode) & 0x8000)))
+    for (const ParkourActionOverride& override : m_Overrides)
+    {
+        if (override.enable
+            && (override.toggleMode
+                ? override.toggleState
+                : (GetAsyncKeyState(override.keyCode) & 0x8000) != 0))
+        {
             anyOverrideActive = true;
-    bool needHook = freeJumpHeld || anyOverrideActive || m_SnapDirectionMode;
+        }
+    }
+    const bool needHook = freeJumpHeld || anyOverrideActive || m_SnapDirectionMode;
 
     if (needHook && !m_HookActive)
     {
@@ -325,7 +610,15 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::Text("  Bound key: 0x%02X", m_ToggleKey);
         if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForKey ? "Cancel Rebind" : "Rebind##FreeJump"))
+        {
             m_WaitingForKey = !m_WaitingForKey;
+            if (m_WaitingForKey)
+            {
+                m_WaitingForSnapKey = false;
+                for (ParkourActionOverride& override : m_Overrides)
+                    override.waitingForKey = false;
+            }
+        }
 
         ImGui::Separator();
         ImGui::Text("Snap Direction:");
@@ -335,7 +628,15 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::Text("  Toggle key: 0x%02X", m_SnapDirectionKey);
         if (m_WaitingForSnapKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForSnapKey ? "Cancel Rebind" : "Rebind##Snap"))
+        {
             m_WaitingForSnapKey = !m_WaitingForSnapKey;
+            if (m_WaitingForSnapKey)
+            {
+                m_WaitingForKey = false;
+                for (ParkourActionOverride& override : m_Overrides)
+                    override.waitingForKey = false;
+            }
+        }
 
         ImGui::Separator();
         bool mouseLock = m_MouseLockEnabled;
@@ -346,11 +647,16 @@ void FreeJumpPlugin::OnImGuiRender()
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Parkour Action Overrides", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        if (ImGui::Button("+ Add Custom Override"))
+        if (ImGui::Button("+ Add Custom Override")
+            && m_Overrides.size() < static_cast<size_t>(kMaxOverrideCount))
         {
             ParkourActionOverride newOverride;
             newOverride.keyCode = VK_F9; // sensible default, user rebinds after
             newOverride.waitingForKey = true; // start in bind mode
+            m_WaitingForKey = false;
+            m_WaitingForSnapKey = false;
+            for (ParkourActionOverride& override : m_Overrides)
+                override.waitingForKey = false;
             m_Overrides.push_back(newOverride);
             SaveSettings();
         }
@@ -368,18 +674,37 @@ void FreeJumpPlugin::OnImGuiRender()
                 ImGui::SameLine();
                 if (ImGui::CollapsingHeader(("Custom " + std::to_string(idx)).c_str()))
                 {
-                    ImGui::Checkbox("Enable", &ov.enable);
+                    if (ImGui::Checkbox("Enable", &ov.enable))
+                        SaveSettings();
                     ImGui::SameLine();
                     ImGui::Text("Key: 0x%02X", ov.keyCode);
                     ImGui::SameLine();
                     if (ImGui::Button(ov.waitingForKey ? "Cancel" : "Rebind"))
-                        ov.waitingForKey = !ov.waitingForKey;
+                    {
+                        const bool startWaiting = !ov.waitingForKey;
+                        for (ParkourActionOverride& otherOverride : m_Overrides)
+                            otherOverride.waitingForKey = false;
+                        ov.waitingForKey = startWaiting;
+                        if (startWaiting)
+                        {
+                            m_WaitingForKey = false;
+                            m_WaitingForSnapKey = false;
+                        }
+                    }
                     if (ov.waitingForKey) ImGui::TextColored(rebindColor, "Input key to bind...");
 
                     bool holdMode = !ov.toggleMode;
-                    if (ImGui::RadioButton("Hold (press and hold)", holdMode)) ov.toggleMode = false;
+                    if (ImGui::RadioButton("Hold (press and hold)", holdMode))
+                    {
+                        ov.toggleMode = false;
+                        SaveSettings();
+                    }
                     ImGui::SameLine();
-                    if (ImGui::RadioButton("Toggle (press once to lock)", ov.toggleMode)) ov.toggleMode = true;
+                    if (ImGui::RadioButton("Toggle (press once to lock)", ov.toggleMode))
+                    {
+                        ov.toggleMode = true;
+                        SaveSettings();
+                    }
 
                     {
                         const char* kActionNames[] = {
@@ -439,8 +764,10 @@ void FreeJumpPlugin::OnImGuiRender()
                             SaveSettings();
                         }
                     }
-                    ImGui::DragFloat("Fitness Multiplier", &ov.fitnessMultiplier, 0.5f, 0.0f, 100000.0f);
-                    ImGui::Checkbox("Remove all other actions", &ov.removeOtherActions);
+                    if (ImGui::DragFloat("Fitness Multiplier", &ov.fitnessMultiplier, 0.5f, 0.0f, 100000.0f))
+                        SaveSettings();
+                    if (ImGui::Checkbox("Remove all other actions", &ov.removeOtherActions))
+                        SaveSettings();
                     if (ImGui::Button("Delete Override"))
                     {
                         m_Overrides.erase(m_Overrides.begin() + idx);
@@ -529,7 +856,7 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
                 AvailableParkourAction* action = actions[i];
                 if (!action) continue;
                 if (std::find(allowedTypes.begin(), allowedTypes.end(),
-                    (int)action->GetEnumParkourAction()) == allowedTypes.end())
+                    GetTypeIntSafe(action)) == allowedTypes.end())
                     SmallArray_POD__RemoveGeneric(&actions, i, sizeof(AvailableParkourAction*));
             }
         }
@@ -542,7 +869,7 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
                 AvailableParkourAction* action = actions[i];
                 if (!action) continue;
                 if (std::find(ao.ptr->actionTypes.begin(), ao.ptr->actionTypes.end(),
-                    (int)action->GetEnumParkourAction()) != ao.ptr->actionTypes.end())
+                    GetTypeIntSafe(action)) != ao.ptr->actionTypes.end())
                 {
                     float* fitness = (float*)((uintptr_t)action + 0x204);
                     if (ao.ptr->fitnessMultiplier != 1.0f)
@@ -552,9 +879,4 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
         }
     }
     return nullptr;
-}
-
-bool FreeJumpPlugin::IsRisingEdgePressed(int vkCode)
-{
-    return (GetAsyncKeyState(vkCode) & 1) != 0;
 }

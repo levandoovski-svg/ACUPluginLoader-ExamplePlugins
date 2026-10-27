@@ -1,5 +1,6 @@
 #include "pch.h"
-#include "ForcedSidehopPlugin.h"
+#include "FailedWallRunPlugin.h"
+#include "FreeJumpPlugin.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
 class ExamplePlugin : public ACUPluginInterfaceVirtuals
@@ -7,18 +8,20 @@ class ExamplePlugin : public ACUPluginInterfaceVirtuals
 public:
     virtual void EveryFrameWhenMenuIsOpen() override
     {
-        g_forcedSidehop.OnUpdate();
-        g_forcedSidehop.OnImGuiRender();
+        g_failedWallRun.OnUpdate();
+        g_failedWallRun.OnImGuiRender();
+        g_freeJump.OnImGuiRender();
     }
 
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        g_forcedSidehop.OnUpdate();
+        g_failedWallRun.OnUpdate();
+        g_freeJump.OnUpdate();
     }
 
     virtual uint64 GetThisPluginVersion() override
     {
-        return MAKE_VERSION_NUMBER_UINT64(0, 4, 0, 0);
+        return MAKE_VERSION_NUMBER_UINT64(0, 5, 0, 0);
     }
 
     virtual void InitStage_WhenPluginAPIDeemedCompatible() override
@@ -27,9 +30,11 @@ public:
 
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
-        g_forcedSidehop.Init();
+        g_failedWallRun.LoadSettings();
+        g_freeJump.OnBeforeActivate();
         return true;
     }
 
-    ForcedSidehopPlugin g_forcedSidehop;
+    FailedWallRunPlugin g_failedWallRun;
+    FreeJumpPlugin g_freeJump;
 } g_thisPlugin;

@@ -203,8 +203,9 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <!-- Keep this DLL limited to the ForcedSidehop gameplay plugin. -->
-    <ClCompile Include="src\ForcedSidehopPlugin.cpp" />
+    <!-- Keep this DLL limited to the full-featured FreeJump gameplay plugin. -->
+    <ClCompile Include="src\FailedWallRunPlugin.cpp" />
+    <ClCompile Include="src\FreeJumpPlugin.cpp" />
     <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\ParkourLogStubs.cpp" />
@@ -216,7 +217,8 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\ForcedSidehopPlugin.h" />
+    <ClInclude Include="src\FailedWallRunPlugin.h" />
+    <ClInclude Include="src\FreeJumpPlugin.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>
