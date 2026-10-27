@@ -12,11 +12,9 @@
 #include <cmath>
 #include <sstream>
 
-// GetEnumParkourAction definition (declared in AvailableParkourAction.h)
-EnumParkourAction AvailableParkourAction::GetEnumParkourAction()
-{
-    return GET_AND_CAST_FANCY_FUNC(*this, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)(this);
-}
+// NOTE: AvailableParkourAction::GetEnumParkourAction() is defined exactly once,
+// in GenericHooksInParkourFiltering.cpp (compiled in this project). Do NOT
+// redefine it here — duplicate definitions break the link.
 
 // 1.5.0 address
 using SmallArray_RemoveFunc = void(__fastcall*)(void* smallArray, int p_idx, unsigned int p_elemSize);

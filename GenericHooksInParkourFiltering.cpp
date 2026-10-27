@@ -1,13 +1,13 @@
 #include "pch.h"
 
-#include "GenericHooksInParkourFiltering.h"
+#include "ParkourDebugging/GenericHooksInParkourFiltering.h"
 
 #include "ACU/basic_types.h"
 #include "ACU/Memory/ACUAllocs.h"
 #include "ACU_DefineNativeFunction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
-#include "AvailableParkourAction.h"
-#include "ParkourTester.h"
+#include "ParkourDebugging/AvailableParkourAction.h"
+#include "ParkourDebugging/ParkourTester.h"
 
 #include "ParkourDebugging/ParkourLog.h"
 

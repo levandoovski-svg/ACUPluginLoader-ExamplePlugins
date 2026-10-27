@@ -7,21 +7,52 @@
 #include "ACU_DefineNativeFunction.h"
 #include "ParkourDebugging/AvailableParkourAction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
+#include "ACU/Parkour_WhileOnWallSystem.h"
 #include <fstream>
 #include <shlobj.h>
 #include "imgui/imgui.h"
 #include <cstring>
 #include <string_view>
+#include <algorithm>
 
 #include "ACU/AtomGraph.h"
 #include "ACU/AtomAnimComponent.h"
 #include "ACU/HumanStatesHolder.h"
 
-// Inline definition (not compiling AvailableParkourAction.cpp separately)
-EnumParkourAction AvailableParkourAction::GetEnumParkourAction()
-{
-    return GET_AND_CAST_FANCY_FUNC(*this, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)(this);
-}
+// ============================================================================
+//  Failure analysis this rewrite is based on (1.5.0 Steam runtime dump,
+//  MODLOG/scripts/ACU_dumped_pe.exe, base 0x140000000, no ASLR):
+//
+//  1) Ordering bug (the main one): the old plugin widened the type-52
+//     acceptance ranges only AFTER CreateParkourActionForParkourPointIfFits
+//     (0x1401D1CF0) had already run InitialTestIfActionFits (0x1401B4900)
+//     and destroyed the action. On walls where vanilla's ranges reject the
+//     probe the wrapper returned false and the plugin did nothing.
+//     -> fixed by GPH_Type52RangeWidener hooking INSIDE the range-setter.
+//  2) Null fancy-fn crash: the type-52 ctor chain passes through fancy table
+//     0x143A41930 whose idx 0x45 (GetEnumParkourAction) is NULL. Any plugin
+//     enumerating actions via GetEnumParkourAction() calls address 0 and
+//     crashes. -> fixed by GetTypeIntSafe() (never dispatches a null fn).
+//  3) Weak selection: fitness sabotage at creation time only.
+//     -> added GPH ChooseBeforeFiltering/ChooseAfterSorting enforcement
+//        (the same mechanism the reverse-engineered ACU_ParkourPatches.dll
+//        uses when it returns the mutated candidate from sort&select).
+//
+//  Type-52 chain (all dump-verified):
+//    creation wrapper 0x1401D1CF0
+//      -> factory 0x1401CC990 (jump table 0x1401D1AF4[0x34] -> ctor 0x1401BC7F0)
+//         -> post-init 0x1401D9210 sets runtime fancy vtable = 0x143A6FFD0
+//      -> fancy 0x3D Set2Floats
+//      -> fancy 0x4B InitialTestIfActionFits = 0x1401B4900
+//           -> fancy 0x64 SetExpectedDistanceRangesAccordingToParkourMode
+//              = 0x1401AF2E0   (hooked at 0x1401AF3B6 by GPH_Type52RangeWidener)
+//           -> fancy 0x49 (0x1401ACBD0)
+//           -> fancy 0x4A per-type geometry test = 0x1401B0340
+//                -> 0x1401B5700 = 5 per-context quick-checks
+//                   (parkour mode / wall slope / mesh / ...) = "wall context" gate
+//           -> TEST AL,AL / JZ reject   (hooked at 0x1401B499E by
+//                                        GPH_Type52FitTestOverride)
+// ============================================================================
 
 // Extended action base with padding matching the game's full action size
 class ParkourAction_Commonbase : public AvailableParkourAction
@@ -44,22 +75,68 @@ namespace
     }
 }
 
-// Guard flag + cached settings for the static creation hook
-static bool g_ShouldCreateFailedWallrun = false;
+// ── Type-52 identification constants (runtime dump) ───────────────────────────
+
+// The fancy vtable the type-52 post-init (0x1401D9210) installs. Its fancy
+// idx 0x45 (GetEnumParkourAction) is valid (0x1401AD4B0).
+static constexpr uint64 k_Type52FancyVTable_Runtime = 0x143A6FFD0;
+
+// Transient base table installed by the shared base ctor (0x1401B9C80) before
+// the post-init replaces it. Its fancy idx 0x45 is NULL — calling
+// GetEnumParkourAction() on an action carrying this table crashes.
+static constexpr uint64 k_Type52FancyVTable_TransientBase = 0x143A41930;
+
+// climbFacadeTester fancy vtables used by the optional cycle-start swap
+// (ACUFixes-0.9.3 / ACU_ParkourPatches values; both valid tables in the dump
+// and proven on this build by the working ACU_ParkourPatches.dll).
+static constexpr uint64 k_ClimbFacadeTesterFancyVTable_Default = 0x1439E08D0;
+static constexpr uint64 k_ClimbFacadeTesterFancyVTable_Baseclass = 0x1439FA1A0;
+
+// ── Null-safe action-type read ────────────────────────────────────────────────
+// NEVER call AvailableParkourAction::GetEnumParkourAction() directly on actions
+// that may be a wallrunUpFromGroundFailed_mb: some of its tables have a NULL
+// fancy fn at idx 0x45 and GET_AND_CAST_FANCY_FUNC does no null check.
+static int GetTypeIntSafe(const AvailableParkourAction* action)
+{
+    if (!action || !action->fancyVTable) return -1;
+    const FancyVFunction& slot = action->fancyVTable->fancyVirtuals[ParkourActionKnownFancyVFuncs::GetEnumParkourAction::idx];
+    if (!slot.fn)
+    {
+        // Null fancy-fn: identify the few known tables by pointer instead.
+        if ((uint64)action->fancyVTable == k_Type52FancyVTable_Runtime
+            || (uint64)action->fancyVTable == k_Type52FancyVTable_TransientBase)
+            return (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
+        return -1;
+    }
+    return (int)GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)((AvailableParkourAction*)action);
+}
+
+static bool IsType52Safe(const AvailableParkourAction* action)
+{
+    return GetTypeIntSafe(action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
+}
+
+// ── Guard flag + cached settings for the static hooks ─────────────────────────
+static volatile bool g_ShouldCreateFailedWallrun = false;
+static volatile bool g_ExpandRanges = false;
+static volatile bool g_SkipFitTest = false;
+static volatile bool g_SwapTesterVTables = false;
 static float g_LiftAmount = 2.0f;
 static float g_LiftSpeed = 6.0f;
-static bool g_VtableSwapEnabled = false;
-static uint64 g_Type52FancyVTable = 0;
 static int g_Action52Count = 0;
 static int g_SabotagedCount = 0;
+static int g_WidenCount = 0;
+static int g_FitOverrideCount = 0;
 
-// Permissive range values so injected type 52 survives validation
+// Permissive acceptance ranges so injected/natural type-52 survives validation.
+// Applied with "only widen" semantics (never narrows vanilla) both inside the
+// range-setter and after creation.
 static float g_RangeHeightDiffMin = -3.0f;
-static float g_RangeHeightDiffMax = 3.0f;
+static float g_RangeHeightDiffMax = 12.0f;  // vanilla type-52 max is 5.0 — stay a superset
 static float g_RangeHorizDiffMin = -3.0f;
 static float g_RangeHorizDiffMax = 3.0f;
 static float g_RangeDistMin = 0.0f;
-static float g_RangeDistMax = 10.0f;
+static float g_RangeDistMax = 15.0f;        // vanilla type-52 max is 12.0 — stay a superset
 static float g_RangeCurveMax = 2.0f;
 static float g_RangeCurveMin = -4.0f;
 static float g_RangeExpectedCurveMin = -2.0f;
@@ -73,19 +150,108 @@ static bool IsTypeBeamSpecific(int t)
     return t == 10 || t == 12 || t == 60 || t == 100 || t == 101;
 }
 
+// ── Range widening (only-loosen semantics) ────────────────────────────────────
+static void WidenMin(float& cur, float req) { if (req < cur) cur = req; }
+static void WidenMax(float& cur, float req) { if (req > cur) cur = req; }
+
+static void WidenType52Ranges(AvailableParkourAction& action)
+{
+    WidenMin(action.heightDifferenceMin, g_RangeHeightDiffMin);
+    WidenMax(action.heightDifferenceMax, g_RangeHeightDiffMax);
+    WidenMin(action.horizontalDifferenceMin, g_RangeHorizDiffMin);
+    WidenMax(action.horizontalDifferenceMax, g_RangeHorizDiffMax);
+    WidenMin(action.distanceMin, g_RangeDistMin);
+    WidenMax(action.distanceMax, g_RangeDistMax);
+    WidenMax(action.curveAllowedRangeMax, g_RangeCurveMax);
+    WidenMin(action.curveAllowedRangeMin, g_RangeCurveMin);
+    WidenMin(action.expectedCurveRangeMin, g_RangeExpectedCurveMin);
+}
+
+// ── Hook 2 callback: inside the type-52 range-setter ──────────────────────────
+// Site 0x1401AF3B6 (10 bytes: `MOV dword ptr [RCX+0x1F8], 0x3D4CCCCD`) is on the
+// convergence path of all ParkourMode branches of 0x1401AF2E0. RCX still holds
+// the action there (it is never reassigned in that function). The stolen bytes
+// re-execute after the callback, then control resumes at 0x1401AF3C0.
+// 0x1401AF2E0 is referenced by exactly one fancy-table slot
+// (0x143A70C60 = 0x143A6FFD0 + 0x64*0x20 + 0x10), so this only ever sees type-52
+// actions.
+static void WhenType52RangesSet_Widen(AllRegisters* params)
+{
+    if (!g_ExpandRanges) return;
+    auto* action = (AvailableParkourAction*)params->rcx_;
+    if (!action) return;
+    WidenType52Ranges(*action);
+    g_WidenCount++;
+}
+
+// ── Hook 3 callback: force the per-type fit-test verdict for type 52 ──────────
+// Site 0x1401B499E = `TEST AL,AL / JZ <reject>` right after the per-type test
+// (fancy 0x4A) returned. RBX still holds the action (callee-saved, set at
+// 0x1401B4940). Forcing AL=1 makes the re-executed stolen bytes take the accept
+// path (CalculateFitness + fancy 0x63), and the creation wrapper keeps the
+// action. Non-type-52 actions are untouched.
+static void WhenType52FitTestDecided_Override(AllRegisters* params)
+{
+    if (!g_SkipFitTest) return;
+    __try
+    {
+        auto* action = (AvailableParkourAction*)params->rbx_;
+        if (!action || !action->fancyVTable) return;
+        if ((uint64)action->fancyVTable != k_Type52FancyVTable_Runtime
+            && (uint64)action->fancyVTable != k_Type52FancyVTable_TransientBase)
+            return;
+        params->GetRAX() = (params->GetRAX() & ~0xFFull) | 1ull;
+        g_FitOverrideCount++;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ── Hook 4 callbacks: cycle-start tester vtable swap (optional) ───────────────
+static void SwapClimbFacadeTesterVTable(uint64 climbFacadeTester)
+{
+    if (!climbFacadeTester) return;
+    *(uint64*)(climbFacadeTester + 8) = g_SwapTesterVTables
+        ? k_ClimbFacadeTesterFancyVTable_Baseclass
+        : k_ClimbFacadeTesterFancyVTable_Default;
+}
+
+static void WhenStartingWallingCycle_SwapFVTables(AllRegisters* params)
+{
+    if (!g_SwapTesterVTables) return;
+    __try
+    {
+        WhileOnWallSystem* hsWalling = (WhileOnWallSystem*)params->rbx_;
+        SwapClimbFacadeTesterVTable((uint64)hsWalling->climbFacade);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void WhenStartingFailedWallrunCycle_SwapFVTables(AllRegisters* params)
+{
+    if (!g_SwapTesterVTables) return;
+    __try
+    {
+        uint64 hsFailedWallrun = params->rsi_;
+        uint64 climbFacadeTester = *(uint64*)(hsFailedWallrun + 0x1D0);
+        SwapClimbFacadeTesterVTable(climbFacadeTester);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ── Hook 1 callback: create the failed wallrun action during facade scans ─────
 static void DuringClimbFacadeScan_CreateFailedWallrun(AllRegisters* params)
 {
     if (!g_ShouldCreateFailedWallrun) return;
 
-    // --- Count existing actions by type ---
+    // --- Count existing actions by type (null-safe!) ---
     auto& existingActions = *(SmallArray<ParkourAction_Commonbase*>*)params->rbx_;
     int action52Count = 0;
     int beamTypeCount = 0;
     for (int i = 0; i < existingActions.size; ++i)
     {
         if (!existingActions[i]) continue;
-        int t = (int)existingActions[i]->GetEnumParkourAction();
-        if (t == 52) action52Count++;
+        int t = GetTypeIntSafe(existingActions[i]);
+        if (t == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb) action52Count++;
         else if (IsTypeBeamSpecific(t)) beamTypeCount++;
     }
 
@@ -110,23 +276,12 @@ static void DuringClimbFacadeScan_CreateFailedWallrun(AllRegisters* params)
 
     action52Count++;
 
-    // Expand allowed ranges so the injected action survives validation
-    newAction->heightDifferenceMin = g_RangeHeightDiffMin;
-    newAction->heightDifferenceMax = g_RangeHeightDiffMax;
-    newAction->horizontalDifferenceMin = g_RangeHorizDiffMin;
-    newAction->horizontalDifferenceMax = g_RangeHorizDiffMax;
-    newAction->distanceMin = g_RangeDistMin;
-    newAction->distanceMax = g_RangeDistMax;
-    newAction->curveAllowedRangeMax = g_RangeCurveMax;
-    newAction->curveAllowedRangeMin = g_RangeCurveMin;
-    newAction->expectedCurveRangeMin = g_RangeExpectedCurveMin;
+    // Expand allowed ranges (belt & braces — the widener hook already widened
+    // them inside InitialTestIfActionFits when it was active).
+    WidenType52Ranges(*newAction);
 
     // Boost fitness so it wins the sort
     newAction->fitness = 9999.0f;
-
-    // Capture fancyVTable for optional vtable swap on beams
-    if (g_Type52FancyVTable == 0)
-        g_Type52FancyVTable = (uint64)newAction->fancyVTable;
 
     // Adjust destination height and expected speed for the lift animation
     {
@@ -151,10 +306,10 @@ static void DuringClimbFacadeScan_CreateFailedWallrun(AllRegisters* params)
     {
         AvailableParkourAction* action = existingActions[i];
         if (!action) continue;
-        int t = (int)action->GetEnumParkourAction();
+        int t = GetTypeIntSafe(action);
 
         // On walls: sabotage wall competitors so type 52 wins
-        if (action52Count > 0 && IsTypeCompetingOnWalls(t))
+        if (IsTypeCompetingOnWalls(t))
         {
             action->fitness = 0.0f;
             sabotagedCount++;
@@ -168,6 +323,8 @@ static void DuringClimbFacadeScan_CreateFailedWallrun(AllRegisters* params)
     g_SabotagedCount = sabotagedCount;
 }
 
+// ── Hook constructors ─────────────────────────────────────────────────────────
+
 GPH_FailedWallrunCreator::GPH_FailedWallrunCreator()
 {
     PresetScript_CCodeInTheMiddle(0x140135230, 12,
@@ -175,7 +332,31 @@ GPH_FailedWallrunCreator::GPH_FailedWallrunCreator()
         AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
 }
 
-uint64 FailedWallRunPlugin::s_Type52FancyVTable = 0;
+GPH_Type52RangeWidener::GPH_Type52RangeWidener()
+{
+    PresetScript_CCodeInTheMiddle(0x1401AF3B6, 10,
+        WhenType52RangesSet_Widen,
+        AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+}
+
+GPH_Type52FitTestOverride::GPH_Type52FitTestOverride()
+{
+    PresetScript_CCodeInTheMiddle(0x1401B499E, 4,
+        WhenType52FitTestDecided_Override,
+        AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+}
+
+GPH_CycleStartVTableSwap::GPH_CycleStartVTableSwap()
+{
+    PresetScript_CCodeInTheMiddle(0x141A4D7CB, 7,
+        WhenStartingWallingCycle_SwapFVTables,
+        AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+    PresetScript_CCodeInTheMiddle(0x141A1BA0C, 7,
+        WhenStartingFailedWallrunCycle_SwapFVTables,
+        AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+}
+
+// ── Settings persistence ──────────────────────────────────────────────────────
 
 static std::string GetIniPath()
 {
@@ -208,6 +389,10 @@ void FailedWallRunPlugin::LoadSettings()
             try { m_LiftSpeed = std::stof(line.substr(10)); } catch (...) {}
         else if (line.rfind("EnforceEnabled=", 0) == 0)
             m_EnforceEnabled = (line.substr(15) == "1");
+        else if (line.rfind("RangeWidenerEnabled=", 0) == 0)
+            m_RangeWidenerEnabled = (line.substr(20) == "1");
+        else if (line.rfind("SkipFitTest=", 0) == 0)
+            m_SkipFitTestEnabled = (line.substr(12) == "1");
         else if (line.rfind("VtableSwapEnabled=", 0) == 0)
             m_VtableSwapEnabled = (line.substr(18) == "1");
     }
@@ -227,6 +412,8 @@ void FailedWallRunPlugin::SaveSettings()
             file << "AnimationCancel=" << (m_CancelEnabled ? 1 : 0) << "\n";
             file << "LiftSpeed=" << m_LiftSpeed << "\n";
             file << "EnforceEnabled=" << (m_EnforceEnabled ? 1 : 0) << "\n";
+            file << "RangeWidenerEnabled=" << (m_RangeWidenerEnabled ? 1 : 0) << "\n";
+            file << "SkipFitTest=" << (m_SkipFitTestEnabled ? 1 : 0) << "\n";
             file << "VtableSwapEnabled=" << (m_VtableSwapEnabled ? 1 : 0) << "\n";
         }
     } catch (...) {}
@@ -248,16 +435,68 @@ bool FailedWallRunPlugin::IsFeatureActive() const
 
 FailedWallRunPlugin::FailedWallRunPlugin()
 {
+    m_Callbacks.ChooseBeforeFiltering_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions) -> AvailableParkourAction*
+    {
+        return static_cast<FailedWallRunPlugin*>(userData)->ChooseBeforeFiltering(actions);
+    };
+    m_Callbacks.ChooseAfterSorting_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame) -> AvailableParkourAction*
+    {
+        return static_cast<FailedWallRunPlugin*>(userData)->ChooseAfterSorting(actions, selectedByGame);
+    };
+    m_Callbacks.m_UserData = this;
+    m_Callbacks.m_CallbackPriority = 5.0f;
+    m_Callbacks.m_Name = "FailedWallRunPlugin";
 }
 
 FailedWallRunPlugin::~FailedWallRunPlugin()
 {
-    if (m_CreatorHookActive)
+    if (m_GphActive)
     {
-        m_FailedWallrunCreator.Deactivate();
-        m_CreatorHookActive = false;
+        GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
+        m_HookActivator.reset();
+        m_GphActive = false;
     }
+    if (m_CreatorHookActive) { m_FailedWallrunCreator.Deactivate(); m_CreatorHookActive = false; }
+    if (m_WidenerHookActive) { m_RangeWidener.Deactivate(); m_WidenerHookActive = false; }
+    if (m_FitTestHookActive) { m_FitTestOverride.Deactivate(); m_FitTestHookActive = false; }
+    if (m_VTableSwapHookActive) { m_VTableSwapHook.Deactivate(); m_VTableSwapHookActive = false; }
 }
+
+// ── Sort&select enforcement ───────────────────────────────────────────────────
+
+AvailableParkourAction* FailedWallRunPlugin::ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return nullptr;
+    for (int i = 0; i < (int)actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action) continue;
+        if (!IsType52Safe(action)) continue;
+        // Same pattern as the reverse-engineered forced-sidehop: floor the
+        // weight so the fitness filter can't discard it, then return the
+        // candidate as the chosen action (GPH honors the return value and
+        // force-selects it before filtering/sorting/final-filters).
+        if (fabsf(action->fitness) < 1.0f)
+            action->fitness = 9999.0f;
+        return action;
+    }
+    return nullptr;
+}
+
+AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return nullptr;
+    for (int i = 0; i < (int)actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action) continue;
+        if (IsType52Safe(action))
+            return action;
+    }
+    return nullptr;
+}
+
+// ── Per-frame update ──────────────────────────────────────────────────────────
 
 void FailedWallRunPlugin::OnUpdate()
 {
@@ -287,14 +526,16 @@ void FailedWallRunPlugin::OnUpdate()
         }
     }
 
-    // Sync globals for the static creation hook
+    // Sync globals for the static hooks
     bool shouldBeActive = IsFeatureActive() && m_EnforceEnabled;
     g_ShouldCreateFailedWallrun = shouldBeActive;
+    g_ExpandRanges = shouldBeActive && m_RangeWidenerEnabled;
+    g_SkipFitTest = shouldBeActive && m_SkipFitTestEnabled;
+    g_SwapTesterVTables = shouldBeActive && m_VtableSwapEnabled;
     g_LiftAmount = m_LiftAmount;
     g_LiftSpeed = m_LiftSpeed;
-    g_VtableSwapEnabled = m_VtableSwapEnabled;
 
-    // Activate/deactivate the creation hook
+    // Activate/deactivate the game-thread hooks
     if (shouldBeActive && !m_CreatorHookActive)
     {
         m_FailedWallrunCreator.Activate();
@@ -304,6 +545,54 @@ void FailedWallRunPlugin::OnUpdate()
     {
         m_FailedWallrunCreator.Deactivate();
         m_CreatorHookActive = false;
+    }
+
+    if (shouldBeActive && m_RangeWidenerEnabled && !m_WidenerHookActive)
+    {
+        m_RangeWidener.Activate();
+        m_WidenerHookActive = true;
+    }
+    else if ((!shouldBeActive || !m_RangeWidenerEnabled) && m_WidenerHookActive)
+    {
+        m_RangeWidener.Deactivate();
+        m_WidenerHookActive = false;
+    }
+
+    if (shouldBeActive && m_SkipFitTestEnabled && !m_FitTestHookActive)
+    {
+        m_FitTestOverride.Activate();
+        m_FitTestHookActive = true;
+    }
+    else if ((!shouldBeActive || !m_SkipFitTestEnabled) && m_FitTestHookActive)
+    {
+        m_FitTestOverride.Deactivate();
+        m_FitTestHookActive = false;
+    }
+
+    if (shouldBeActive && m_VtableSwapEnabled && !m_VTableSwapHookActive)
+    {
+        m_VTableSwapHook.Activate();
+        m_VTableSwapHookActive = true;
+    }
+    else if ((!shouldBeActive || !m_VtableSwapEnabled) && m_VTableSwapHookActive)
+    {
+        m_VTableSwapHook.Deactivate();
+        m_VTableSwapHookActive = false;
+    }
+
+    // Sort&select enforcement via GenericHooksInParkourFiltering
+    if (shouldBeActive && !m_GphActive)
+    {
+        auto gph = GenericHooksInParkourFiltering::GetSingleton();
+        gph->Subscribe(m_Callbacks);
+        m_HookActivator = gph->RequestGPHSortAndSelect();
+        m_GphActive = true;
+    }
+    else if (!shouldBeActive && m_GphActive)
+    {
+        GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
+        m_HookActivator.reset();
+        m_GphActive = false;
     }
 
     // Refresh debug stats from the globals
@@ -352,16 +641,13 @@ void FailedWallRunPlugin::OnImGuiRender()
     ImGui::Text("Failed Wall-Run Plugin");
     ImGui::Separator();
 
-    ImGui::TextWrapped("Two features in one plugin: (1) Force failed wallrun to enable side ejects, "
-                       "(2) Ezio-style animation cancel to interrupt any parkour action mid-animation.");
+    ImGui::TextWrapped("Forces the failed wallrun (wallrunUpFromGroundFailed_mb) on ANY wall, "
+                       "with or without handholds. Ranges are widened during creation and the "
+                       "wall-context fit test is overridden for type 52 while the key is held.");
     ImGui::Spacing();
 
-    // --- Section 1: Failed Wallrun ---
     if (ImGui::CollapsingHeader("Failed Wallrun Side-Eject", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::TextWrapped("Forces the failed wallrun animation, enabling side ejects "
-                           "during the animation. Works from ground, beams, and ropes.");
-
         bool enabled = m_PluginEnabled;
         if (ImGui::Checkbox("Enable Failed Wallrun", &enabled))
         {
@@ -397,7 +683,7 @@ void FailedWallRunPlugin::OnImGuiRender()
                 m_WaitingForKey = !m_WaitingForKey;
 
             ImGui::Separator();
-            ImGui::TextColored(debugColor, "Tuning (textboxes accept manual input + Enter):");
+            ImGui::TextColored(debugColor, "Patches (all 1.5.0 dump-verified):");
 
             bool enforce = m_EnforceEnabled;
             if (ImGui::Checkbox("Enforce failed wallrun", &enforce))
@@ -409,6 +695,39 @@ void FailedWallRunPlugin::OnImGuiRender()
             if (m_EnforceEnabled)
             {
                 ImGui::Indent();
+
+                bool widener = m_RangeWidenerEnabled;
+                if (ImGui::Checkbox("Widen acceptance ranges (during creation)", &widener))
+                {
+                    m_RangeWidenerEnabled = widener;
+                    SaveSettings();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Hooks the type-52 SetExpectedDistanceRangesAccordingToParkourMode\n"
+                                      "(0x1401AF2E0) so the widened ranges are in place BEFORE the\n"
+                                      "fit test runs. Only ever loosens vanilla ranges.");
+
+                bool skipFit = m_SkipFitTestEnabled;
+                if (ImGui::Checkbox("Override wall-context fit test", &skipFit))
+                {
+                    m_SkipFitTestEnabled = skipFit;
+                    SaveSettings();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Forces the per-type fit-test verdict (fancy 0x4A ->\n"
+                                      "0x1401B5700 quick-check chain) to 'fits' for type-52 actions\n"
+                                      "only. This is what makes the move work on walls WITH handholds.");
+
+                bool vtableSwap = m_VtableSwapEnabled;
+                if (ImGui::Checkbox("Cycle-start tester vtable swap (experimental)", &vtableSwap))
+                {
+                    m_VtableSwapEnabled = vtableSwap;
+                    SaveSettings();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("ACUFixes/ACU_ParkourPatches pattern: swap the climbFacadeTester\n"
+                                      "fancy vtable at walling/failed-wallrun cycle start while the key\n"
+                                      "is held, so more move types get scanned on walls.");
 
                 ImGui::Text("Lift height:");
                 ImGui::SameLine();
@@ -434,29 +753,23 @@ void FailedWallRunPlugin::OnImGuiRender()
                     SaveSettings();
                 }
 
-                bool vtableSwap = m_VtableSwapEnabled;
-                if (ImGui::Checkbox("Vtable swap (experimental, crash risk)", &vtableSwap))
-                {
-                    m_VtableSwapEnabled = vtableSwap;
-                    SaveSettings();
-                }
-
                 ImGui::Unindent();
             }
 
             if (isActive)
             {
                 ImGui::Separator();
-                ImGui::TextColored(debugColor, "Stats:");
-                ImGui::Text("  Action 52 found: %d | Sabotaged: %d",
+                ImGui::TextColored(debugColor, "Stats (last scan cycle):");
+                ImGui::Text("  Type-52 in list: %d | Sabotaged competitors: %d",
                     m_LastAction52Count,
                     m_LastSabotagedCount);
-                ImGui::Text("  Lift height: %.1fm | Speed: %.1f",
-                    m_LiftAmount,
-                    m_LiftSpeed);
-
-                if (g_Type52FancyVTable == 0)
-                    ImGui::TextColored(ImVec4(1,1,0,1), "  (capturing type 52 vtable... approach a wall)");
+                ImGui::Text("  Range widenings: %d | Fit-test overrides: %d",
+                    g_WidenCount, g_FitOverrideCount);
+                ImGui::Text("  Hooks: creation %s | widener %s | fit-override %s | vtable-swap %s",
+                    m_CreatorHookActive ? "ON" : "off",
+                    m_WidenerHookActive ? "ON" : "off",
+                    m_FitTestHookActive ? "ON" : "off",
+                    m_VTableSwapHookActive ? "ON" : "off");
             }
 
             ImGui::Unindent();
@@ -469,13 +782,7 @@ void FailedWallRunPlugin::OnImGuiRender()
     {
         ImGui::TextWrapped(
             "Instantly cancels any parkour animation mid-motion when you press Space, "
-            "letting you chain into a new action immediately. "
-            "This replicates the responsive parkour feel from Assassin's Creed 2 / Brotherhood / Revelations.");
-        ImGui::Spacing();
-        ImGui::TextWrapped(
-            "How to use: While Arno is in a parkour animation (wallrun, vault, side-eject, etc.), "
-            "press Space to cancel. The animation will instantly blend to idle, "
-            "and you can immediately press a new direction for the next parkour action.");
+            "letting you chain into a new action immediately.");
         ImGui::Spacing();
 
         bool cancelEnabled = m_CancelEnabled;

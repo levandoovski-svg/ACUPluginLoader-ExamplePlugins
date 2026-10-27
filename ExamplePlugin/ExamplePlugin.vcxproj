@@ -208,7 +208,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     <ClCompile Include="src\ExactPositionTeleportPlugin.cpp" />
     <ClCompile Include="src\ForcedSidehopPlugin.cpp" />
     <ClCompile Include="src\FreeJumpPlugin.cpp" />
-    <ClCompile Include="..\GenericHooksInParkourFiltering.cpp" />
+    <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
     <ClCompile Include="src\ParryAssassinPlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">

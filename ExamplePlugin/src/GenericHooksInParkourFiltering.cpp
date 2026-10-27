@@ -85,8 +85,16 @@ static bool CreateParkourAction_B_Replacement(
 
 GPH_Creation::GPH_Creation()
 {
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D1260, CreateParkourAction_A_Replacement);
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D13C0, CreateParkourAction_B_Replacement);
+    // DISABLED for the 1.5.0 Steam build (runtime dump 62734b81…, base 0x140000000).
+    // In that binary 0x1401D1260 and 0x1401D13C0 are NOT function starts — they sit
+    // mid-function inside the parkour action factory (one function spanning
+    // 0x1401CC990..0x1401D1ADA, Denuvo-split; the per-type cases live between them).
+    // ReplaceFunctionAtItsStart there would corrupt the factory and crash.
+    // The 1.5.0 equivalent of 0.9.3's creation wrapper is 0x1401D1CF0
+    // (CreateParkourActionForParkourPointIfFits, already used by FailedWallRunPlugin).
+    // Re-enable only after re-verifying the addresses against the running build.
+    // PresetScript_ReplaceFunctionAtItsStart(0x1401D1260, CreateParkourAction_A_Replacement);
+    // PresetScript_ReplaceFunctionAtItsStart(0x1401D13C0, CreateParkourAction_B_Replacement);
 }
 
 static void SortAndSelectHookCallback(AllRegisters* params)
