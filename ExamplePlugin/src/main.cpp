@@ -1,5 +1,5 @@
 #include "pch.h"
-#include "ExactPositionTeleportPlugin.h"
+#include "ForcedSidehopPlugin.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
 class ExamplePlugin : public ACUPluginInterfaceVirtuals
@@ -7,16 +7,13 @@ class ExamplePlugin : public ACUPluginInterfaceVirtuals
 public:
     virtual void EveryFrameWhenMenuIsOpen() override
     {
-        // Keep the ExactPositionTeleport plugin active while the loader menu is
-        // open. Its rising-edge guard makes duplicate calls from the
-        // closed-menu path safe.
-        g_exactPositionTeleport.OnUpdate();
-        g_exactPositionTeleport.OnImGuiRender();
+        g_forcedSidehop.OnUpdate();
+        g_forcedSidehop.OnImGuiRender();
     }
 
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        g_exactPositionTeleport.OnUpdate();
+        g_forcedSidehop.OnUpdate();
     }
 
     virtual uint64 GetThisPluginVersion() override
@@ -30,9 +27,9 @@ public:
 
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
-        g_exactPositionTeleport.Init();
+        g_forcedSidehop.Init();
         return true;
     }
 
-    ExactPositionTeleportPlugin g_exactPositionTeleport;
+    ForcedSidehopPlugin g_forcedSidehop;
 } g_thisPlugin;

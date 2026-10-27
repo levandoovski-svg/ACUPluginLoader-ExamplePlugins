@@ -203,8 +203,9 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <!-- Keep this DLL limited to the ExactPositionTeleport plugin. -->
-    <ClCompile Include="src\ExactPositionTeleportPlugin.cpp" />
+    <!-- Keep this DLL limited to the ForcedSidehop gameplay plugin. -->
+    <ClCompile Include="src\ForcedSidehopPlugin.cpp" />
+    <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -214,7 +215,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\ExactPositionTeleportPlugin.h" />
+    <ClInclude Include="src\ForcedSidehopPlugin.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>
