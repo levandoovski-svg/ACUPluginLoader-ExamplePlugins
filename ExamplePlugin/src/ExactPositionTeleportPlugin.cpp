@@ -1258,9 +1258,7 @@ void ExactPositionTeleportPlugin::ServiceShiftNegation()
 
 void ExactPositionTeleportPlugin::OnImGuiRender()
 {
-    ImGui::Begin("Exact Position Teleport");
-
-    // Minimal player-facing view: the two main toggles, binding, action.
+    // Minimal player-facing view: the two main toggles and key binding.
     if (ImGui::Checkbox("Enable CatchLedge", &m_PluginEnabled))
     {
         SaveSettings();
@@ -1279,7 +1277,7 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show the collapsible debug / parameters section.");
 
-    ImGui::Text("Force-freefall / teleport key: 0x%02X", m_ForceKey);
+    ImGui::Text("Catch ledge keybind: 0x%02X", m_ForceKey);
     if (m_ForceKey >= 0x20 && m_ForceKey <= 0x7E)
     {
         ImGui::SameLine();
@@ -1312,15 +1310,6 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f),
             "Press any keyboard key or mouse button to bind it...");
     }
-
-    if (ImGui::Button(m_BreakfallAfterTeleport && !m_SafeInjectionOnly
-        ? "Force freefall + Breakfall now"
-        : "Force freefall now"))
-    {
-        BeginForceFreefall();
-    }
-
-    ImGui::TextWrapped("Last result: %s", m_LastStatus.c_str());
 
     // Collapsible debug section: all parameters, sliders, gates, diagnostics.
     if (m_ShowDebugUi && ImGui::TreeNodeEx("Debug / parameters", ImGuiTreeNodeFlags_DefaultOpen))
@@ -1515,8 +1504,6 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
 
     ImGui::TreePop(); // close "Debug / parameters"
     } // end debug section
-
-    ImGui::End();
 }
 
 void ExactPositionTeleportPlugin::LoadSettings()
