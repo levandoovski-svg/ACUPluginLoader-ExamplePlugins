@@ -421,6 +421,8 @@ void FailedWallRunPlugin::LoadSettings()
             m_SkipFitTestEnabled = (line.substr(12) == "1");
         else if (line.rfind("VtableSwapEnabled=", 0) == 0)
             m_VtableSwapEnabled = (line.substr(18) == "1");
+        else if (line.rfind("SingleStageMode=", 0) == 0)
+            m_SingleStageMode = (line.substr(18) == "1");
     }
 }
 
@@ -441,6 +443,7 @@ void FailedWallRunPlugin::SaveSettings()
             file << "RangeWidenerEnabled=" << (m_RangeWidenerEnabled ? 1 : 0) << "\n";
             file << "SkipFitTest=" << (m_SkipFitTestEnabled ? 1 : 0) << "\n";
             file << "VtableSwapEnabled=" << (m_VtableSwapEnabled ? 1 : 0) << "\n";
+            file << "SingleStageMode=" << (m_SingleStageMode ? 1 : 0) << "\n";
         }
     } catch (...) {}
 }
@@ -492,6 +495,8 @@ FailedWallRunPlugin::~FailedWallRunPlugin()
 
 AvailableParkourAction* FailedWallRunPlugin::ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions)
 {
+    if (m_SingleStageMode) return nullptr;
+
     if (!IsFeatureActive() || !m_EnforceEnabled) return nullptr;
     for (int i = 0; i < (int)actions.size; ++i)
     {
@@ -511,7 +516,9 @@ AvailableParkourAction* FailedWallRunPlugin::ChooseBeforeFiltering(SmallArray<Av
 
 AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
 {
-    if (!IsFeatureActive() || !m_EnforceEnabled) return nullptr;
+    if (m_SingleStageMode) return selectedByGame;
+
+    if (!IsFeatureActive() || !m_EnforceEnabled) return selectedByGame;
     for (int i = 0; i < (int)actions.size; ++i)
     {
         AvailableParkourAction* action = actions[i];
@@ -552,69 +559,109 @@ void FailedWallRunPlugin::OnUpdate()
         }
     }
 
-    // Sync globals for the static hooks
+    // -- Single-stage mode (exact ForcedSidehop-style): disable all extra
+    // hooks (creation, widener, fit-override, cycle-swap) and only use GPH.
+    bool singleStage = m_SingleStageMode;
     bool shouldBeActive = IsFeatureActive() && m_EnforceEnabled;
-    g_ShouldCreateFailedWallrun = shouldBeActive;
-    g_ExpandRanges = shouldBeActive && m_RangeWidenerEnabled;
-    g_SkipFitTest = shouldBeActive && m_SkipFitTestEnabled;
-    g_SwapTesterVTables = shouldBeActive && m_VtableSwapEnabled;
+    if (singleStage)
+    {
+        // Force only GPH-based behavior; disable all injection layers.
+        g_ShouldCreateFailedWallrun = false;
+        g_ExpandRanges = false;
+        g_SkipFitTest = false;
+        g_SwapTesterVTables = false;
+    }
+    else
+    {
+        g_ShouldCreateFailedWallrun = shouldBeActive;
+        g_ExpandRanges = shouldBeActive && m_RangeWidenerEnabled;
+        g_SkipFitTest = shouldBeActive && m_SkipFitTestEnabled;
+        g_SwapTesterVTables = shouldBeActive && m_VtableSwapEnabled;
+    }
     g_LiftAmount = m_LiftAmount;
     g_LiftSpeed = m_LiftSpeed;
 
-    // Activate/deactivate the game-thread hooks
-    if (shouldBeActive && !m_CreatorHookActive)
-    {
-        m_FailedWallrunCreator.Activate();
-        m_CreatorHookActive = true;
-    }
-    else if (!shouldBeActive && m_CreatorHookActive)
+    // Deactivate any extra-layer hooks when in single-stage mode
+    if (singleStage && m_CreatorHookActive)
     {
         m_FailedWallrunCreator.Deactivate();
         m_CreatorHookActive = false;
+    } else if (!m_SingleStageMode) {
+        if (shouldBeActive && !m_CreatorHookActive)
+        {
+            m_FailedWallrunCreator.Activate();
+            m_CreatorHookActive = true;
+        }
+        else if (!shouldBeActive && m_CreatorHookActive)
+        {
+            m_FailedWallrunCreator.Deactivate();
+            m_CreatorHookActive = false;
+        }
     }
 
-    if (shouldBeActive && m_RangeWidenerEnabled && !m_WidenerHookActive)
-    {
-        m_RangeWidener.Activate();
-        m_WidenerHookActive = true;
-    }
-    else if ((!shouldBeActive || !m_RangeWidenerEnabled) && m_WidenerHookActive)
+    if (singleStage && m_WidenerHookActive)
     {
         m_RangeWidener.Deactivate();
         m_WidenerHookActive = false;
+    } else if (!m_SingleStageMode) {
+        if (shouldBeActive && m_RangeWidenerEnabled && !m_WidenerHookActive)
+        {
+            m_RangeWidener.Activate();
+            m_WidenerHookActive = true;
+        }
+        else if ((!shouldBeActive || !m_RangeWidenerEnabled) && m_WidenerHookActive)
+        {
+            m_RangeWidener.Deactivate();
+            m_WidenerHookActive = false;
+        }
     }
 
-    if (shouldBeActive && m_SkipFitTestEnabled && !m_FitTestHookActive)
-    {
-        if (SwapType52FitTestFn(true))
-            m_FitTestHookActive = true;
-    }
-    else if ((!shouldBeActive || !m_SkipFitTestEnabled) && m_FitTestHookActive)
+    if (singleStage && m_FitTestHookActive)
     {
         SwapType52FitTestFn(false);
         m_FitTestHookActive = false;
+    } else if (!m_SingleStageMode) {
+        if (shouldBeActive && m_SkipFitTestEnabled && !m_FitTestHookActive)
+        {
+            if (SwapType52FitTestFn(true))
+                m_FitTestHookActive = true;
+        }
+        else if ((!shouldBeActive || !m_SkipFitTestEnabled) && m_FitTestHookActive)
+        {
+            SwapType52FitTestFn(false);
+            m_FitTestHookActive = false;
+        }
     }
 
-    if (shouldBeActive && m_VtableSwapEnabled && !m_VTableSwapHookActive)
-    {
-        m_VTableSwapHook.Activate();
-        m_VTableSwapHookActive = true;
-    }
-    else if ((!shouldBeActive || !m_VtableSwapEnabled) && m_VTableSwapHookActive)
+    if (singleStage && m_VTableSwapHookActive)
     {
         m_VTableSwapHook.Deactivate();
         m_VTableSwapHookActive = false;
+    } else if (!m_SingleStageMode) {
+        if (shouldBeActive && m_VtableSwapEnabled && !m_VTableSwapHookActive)
+        {
+            m_VTableSwapHook.Activate();
+            m_VTableSwapHookActive = true;
+        }
+        else if ((!shouldBeActive || !m_VtableSwapEnabled) && m_VTableSwapHookActive)
+        {
+            m_VTableSwapHook.Deactivate();
+            m_VTableSwapHookActive = false;
+        }
     }
 
     // Sort&select enforcement via GenericHooksInParkourFiltering
-    if (shouldBeActive && !m_GphActive)
+    // In single-stage mode we disable the GPH callbacks that enforce type-52
+    // and instead rely ONLY on the ForcedSidehop-style rewrite approach.
+    bool useGphEnforce = !m_SingleStageMode;
+    if (useGphEnforce && shouldBeActive && !m_GphActive)
     {
         auto gph = GenericHooksInParkourFiltering::GetSingleton();
         gph->Subscribe(m_Callbacks);
         m_HookActivator = gph->RequestGPHSortAndSelect();
         m_GphActive = true;
     }
-    else if (!shouldBeActive && m_GphActive)
+    else if (!m_SingleStageMode && !shouldBeActive && m_GphActive)
     {
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
         m_HookActivator.reset();
@@ -744,6 +791,15 @@ void FailedWallRunPlugin::OnImGuiRender()
                                       "0x1401B5700 quick-check chain) to 'fits' for type-52 actions\n"
                                       "only. This is what makes the move work on walls WITH handholds.");
 
+                bool singleStageChk = m_SingleStageMode;
+                if (ImGui::Checkbox("Single-stage mode (ForcedSidehop-style)", &singleStageChk))
+                {
+                    m_SingleStageMode = singleStageChk;
+                    SaveSettings();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("When enabled: disables all injection hooks (creation, widener, fit-override, cycle-swap) and uses only GPH like ForcedSidehopPlugin.");
+
                 bool vtableSwap = m_VtableSwapEnabled;
                 if (ImGui::Checkbox("Cycle-start tester vtable swap (experimental)", &vtableSwap))
                 {
@@ -825,6 +881,8 @@ void FailedWallRunPlugin::OnImGuiRender()
             ImGui::TextColored(debugColor, "Status:");
             ImGui::Text("  In Parkour State: %s", IsInParkourState() ? "YES" : "NO");
             ImGui::Text("  Cancel Key: Space");
+            ImGui::TextColored(m_SingleStageMode ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f) : ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                             "  Mode: %s", m_SingleStageMode ? "SINGLE-STAGE (ForcedSidehop-style)" : "FULL (creation + injection)");
             ImGui::Unindent();
         }
     }

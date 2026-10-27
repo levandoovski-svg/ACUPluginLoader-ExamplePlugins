@@ -30,7 +30,7 @@ DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcal
 
 namespace
 {
-    constexpr int kMaxOverrideCount = 64;
+    constexpr int kMaxOverrideCount = 4096;
 
     std::string_view Trim(std::string_view text)
     {
@@ -160,7 +160,7 @@ namespace
             actionTypes.push_back(actionType);
         }
         if (actionTypes.empty())
-            return false;
+            actionTypes.push_back(50); // Legacy files used the default type for an empty field.
 
         float fitnessMultiplier = 0.0f;
         bool removeOtherActions = false;
@@ -242,6 +242,7 @@ void FreeJumpPlugin::LoadSettings()
 
     std::vector<ParkourActionOverride> loadedOverrides;
     bool hasOverrideCount = false;
+    bool hasOverrideData = false;
     std::string line;
     while (std::getline(file, line))
     {
@@ -277,30 +278,38 @@ void FreeJumpPlugin::LoadSettings()
             int count = 0;
             if (TryParseInteger(value, 10, count) && count >= 0 && count <= kMaxOverrideCount)
             {
-                loadedOverrides.assign(count, ParkourActionOverride{});
+                if (!hasOverrideData)
+                    loadedOverrides.assign(count, ParkourActionOverride{});
+                else if (loadedOverrides.size() < static_cast<size_t>(count))
+                    loadedOverrides.resize(count);
                 hasOverrideCount = true;
+                hasOverrideData = true;
             }
             else
             {
-                loadedOverrides.clear();
+                // Preserve any valid Override records already read instead of
+                // turning a malformed count into an empty configuration.
                 hasOverrideCount = false;
             }
         }
-        else if (TryGetValue(trimmedLine, "Override=", value) && hasOverrideCount)
+        else if (TryGetValue(trimmedLine, "Override=", value))
         {
             int index = 0;
             ParkourActionOverride parsedOverride;
             if (!TryParseOverride(value, index, parsedOverride)
                 || index < 0
-                || index >= static_cast<int>(loadedOverrides.size()))
+                || index >= kMaxOverrideCount)
             {
                 continue;
             }
+            if (loadedOverrides.size() <= static_cast<size_t>(index))
+                loadedOverrides.resize(static_cast<size_t>(index) + 1);
             loadedOverrides[static_cast<size_t>(index)] = std::move(parsedOverride);
+            hasOverrideData = true;
         }
     }
 
-    if (hasOverrideCount)
+    if (hasOverrideCount || hasOverrideData)
         m_Overrides = std::move(loadedOverrides);
 }
 
@@ -476,9 +485,23 @@ bool FreeJumpPlugin::WasKeyPressed(int vkCode) const
     return IsValidVirtualKey(vkCode) && m_KeyPressedThisFrame[vkCode];
 }
 
+bool FreeJumpPlugin::IsSortAndSelectSiteAlreadyPatched() const
+{
+    // ACUFixes-0.9.3 and ACU_ParkourPatches replace the sort/select function
+    // at this exact address. A second replacement would restore the other
+    // plugin's bytes when either DLL unloads, leaving a dangling or vanilla
+    // function under an active hook.
+    constexpr uintptr_t kSortAndSelectSite = 0x140133B00;
+    const uint16_t firstBytes = *reinterpret_cast<const uint16_t*>(kSortAndSelectSite);
+    return (firstBytes & 0x00FF) == 0x00E9  // near JMP rel32
+        || firstBytes == 0x25FF              // JMP qword ptr [RIP+disp32]
+        || firstBytes == 0xB848;             // MOVABS RAX, imm64 patch prologue
+}
+
 void FreeJumpPlugin::OnUpdate()
 {
     m_KeyStateUpdatedThisFrame.fill(false);
+    m_JustCapturedKey = 0;
 
     UpdateKeyState(m_ToggleKey);
     UpdateKeyState(m_SnapDirectionKey);
@@ -513,6 +536,7 @@ void FreeJumpPlugin::OnUpdate()
     {
         if (captureKey(m_ToggleKey))
         {
+            m_JustCapturedKey = m_ToggleKey;
             m_WaitingForKey = false;
             SaveSettings();
         }
@@ -521,6 +545,7 @@ void FreeJumpPlugin::OnUpdate()
     {
         if (captureKey(m_SnapDirectionKey))
         {
+            m_JustCapturedKey = m_SnapDirectionKey;
             m_WaitingForSnapKey = false;
             SaveSettings();
         }
@@ -533,6 +558,7 @@ void FreeJumpPlugin::OnUpdate()
                 continue;
             if (captureKey(override.keyCode))
             {
+                m_JustCapturedKey = override.keyCode;
                 override.waitingForKey = false;
                 SaveSettings();
             }
@@ -540,7 +566,7 @@ void FreeJumpPlugin::OnUpdate()
         }
     }
 
-    if (WasKeyPressed(m_SnapDirectionKey))
+    if (WasKeyPressed(m_SnapDirectionKey) && m_SnapDirectionKey != m_JustCapturedKey)
     {
         m_SnapDirectionMode = !m_SnapDirectionMode;
         SaveSettings();
@@ -550,7 +576,7 @@ void FreeJumpPlugin::OnUpdate()
     {
         if (!override.enable || !override.toggleMode)
             continue;
-        if (WasKeyPressed(override.keyCode))
+        if (WasKeyPressed(override.keyCode) && override.keyCode != m_JustCapturedKey)
         {
             override.toggleState = !override.toggleState;
             SaveSettings();
@@ -563,14 +589,17 @@ void FreeJumpPlugin::OnUpdate()
             m_LastMouseLockEnabled = m_MouseLockEnabled;
     }
 
-    const bool freeJumpHeld = (GetAsyncKeyState(m_ToggleKey) & 0x8000) != 0;
+    const bool freeJumpHeld = m_ToggleKey != m_JustCapturedKey
+        && (GetAsyncKeyState(m_ToggleKey) & 0x8000) != 0;
     bool anyOverrideActive = false;
     for (const ParkourActionOverride& override : m_Overrides)
     {
+        const bool overrideKeyHeld = override.keyCode != m_JustCapturedKey
+            && (GetAsyncKeyState(override.keyCode) & 0x8000) != 0;
         if (override.enable
             && (override.toggleMode
                 ? override.toggleState
-                : (GetAsyncKeyState(override.keyCode) & 0x8000) != 0))
+                : overrideKeyHeld))
         {
             anyOverrideActive = true;
         }
@@ -579,10 +608,20 @@ void FreeJumpPlugin::OnUpdate()
 
     if (needHook && !m_HookActive)
     {
-        auto gph = GenericHooksInParkourFiltering::GetSingleton();
-        gph->Subscribe(m_Callbacks);
-        m_HookActivator = gph->RequestGPHSortAndSelect();
-        m_HookActive = true;
+        if (IsSortAndSelectSiteAlreadyPatched())
+        {
+            // Refuse a second full-function replacement. The UI reports this
+            // state so the user can disable the conflicting parkour plugin.
+            m_HookRefused = true;
+        }
+        else
+        {
+            m_HookRefused = false;
+            auto gph = GenericHooksInParkourFiltering::GetSingleton();
+            gph->Subscribe(m_Callbacks);
+            m_HookActivator = gph->RequestGPHSortAndSelect();
+            m_HookActive = true;
+        }
     }
     else if (!needHook && m_HookActive)
     {
@@ -602,6 +641,13 @@ void FreeJumpPlugin::OnImGuiRender()
     const ImVec4 rebindColor(0.90f, 0.90f, 0.20f, 1.00f);
 
     ImGui::Text("FreeJumpPlugin");
+    if (m_HookRefused)
+    {
+        ImGui::TextWrapped(
+            "Parkour sort/select (0x140133B00) is already patched by another plugin. "
+            "FreeJump hook was not installed. Disable/remove the conflicting parkour "
+            "plugin (for example ACU_ParkourPatches.dll) before testing these features.");
+    }
     if (ImGui::CollapsingHeader("Basic Features", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Text("Free Jump:");

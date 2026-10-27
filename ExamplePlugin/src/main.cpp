@@ -1,5 +1,4 @@
 #include "pch.h"
-#include "FailedWallRunPlugin.h"
 #include "FreeJumpPlugin.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
@@ -8,14 +7,11 @@ class ExamplePlugin : public ACUPluginInterfaceVirtuals
 public:
     virtual void EveryFrameWhenMenuIsOpen() override
     {
-        g_failedWallRun.OnUpdate();
-        g_failedWallRun.OnImGuiRender();
         g_freeJump.OnImGuiRender();
     }
 
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
-        g_failedWallRun.OnUpdate();
         g_freeJump.OnUpdate();
     }
 
@@ -30,11 +26,9 @@ public:
 
     virtual bool InitStage_WhenCodePatchesAreSafeToApply(ACUPluginLoaderInterface& pluginLoader) override
     {
-        g_failedWallRun.LoadSettings();
         g_freeJump.OnBeforeActivate();
         return true;
     }
 
-    FailedWallRunPlugin g_failedWallRun;
     FreeJumpPlugin g_freeJump;
 } g_thisPlugin;

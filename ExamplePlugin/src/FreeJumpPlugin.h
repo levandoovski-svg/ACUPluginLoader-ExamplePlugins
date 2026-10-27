@@ -42,6 +42,7 @@ private:
     void UpdateKeyState(int vkCode);
     void UpdateAllKeyStates();
     bool WasKeyPressed(int vkCode) const;
+    bool IsSortAndSelectSiteAlreadyPatched() const;
 
     void LoadSettings();
     void SaveSettings();
@@ -50,6 +51,7 @@ private:
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_HookActivator;
     bool m_HookActive = false;
+    bool m_HookRefused = false;
 
     // Basic features
     int  m_ToggleKey         = VK_XBUTTON1;
@@ -65,6 +67,7 @@ private:
     std::array<bool, 256> m_PreviousKeyDown{};
     std::array<bool, 256> m_KeyPressedThisFrame{};
     std::array<bool, 256> m_KeyStateUpdatedThisFrame{};
+    int m_JustCapturedKey = 0;
 
     // Overrides
     std::vector<ParkourActionOverride> m_Overrides;

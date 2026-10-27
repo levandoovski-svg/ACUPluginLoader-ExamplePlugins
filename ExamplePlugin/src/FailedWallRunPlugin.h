@@ -121,6 +121,11 @@ private:
 
     bool m_CancelEnabled = false;
 
+    // Toggleable single-stage mode that makes this plugin work EXACTLY like
+    // ForcedSidehopPlugin (rewrites existing array candidate, skips creation/
+    // range-widener/fit-override/vtable hooks). Set via checkbox in UI.
+    bool m_SingleStageMode = false;
+
     // Debug stats (written from the game thread, read by the UI).
     int m_LastAction52Count = 0;
     int m_LastSabotagedCount = 0;
