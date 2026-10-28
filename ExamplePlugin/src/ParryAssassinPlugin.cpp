@@ -173,7 +173,6 @@ static bool HighlightCueShouldApply(const void* fxSharedBlock)
 // window; the original vector is retained per-thread so non-target FX can keep it.
 static void OnHighlightCandidateColor(AllRegisters* params)
 {
-    InterlockedIncrement64(&g_HighlightCandidateHookHits);
     const uintptr_t owner = static_cast<uintptr_t>(params->rbx_);
     const uintptr_t fxSlot = owner + 0x4C0;
     const bool cueActive = g_HighlightCueEnabled && g_ParryAssaultEnabled;

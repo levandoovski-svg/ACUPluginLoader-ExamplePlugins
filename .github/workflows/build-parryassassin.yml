@@ -1,0 +1,47 @@
+name: Build ParryAssassinPlugin
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - "ExamplePlugin/src/ParryAssassinPlugin.cpp"
+      - "ExamplePlugin/src/ParryAssassinPlugin.h"
+      - "ExamplePlugin/src/AllowSmokeAssassinatePlugin.cpp"
+      - "ExamplePlugin/src/AllowSmokeAssassinatePlugin.h"
+      - "ExamplePlugin/src/main.parryassassin.cpp"
+      - "ExamplePlugin/src/pch.cpp"
+      - "ExamplePlugin/src/pch.h"
+      - "ExamplePlugin/ExamplePlugin.vcxproj"
+      - ".github/workflows/build-parryassassin.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable Long Paths
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Checkout plugin repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        path: 's'
+        submodules: 'recursive'
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build ParryAssassinPlugin
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\ExamplePlugin\ExamplePlugin.vcxproj" /p:Configuration=Release /p:Platform=x64 /p:ParryAssassinOnly=true /m
+
+    - name: Upload ParryAssassinPlugin DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: parryassassin-plugin-dll
+        path: s/ExamplePlugin/build/x64/Release/plugins/ParryAssassinPlugin.dll
