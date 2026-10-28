@@ -1,0 +1,68 @@
+name: Build FailedWallRunPlugin
+
+# Dedicated workflow for the FailedWallRunPlugin build. Builds
+# ExamplePlugin/FailedWallRunPlugin.vcxproj (its own entry point,
+# src/main.failedwallrun.cpp) so the root build.yml (FreeJumpPlugin /
+# ExamplePlugin.vcxproj) never needs its project reference switched when
+# working on another plugin. Runs only when FailedWallRun-related files
+# change, or on manual dispatch.
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - "ExamplePlugin/src/FailedWallRunPlugin.cpp"
+      - "ExamplePlugin/src/FailedWallRunPlugin.h"
+      - "ExamplePlugin/src/main.failedwallrun.cpp"
+      - "ExamplePlugin/src/GenericHooksInParkourFiltering.cpp"
+      - "ExamplePlugin/src/ParkourLogStubs.cpp"
+      - "ExamplePlugin/src/pch.cpp"
+      - "ExamplePlugin/src/pch.h"
+      - "ExamplePlugin/FailedWallRunPlugin.vcxproj"
+      - ".github/workflows/build-failedwallrun.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable Long Paths
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Checkout plugin repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        path: 's'
+        submodules: 'recursive'
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Checkout ACUFixes repo
+      uses: actions/checkout@v4
+      with:
+        repository: NameTaken3125/ACUFixes
+        fetch-depth: 0
+        path: 'ACUFixes'
+
+    - name: Clean build artifacts
+      shell: pwsh
+      run: |
+        $buildDir = "${{ github.workspace }}\s\ExamplePlugin\build"
+        if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build FailedWallRunPlugin
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\ExamplePlugin\FailedWallRunPlugin.vcxproj" /p:Configuration=Release /p:Platform=x64 "/p:ACUFixesInclude=$root\s\ACUFixes-master\ACUFixes\src" /m
+
+    - name: Upload DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: failedwallrun-plugin-dll
+        path: |
+          s/ExamplePlugin/build/x64/Release/plugins/FailedWallRunPlugin.dll

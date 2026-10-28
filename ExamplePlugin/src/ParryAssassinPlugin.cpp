@@ -108,6 +108,7 @@ static void InstallAssassinationHooks()
 // up via 0x142759CF0).
 //
 // FUN_14087f850 applies the current highlight params to the highlighted NPC's FX instance:
+//   caller 0x14087FC88 stores candidate color; zero/equality checks follow at 0x14087FC8D
 //   0x14087F9A6  mov rax,[rsi]            ; SharedBlock* of the FX instance
 //   0x14087F9A9  mov [rsp+0x58],rax       ; (refcounted copy for the call)
 //   0x14087F9B2  mov r9,[rsp+0xB8]        ; <- hook A: color source for "critical color"
@@ -123,16 +124,23 @@ static void InstallAssassinationHooks()
 //   0x14087F9EF  mov rcx,rbp
 //   0x14087F9F2  call 0x141E302D0         ; SetParamFloat(ctx, &fxShared, id, value)
 //
-// Both hooks are pass-through unless the parry-ready window is open. While it is,
-// the color fed to the highlight FX of the player's currently highlighted NPC
-// (identity-checked against WhenHighlightedNPCChanges::highlightedNPCFxInstance)
-// is replaced with the configured gold, and the "critical state" is forced to 1.0.
-// When the window closes the game re-applies its own values on the next update.
+// The caller compares its candidate color against zero before invoking this
+// parameter-apply routine. A hook replaces that candidate while ready,
+// making sure the currently highlighted target reaches the parameter setter.
+// The color hook then restores the vanilla candidate for non-target FX and uses
+// gold only for the player's highlighted NPC. Counters are shown in the plugin UI.
 
 static bool  g_HighlightCueEnabled = false;
 static bool  g_ForceCriticalState  = true;
 static bool  g_StrictTargetCheck   = true;
 static float g_GoldHighlightColor[4] = { 1.0f, 0.84f, 0.0f, 0.0f };
+static volatile LONG64 g_HighlightCandidateHookHits = 0;
+static volatile LONG64 g_HighlightGoldAppliedHits = 0;
+static void* volatile g_LastGoldFxSlot = nullptr;
+static thread_local float g_VanillaHighlightColor[4] = {};
+static thread_local uintptr_t g_HighlightCandidateOwner = 0;
+static thread_local bool g_HighlightCandidateOverridePending = false;
+static thread_local bool g_HighlightCandidateIsRestore = false;
 
 // SharedBlock::GetPtr() semantics (see ACU/SharedPtr.h), applied defensively.
 static void* SharedBlock_GetPtr(void* sharedBlock)
@@ -160,14 +168,69 @@ static bool HighlightCueShouldApply(const void* fxSharedBlock)
     return playerFx && playerFx == hookFx;
 }
 
+// Stolen instruction: movaps [rsp+0x40],xmm0 at the caller, immediately before
+// its zero-color/equality test. Force a non-zero candidate only during the ready
+// window; the original vector is retained per-thread so non-target FX can keep it.
+static void OnHighlightCandidateColor(AllRegisters* params)
+{
+    InterlockedIncrement64(&g_HighlightCandidateHookHits);
+    const uintptr_t owner = static_cast<uintptr_t>(params->rbx_);
+    const uintptr_t fxSlot = owner + 0x4C0;
+    const bool cueActive = g_HighlightCueEnabled && g_ParryAssaultEnabled;
+    const bool restorePreviousGold = !cueActive &&
+        reinterpret_cast<uintptr_t>(InterlockedCompareExchangePointer(
+            &g_LastGoldFxSlot, nullptr, nullptr)) == fxSlot;
+    if (!cueActive && !restorePreviousGold)
+        return;
+
+    InterlockedIncrement64(&g_HighlightCandidateHookHits);
+    for (int i = 0; i < 4; ++i)
+    {
+        g_VanillaHighlightColor[i] = params->XMM0.fa[i];
+        params->XMM0.fa[i] = g_GoldHighlightColor[i];
+    }
+    g_HighlightCandidateOwner = owner;
+    g_HighlightCandidateOverridePending = true;
+    g_HighlightCandidateIsRestore = restorePreviousGold;
+}
+
 // Stolen instruction: mov r9,[rsp+0xB8] (color source for the "critical color" param).
 static void OnHighlightCriticalColor(AllRegisters* params)
 {
     void* colorPtr = *(void**)(params->GetRSP() + 0xB8);
     const void* fxShared = *(void* const*)(params->GetRSP() + 0x58);
-    if (HighlightCueShouldApply(fxShared))
+    const bool fromCandidateCaller =
+        g_HighlightCandidateOverridePending &&
+        *(const uintptr_t*)(params->GetRSP() + 0x88) == 0x14087FD09 &&
+        g_HighlightCandidateOwner;
+    const uintptr_t candidateFxSlot = g_HighlightCandidateOwner + 0x4C0;
+    const bool sameCandidateFx = fromCandidateCaller &&
+        fxShared == *(const void* const*)candidateFxSlot;
+    const bool candidateCallerReturn =
+        g_HighlightCandidateOverridePending &&
+        *(const uintptr_t*)(params->GetRSP() + 0x88) == 0x14087FD09;
+
+    if (sameCandidateFx && HighlightCueShouldApply(fxShared))
     {
         colorPtr = &g_GoldHighlightColor;
+        InterlockedExchangePointer(&g_LastGoldFxSlot, (void*)candidateFxSlot);
+        InterlockedIncrement64(&g_HighlightGoldAppliedHits);
+    }
+    else if (sameCandidateFx)
+    {
+        // The caller's temporary gold candidate exists only to bypass its
+        // zero-vector early-out. Restore the original value, including zero,
+        // when applying non-target colors or reverting the last gold FX.
+        colorPtr = g_VanillaHighlightColor;
+        if (g_HighlightCandidateIsRestore)
+            InterlockedExchangePointer(&g_LastGoldFxSlot, nullptr);
+    }
+
+    if (fromCandidateCaller || candidateCallerReturn)
+    {
+        g_HighlightCandidateOverridePending = false;
+        g_HighlightCandidateIsRestore = false;
+        g_HighlightCandidateOwner = 0;
     }
     params->r9_ = reinterpret_cast<unsigned long long>(colorPtr);
 }
@@ -188,6 +251,9 @@ struct HighlightCueHooks : AutoAssemblerCodeHolder_Base
 {
     HighlightCueHooks()
     {
+        PresetScript_CCodeInTheMiddle(
+            0x14087FC88, 5, OnHighlightCandidateColor,
+            RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
         PresetScript_CCodeInTheMiddle(
             0x14087F9B2, 8, OnHighlightCriticalColor,
             RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, false);
@@ -511,7 +577,11 @@ void ParryAssassinPlugin::OnImGuiRender()
                 SyncHighlightCueGlobals();
                 SaveSettings();
             }
-            ImGui::TextDisabled("Tints the highlight FX of the enemy you are attacking\nwhile the ready window is open.");
+            ImGui::Text("Ready-window candidate updates: %lld",
+                        static_cast<long long>(InterlockedCompareExchange64(&g_HighlightCandidateHookHits, 0, 0)));
+            ImGui::Text("Gold applied to matched target: %lld",
+                        static_cast<long long>(InterlockedCompareExchange64(&g_HighlightGoldAppliedHits, 0, 0)));
+            ImGui::TextDisabled("Tints the highlighted enemy while the ready window is open.");
         }
 
         if (m_CritKillEnabled)
