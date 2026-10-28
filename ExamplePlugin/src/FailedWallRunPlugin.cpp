@@ -173,6 +173,32 @@ static bool IsTypeBeamSpecific(int t)
     return t == 10 || t == 12 || t == 60 || t == 100 || t == 101;
 }
 
+// Game function used to prune candidates (1.5.0 address, same value
+// ForcedSidehopPlugin.cpp uses; do NOT DEFINE it here — it is already
+// DEFINE_GAME_FUNCTION'd in GenericHooksInParkourFiltering.cpp).
+using SmallArray_RemoveFunc = void(__fastcall*)(void* smallArray, int p_idx, unsigned int p_elemSize);
+static SmallArray_RemoveFunc SmallArray_POD__RemoveGeneric = (SmallArray_RemoveFunc)0x142725F00;
+
+uint64 FailedWallRunPlugin::s_Type52FancyVTable = 0;
+static int g_CreationOverrideCount = 0;
+
+// Raise an action's destination so Arno visibly gains height during the
+// animation (Z is the vertical axis in AC Unity). Same adjustment the old
+// plugin applied in OverrideCreationDiscard.
+static void LiftActionDestination(AvailableParkourAction& action, float liftAmount)
+{
+    Vector3f& dest = (Vector3f&)action.locationAnchorDest;
+    Vector3f& src = (Vector3f&)action.locationAnchorSrc;
+    float riseTarget = src.z + liftAmount;
+    if (dest.z < riseTarget)
+    {
+        dest.z = riseTarget;
+        action.expectedVerticalSpeed_mb = g_LiftSpeed;
+        action.expectedHeightDiff_mb = riseTarget - src.z;
+        action.expectedVerticalDefaultDisplace = -1.0f;
+    }
+}
+
 // ── Range widening (only-loosen semantics) ────────────────────────────────────
 static void WidenMin(float& cur, float req) { if (req < cur) cur = req; }
 static void WidenMax(float& cur, float req) { if (req > cur) cur = req; }
@@ -506,6 +532,10 @@ FailedWallRunPlugin::FailedWallRunPlugin()
     {
         return static_cast<FailedWallRunPlugin*>(userData)->ChooseAfterSorting(actions, selectedByGame);
     };
+    m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool
+    {
+        return static_cast<FailedWallRunPlugin*>(userData)->OverrideCreationDiscard(action);
+    };
     m_Callbacks.m_UserData = this;
     // Distinct priority (proven pattern: ForcedSidehop used 4.0 vs FreeJump's
     // 5.0). Equal priorities would make callback order depend on subscription
@@ -524,6 +554,7 @@ FailedWallRunPlugin::~FailedWallRunPlugin()
     {
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
         m_HookActivator.reset();
+        m_HookActivatorCreation.reset();
         m_GphActive = false;
     }
     if (m_CreatorHookActive) { m_FailedWallrunCreator.Deactivate(); m_CreatorHookActive = false; }
@@ -536,21 +567,72 @@ FailedWallRunPlugin::~FailedWallRunPlugin()
 
 AvailableParkourAction* FailedWallRunPlugin::ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions)
 {
+    // Single-stage mode (ForcedSidehop-style): skip enforcement callbacks.
     if (m_SingleStageMode) return nullptr;
 
     if (!IsFeatureActive() || !m_EnforceEnabled) return nullptr;
+
+    // First pass: count type 52 in the array (null-safe reads only).
+    int action52Count = 0;
+    for (int i = 0; i < (int)actions.size; ++i)
+    {
+        if (!actions[i]) continue;
+        if (GetTypeIntSafe(actions[i]) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+            action52Count++;
+    }
+
+    // Second pass: manipulate fitness to force selection of type 52.
+    // On walls: type 52 was kept alive by the creation override, so sabotage
+    //   wall competitors.
+    // On beams: no type 52 exists, so sabotage beam types and boost type 53
+    //   (which OverrideCreationDiscard converted to 52 via vtable swap — after
+    //   conversion it reads as 52 in the first pass).
+    int sabotagedCount = 0;
     for (int i = 0; i < (int)actions.size; ++i)
     {
         AvailableParkourAction* action = actions[i];
         if (!action) continue;
-        if (!IsType52Safe(action)) continue;
-        // Same pattern as the reverse-engineered forced-sidehop: floor the
-        // weight so the fitness filter can't discard it, then return the
-        // candidate as the chosen action (GPH honors the return value and
-        // force-selects it before filtering/sorting/final-filters).
-        if (fabsf(action->fitness) < 1.0f)
+        const int t = GetTypeIntSafe(action);
+
+        if (t == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+        {
             action->fitness = 9999.0f;
-        return action;
+        }
+        else if (t == (int)EnumParkourAction::wallrunUpToHang) // 54
+        {
+            SmallArray_POD__RemoveGeneric(&actions, i--, 8u);
+            sabotagedCount++;
+        }
+        else if (action52Count > 0 && IsTypeCompetingOnWalls(t))
+        {
+            action->fitness = 0.0f;
+            sabotagedCount++;
+        }
+        else if (action52Count == 0)
+        {
+            if (IsTypeBeamSpecific(t))
+            {
+                action->fitness = 0.0f;
+                sabotagedCount++;
+            }
+            else if (t == (int)EnumParkourAction::wallrunUpFromGround_mb) // 53
+            {
+                action->fitness = 9999.0f;
+            }
+        }
+    }
+
+    m_LastAction52Count = action52Count;
+    m_LastSabotagedCount = sabotagedCount;
+
+    // Force-select the first failed wallrun if one is in the array
+    // (converted 53s read as 52 here because the vtable was swapped).
+    for (int i = 0; i < (int)actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action) continue;
+        if (IsType52Safe(action))
+            return action;
     }
     return nullptr;
 }
@@ -564,10 +646,56 @@ AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting(SmallArray<Avail
     {
         AvailableParkourAction* action = actions[i];
         if (!action) continue;
-        if (IsType52Safe(action))
+        // 52 = failed wallrun; 53 = normal wallrun-up kept as a defensive
+        // fallback (post-conversion actions read as 52 anyway).
+        const int t = GetTypeIntSafe(action);
+        if (t == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb
+            || t == (int)EnumParkourAction::wallrunUpFromGround_mb)
             return action;
     }
     return nullptr;
+}
+
+// ── Creation-stage override (requires GPH creation replacements) ─────────────
+
+bool FailedWallRunPlugin::OverrideCreationDiscard(AvailableParkourAction& action)
+{
+    // Single-stage mode = ForcedSidehop-style: no creation-stage mutation.
+    if (m_SingleStageMode) return false;
+    if (!IsFeatureActive() || !m_EnforceEnabled) return false;
+
+    // Null-safe type read (fancy idx 0x45 can be NULL on transient tables).
+    const int t = GetTypeIntSafe(&action);
+
+    // Capture type 52's RUNTIME fancy vtable once — only from the
+    // dump-verified runtime table, never from the transient base table.
+    if (t == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb
+        && s_Type52FancyVTable == 0
+        && (uint64)action.fancyVTable == k_Type52FancyVTable_Runtime)
+    {
+        s_Type52FancyVTable = (uint64)action.fancyVTable;
+    }
+
+    // Keep the failed wallrun alive even when the fit test rejected it.
+    if (t == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+    {
+        LiftActionDestination(action, m_LiftAmount);
+        g_CreationOverrideCount++;
+        return true;
+    }
+
+    // Convert the normal wallrun-up (53) into the failed wallrun (52) by
+    // swapping its fancy vtable — the same behavior-swap pattern
+    // ForcedSidehopPlugin uses. Requires a captured type-52 vtable.
+    if (t == (int)EnumParkourAction::wallrunUpFromGround_mb && s_Type52FancyVTable != 0)
+    {
+        action.fancyVTable = reinterpret_cast<ParkourAction_FancyVTable*>(s_Type52FancyVTable);
+        LiftActionDestination(action, m_LiftAmount + 0.5f);
+        g_CreationOverrideCount++;
+        return true;
+    }
+
+    return false;
 }
 
 // ── Per-frame update ──────────────────────────────────────────────────────────
@@ -708,7 +836,7 @@ void FailedWallRunPlugin::OnUpdate()
         }
     }
 
-    // Sort&select enforcement via GenericHooksInParkourFiltering
+    // Sort&select + creation-stage enforcement via GenericHooksInParkourFiltering
     // In single-stage mode we disable the GPH callbacks that enforce type-52
     // and instead rely ONLY on the ForcedSidehop-style rewrite approach.
     bool useGphEnforce = !m_SingleStageMode;
@@ -717,12 +845,17 @@ void FailedWallRunPlugin::OnUpdate()
         auto gph = GenericHooksInParkourFiltering::GetSingleton();
         gph->Subscribe(m_Callbacks);
         m_HookActivator = gph->RequestGPHSortAndSelect();
+        // Creation-stage replacements (0x1401D1CF0 / 0x1401D1E50) are what
+        // invoke OverrideCreationDiscard_fnp — required for the keep-alive and
+        // 53->52 conversion. Same proven pattern the old plugin used.
+        m_HookActivatorCreation = gph->RequestGPHCreation();
         m_GphActive = true;
     }
     else if (!m_SingleStageMode && !shouldBeActive && m_GphActive)
     {
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
         m_HookActivator.reset();
+        m_HookActivatorCreation.reset();
         m_GphActive = false;
     }
 
@@ -905,6 +1038,11 @@ void FailedWallRunPlugin::OnImGuiRender()
                     m_LastSabotagedCount);
                 ImGui::Text("  Range widenings: %d | Fit-test overrides: %d",
                     g_WidenCount, g_FitOverrideCount);
+                ImGui::Text("  Kept/converted at creation: %d",
+                    g_CreationOverrideCount);
+                if (s_Type52FancyVTable == 0)
+                    ImGui::TextColored(ImVec4(1, 1, 0, 1),
+                        "  (capturing type-52 vtable... approach any wall once)");
                 ImGui::Text("  Hooks: creation %s | widener %s | fit-override %s | vtable-swap %s",
                     m_CreatorHookActive ? "ON" : "off",
                     m_WidenerHookActive ? "ON" : "off",

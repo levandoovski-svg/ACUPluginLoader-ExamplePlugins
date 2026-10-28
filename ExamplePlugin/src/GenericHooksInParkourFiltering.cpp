@@ -44,6 +44,132 @@ DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcal
 
 class Entity;
 
+// ── Creation-stage replacements (ported verbatim from ACUFixes-0.9.3) ──────
+// Replace the two creation wrappers at their function starts (0x1401D1CF0 /
+// 0x1401D1E50, the ACUFixes-0.9.3 address set, confirmed present in the two
+// reference DLLs that work on this install — see PROGRESS.md session 6).
+// Difference from the 0.9.3 original: after InitialTestIfActionFits, every
+// subscribed callback gets a chance to override the discard verdict via
+// OverrideCreationDiscard_fnp (return true = keep the action; the callback may
+// have mutated it in place first — FailedWallRunPlugin keeps
+// wallrunUpFromGroundFailed_mb alive on non-qualifying walls and converts
+// wallrunUpFromGround_mb into it via a fancy-vtable swap).
+struct CollisionProbeForParkour_mb
+{
+    Vector4f locationAnchorDest; //0x0000
+    Vector4f direction; //0x0010
+    char pad_0020[20]; //0x0020
+    float flt_34; //0x0034
+    uint32 collisionLayer_mb; //0x0038
+    char pad_003C[4]; //0x003C
+    Vector4f pos40; //0x0040
+    Vector4f pos50; //0x0050
+    PlayerRefInParkourAction shared_buildingEntity; //0x0060
+    char pad_0078[8]; //0x0078
+}; //Size: 0x0080
+assert_offsetof(CollisionProbeForParkour_mb, collisionLayer_mb, 0x38);
+assert_offsetof(CollisionProbeForParkour_mb, shared_buildingEntity, 0x60);
+assert_sizeof(CollisionProbeForParkour_mb, 0x80); // Allocated and constructed at 140184AEF
+
+static void RunCreationDiscardOverrides(AvailableParkourAction& newAction, bool& isDiscarded)
+{
+    auto& allParkourCallbacks = GenericHooksInParkourFiltering::GetSingleton()->m_Callbacks;
+    for (ParkourCallbacks* parkourCallbacks : allParkourCallbacks)
+    {
+        if (!parkourCallbacks->OverrideCreationDiscard_fnp) continue;
+        if (parkourCallbacks->OverrideCreationDiscard_fnp(parkourCallbacks->m_UserData, newAction))
+            isDiscarded = false;
+    }
+}
+
+bool CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement(
+    EnumParkourAction actionType,
+    __m128* p_locationOfOrigin,
+    __m128* a3,
+    __m128* p_directionOfMovementInputWorldSpace,
+    float a5, int a6, char a7, CollisionProbeForParkour_mb* a8,
+    Entity* p_player,
+    AvailableParkourAction* p_previousAction_mb,
+    AvailableParkourAction** const p_newAction_out,
+    float a12,
+    float p_epsilon_mb)
+{
+    AvailableParkourAction* newAction = ConstructParkourAction_A(actionType, p_locationOfOrigin, a3, p_directionOfMovementInputWorldSpace, a6, a7, (uint64)a8, p_previousAction_mb);
+    *p_newAction_out = newAction;
+    if (!newAction) return false;
+    if (p_player)
+        AvailableParkourAction__InitializePlayerRef(&newAction->playerRef, p_player);
+    GET_AND_CAST_FANCY_FUNC(*newAction, ParkourActionKnownFancyVFuncs::Set2FloatsAfterCreation)(newAction, a12, p_epsilon_mb);
+    bool isActionFits = GET_AND_CAST_FANCY_FUNC(*newAction, ParkourActionKnownFancyVFuncs::InitialTestIfActionFits)(
+        newAction,
+        p_locationOfOrigin,
+        a3,
+        p_directionOfMovementInputWorldSpace,
+        a5,
+        a6,
+        (uint64)a8,
+        p_player,
+        p_previousAction_mb);
+    bool isDiscarded = !isActionFits;
+    RunCreationDiscardOverrides(*newAction, isDiscarded);
+    std::shared_ptr<ParkourCycleLogged> currentCycle = GetCurrentLoggedParkourCycle();
+    currentCycle->LogActionInitialCreation(*newAction, isDiscarded);
+    currentCycle->m_LocationOfOrigin = *(Vector3f*)p_locationOfOrigin;
+    currentCycle->m_DirectionOfMovementInputWorldSpace = *(Vector3f*)p_directionOfMovementInputWorldSpace;
+    if (isDiscarded)
+    {
+        newAction->Unk008_Destroy(0);
+        ACU::Memory::ACUDeallocateBytes((byte*)newAction);
+        *p_newAction_out = nullptr;
+        return false;
+    }
+    return true;
+}
+
+bool CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement(
+    EnumParkourAction actionType,
+    __m128* p_locationOfOrigin,
+    __m128* a3,
+    __m128* p_directionOfMovementInputWorldSpace,
+    float a5, int a6, char a7, uint64 a8, uint64 a9,
+    Entity* p_player,
+    AvailableParkourAction* p_previousAction_mb,
+    AvailableParkourAction** const p_newAction_out,
+    float a13,
+    float p_epsilon_mb)
+{
+    AvailableParkourAction* newAction = ConstructParkourAction_B(actionType, p_locationOfOrigin, a3, p_directionOfMovementInputWorldSpace, a6, a7, a8, a9, p_player, p_previousAction_mb);
+    *p_newAction_out = newAction;
+    if (!newAction) return false;
+    if (p_player)
+        AvailableParkourAction__InitializePlayerRef(&newAction->playerRef, p_player);
+    GET_AND_CAST_FANCY_FUNC(*newAction, ParkourActionKnownFancyVFuncs::Set2FloatsAfterCreation)(newAction, a13, p_epsilon_mb);
+    bool isActionFits = GET_AND_CAST_FANCY_FUNC(*newAction, ParkourActionKnownFancyVFuncs::InitialTestIfActionFits)(
+        newAction,
+        p_locationOfOrigin,
+        a3,
+        p_directionOfMovementInputWorldSpace,
+        a5,
+        a6,
+        a9,
+        p_player,
+        p_previousAction_mb);
+    bool isDiscarded = !isActionFits;
+    RunCreationDiscardOverrides(*newAction, isDiscarded);
+    std::shared_ptr<ParkourCycleLogged> currentCycle = GetCurrentLoggedParkourCycle();
+    currentCycle->LogActionInitialCreation(*newAction, isDiscarded);
+    currentCycle->m_LocationOfOrigin = *(Vector3f*)p_locationOfOrigin;
+    currentCycle->m_DirectionOfMovementInputWorldSpace = *(Vector3f*)p_directionOfMovementInputWorldSpace;
+    if (isDiscarded)
+    {
+        newAction->Unk008_Destroy(0);
+        ACU::Memory::ACUDeallocateBytes((byte*)newAction);
+        *p_newAction_out = nullptr;
+        return false;
+    }
+    return true;
+}
+
 // ── Sort&select replacement (verbatim pipeline from ACUFixes-0.9.3) ──────────
 // Replaces SortAndSelectBestMatchingAction at its function start. Logging goes
 // through ParkourLog; ParkourLogStubs.cpp provides pass-through stubs so the
@@ -196,13 +322,17 @@ int SortAndSelectBestMatchingAction_FullReplacement(
 
 GPH_Creation::GPH_Creation()
 {
-    // DISABLED for this standalone plugin. On 1.5.0 the creation stage sits in
-    // a Denuvo-split factory region and ForcedSidehop does not need it (it
-    // rewrites already-created candidates in sort&select). FailedWallRunPlugin
-    // documents the verified creation wrapper (0x1401D1CF0) separately.
-    // Re-enable only after re-verifying against the running build:
-    // PresetScript_ReplaceFunctionAtItsStart(0x1401D1CF0, ...);
-    // PresetScript_ReplaceFunctionAtItsStart(0x1401D1E50, ...);
+    // RE-ENABLED for FailedWallRunPlugin. Both addresses are the
+    // ACUFixes-0.9.3 / 1.5.0-verified set, confirmed present in the two
+    // reference DLLs that demonstrably work on this install (ACUFixes.dll and
+    // ACU_ParkourPatches.dll — see PROGRESS.md session 6 evidence), and
+    // FailedWallRunPlugin.cpp independently dump-verifies 0x1401D1CF0 against
+    // the runtime dump. The creation-stage replacement is what invokes
+    // OverrideCreationDiscard_fnp (keep-alive + 53->52 conversion).
+    // NOTE: like the sort&select start, these are function-start replacements;
+    // do not let two plugins replace the same address simultaneously.
+    PresetScript_ReplaceFunctionAtItsStart(0x1401D1CF0, CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement);
+    PresetScript_ReplaceFunctionAtItsStart(0x1401D1E50, CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement);
 }
 
 GPH_SortAndSelect::GPH_SortAndSelect()

@@ -200,6 +200,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\FailedWallRunPlugin.h" />
+    <ClInclude Include="src\ParkourDebugging\GenericHooksInParkourFiltering.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>

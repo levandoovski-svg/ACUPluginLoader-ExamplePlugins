@@ -82,6 +82,14 @@ public:
     AvailableParkourAction* ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions);
     AvailableParkourAction* ChooseAfterSorting(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame);
 
+    // Runs on the game thread inside the creation-stage replacements, for EVERY
+    // constructed action, BEFORE the discard decision (requires
+    // RequestGPHCreation). Return true to keep an action the vanilla fit test
+    // rejected; the action may be mutated in place first. This is the
+    // mechanism that keeps wallrunUpFromGroundFailed_mb (52) alive on
+    // non-qualifying walls and converts wallrunUpFromGround_mb (53) into it.
+    bool OverrideCreationDiscard(AvailableParkourAction& action);
+
 private:
     static bool IsRisingEdgePressed(int vkCode);
 
@@ -109,7 +117,15 @@ private:
     // Sort&select enforcement (same mechanism FreeJump/BlackFlagGrab use).
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_HookActivator;
+    std::shared_ptr<SharedHookActivator> m_HookActivatorCreation;
     bool m_GphActive = false;
+
+    // Captured wallrunUpFromGroundFailed_mb (52) RUNTIME fancy vtable, used to
+    // convert wallrunUpFromGround_mb (53) into it at creation time (same
+    // behavior-swap pattern as ForcedSidehop). 0 = not captured yet; captured
+    // only from the dump-verified runtime table, never from the transient base
+    // table. Approach any wall once so a natural type-52 gets created.
+    static uint64 s_Type52FancyVTable;
 
     bool m_PluginEnabled = true;
     int m_ToggleKey = 0x76; // F7

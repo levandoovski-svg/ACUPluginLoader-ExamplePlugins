@@ -136,9 +136,12 @@ static bool  g_StrictTargetCheck   = true;
 static float g_GoldHighlightColor[4] = { 1.0f, 0.84f, 0.0f, 0.0f };
 static volatile LONG64 g_HighlightCandidateHookHits = 0;
 static volatile LONG64 g_HighlightGoldAppliedHits = 0;
+static volatile LONG64 g_HighlightForcedUpdateHits = 0;
 static void* volatile g_LastGoldFxSlot = nullptr;
 static thread_local float g_VanillaHighlightColor[4] = {};
 static thread_local uintptr_t g_HighlightCandidateOwner = 0;
+static thread_local uintptr_t g_HighlightCandidateReturnAddress = 0;
+static thread_local uintptr_t g_HighlightCandidateFxShared = 0;
 static thread_local bool g_HighlightCandidateOverridePending = false;
 static thread_local bool g_HighlightCandidateIsRestore = false;
 
@@ -168,9 +171,25 @@ static bool HighlightCueShouldApply(const void* fxSharedBlock)
     return playerFx && playerFx == hookFx;
 }
 
-// Stolen instruction: movaps [rsp+0x40],xmm0 at the caller, immediately before
-// its zero-color/equality test. Force a non-zero candidate only during the ready
-// window; the original vector is retained per-thread so non-target FX can keep it.
+// The caller uses DL as a later update-path gate; override its candidate and
+// flag before the zero/equality checks, then correlate the nested FX-apply call
+// by return address and shared-block identity. All overrides are ready-window
+// only (plus one restore update for the last gold FX).
+static void ClearPendingHighlightCandidate(AllRegisters* params)
+{
+    const uintptr_t returnAddress =
+        *reinterpret_cast<const uintptr_t*>(params->GetRSP());
+    if (!g_HighlightCandidateOverridePending ||
+        returnAddress != g_HighlightCandidateReturnAddress)
+        return;
+
+    g_HighlightCandidateOverridePending = false;
+    g_HighlightCandidateIsRestore = false;
+    g_HighlightCandidateOwner = 0;
+    g_HighlightCandidateReturnAddress = 0;
+    g_HighlightCandidateFxShared = 0;
+}
+
 static void OnHighlightCandidateColor(AllRegisters* params)
 {
     const uintptr_t owner = static_cast<uintptr_t>(params->rbx_);
@@ -188,7 +207,14 @@ static void OnHighlightCandidateColor(AllRegisters* params)
         g_VanillaHighlightColor[i] = params->XMM0.fa[i];
         params->XMM0.fa[i] = g_GoldHighlightColor[i];
     }
+    // At this site DL came from [RBX+0x515] and is checked again at 0x14087FC9D
+    // and 0x14087FCB9. Force the flagged-color branch so the call isn't skipped.
+    params->rdx_ = (params->rdx_ & ~0xFFULL) | 1ULL;
+    InterlockedIncrement64(&g_HighlightForcedUpdateHits);
     g_HighlightCandidateOwner = owner;
+    g_HighlightCandidateReturnAddress =
+        *reinterpret_cast<const uintptr_t*>(params->GetRSP());
+    g_HighlightCandidateFxShared = *reinterpret_cast<const uintptr_t*>(owner + 0x4C0);
     g_HighlightCandidateOverridePending = true;
     g_HighlightCandidateIsRestore = restorePreviousGold;
 }
@@ -198,17 +224,16 @@ static void OnHighlightCriticalColor(AllRegisters* params)
 {
     void* colorPtr = *(void**)(params->GetRSP() + 0xB8);
     const void* fxShared = *(void* const*)(params->GetRSP() + 0x58);
+    const uintptr_t returnAddress =
+        *reinterpret_cast<const uintptr_t*>(params->GetRSP());
     const bool fromCandidateCaller =
         g_HighlightCandidateOverridePending &&
-        *(const uintptr_t*)(params->GetRSP() + 0x88) == 0x14087FD09 &&
+        returnAddress == g_HighlightCandidateReturnAddress &&
         g_HighlightCandidateOwner;
     const uintptr_t candidateFxSlot = g_HighlightCandidateOwner + 0x4C0;
     const bool sameCandidateFx = fromCandidateCaller &&
+        fxShared == reinterpret_cast<const void*>(g_HighlightCandidateFxShared) &&
         fxShared == *(const void* const*)candidateFxSlot;
-    const bool candidateCallerReturn =
-        g_HighlightCandidateOverridePending &&
-        *(const uintptr_t*)(params->GetRSP() + 0x88) == 0x14087FD09;
-
     if (sameCandidateFx && HighlightCueShouldApply(fxShared))
     {
         colorPtr = &g_GoldHighlightColor;
@@ -225,11 +250,13 @@ static void OnHighlightCriticalColor(AllRegisters* params)
             InterlockedExchangePointer(&g_LastGoldFxSlot, nullptr);
     }
 
-    if (fromCandidateCaller || candidateCallerReturn)
+    if (fromCandidateCaller)
     {
         g_HighlightCandidateOverridePending = false;
         g_HighlightCandidateIsRestore = false;
         g_HighlightCandidateOwner = 0;
+        g_HighlightCandidateReturnAddress = 0;
+        g_HighlightCandidateFxShared = 0;
     }
     params->r9_ = reinterpret_cast<unsigned long long>(colorPtr);
 }
@@ -252,6 +279,9 @@ struct HighlightCueHooks : AutoAssemblerCodeHolder_Base
     {
         PresetScript_CCodeInTheMiddle(
             0x14087FC88, 5, OnHighlightCandidateColor,
+            RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+        PresetScript_CCodeInTheMiddle(
+            0x14087FD09, 3, ClearPendingHighlightCandidate,
             RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
         PresetScript_CCodeInTheMiddle(
             0x14087F9B2, 8, OnHighlightCriticalColor,
@@ -580,6 +610,8 @@ void ParryAssassinPlugin::OnImGuiRender()
                         static_cast<long long>(InterlockedCompareExchange64(&g_HighlightCandidateHookHits, 0, 0)));
             ImGui::Text("Gold applied to matched target: %lld",
                         static_cast<long long>(InterlockedCompareExchange64(&g_HighlightGoldAppliedHits, 0, 0)));
+            ImGui::Text("Forced highlight update path: %lld",
+                        static_cast<long long>(InterlockedCompareExchange64(&g_HighlightForcedUpdateHits, 0, 0)));
             ImGui::TextDisabled("Tints the highlighted enemy while the ready window is open.");
         }
 
