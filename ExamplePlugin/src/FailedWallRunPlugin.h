@@ -100,6 +100,12 @@ private:
     bool m_FitTestHookActive = false;
     bool m_VTableSwapHookActive = false;
 
+    // Vanilla-byte verification results (fail-closed guards; shown in the UI).
+    bool m_CreatorSiteOk = true;
+    bool m_WidenerSiteOk = true;
+    bool m_FitTestSlotOk = true;
+    bool m_SwapSitesOk = true;
+
     // Sort&select enforcement (same mechanism FreeJump/BlackFlagGrab use).
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_HookActivator;

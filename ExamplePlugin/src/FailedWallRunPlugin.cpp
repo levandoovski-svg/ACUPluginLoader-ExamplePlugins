@@ -92,6 +92,29 @@ static constexpr uint64 k_Type52FancyVTable_TransientBase = 0x143A41930;
 static constexpr uint64 k_ClimbFacadeTesterFancyVTable_Default = 0x1439E08D0;
 static constexpr uint64 k_ClimbFacadeTesterFancyVTable_Baseclass = 0x1439FA1A0;
 
+// ── Vanilla-byte fail-safe (BreakfallForce/ExactPositionTeleport pattern) ─────
+// Before installing a code hook or swapping the fit-test slot, verify the site
+// still holds the vanilla bytes/values captured in the 1.5.0 runtime dump. If
+// anything else already patched a site (e.g. ACU_ParkourPatches.dll, which
+// hooks 0x140135230), refuse to install and fail closed instead of stacking a
+// second hook on foreign bytes. FailedWallRun and FreeJump share no patch
+// sites, so within this DLL this only guards against third-party plugins and
+// build mismatches.
+static constexpr uint8_t k_ExpectedBytes_CreationSite[12] = {
+    0xE9, 0xEB, 0xAE, 0x90, 0xFF, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; // JMP 0x13FA40120 (Denuvo VM thunk) + game NOP padding
+static constexpr uint8_t k_ExpectedBytes_RangeSetterSite[10] = {
+    0xC7, 0x81, 0xF8, 0x01, 0x00, 0x00, 0xCD, 0xCC, 0x4C, 0x3D };             // MOV dword ptr [RCX+0x1F8], 0.05f
+static constexpr uint8_t k_ExpectedBytes_WallingCycleSite[7] = {
+    0xE9, 0x50, 0x29, 0xFD, 0xFD, 0x90, 0x90 };                               // JMP 0x13F871120 (Denuvo VM thunk)
+static constexpr uint8_t k_ExpectedBytes_FailedWallrunCycleSite[7] = {
+    0xE9, 0x0F, 0x47, 0xFF, 0xFD, 0x90, 0x90 };                               // JMP 0x13FA10120 (Denuvo VM thunk)
+
+static bool SiteBytesMatch(uintptr_t addr, const uint8_t* expected, size_t len)
+{
+    const uint8_t* live = reinterpret_cast<const uint8_t*>(addr);
+    return memcmp(live, expected, len) == 0;
+}
+
 // ── Null-safe action-type read ────────────────────────────────────────────────
 // NEVER call AvailableParkourAction::GetEnumParkourAction() directly on actions
 // that may be a wallrunUpFromGroundFailed_mb: some of its tables have a NULL
@@ -224,19 +247,30 @@ static bool SwapType52FitTestFn(bool install)
     DWORD oldProtect = 0;
     if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect))
         return false;
+    bool ok = false;
     if (install)
     {
-        if (!s_OriginalType52FitTestFn || s_OriginalType52FitTestFn == (void*)&Type52FitTestStub)
-            s_OriginalType52FitTestFn = k_Type52FitTestOriginal; // dump-verified vanilla value
-        *slot = (void*)&Type52FitTestStub;
+        // Fail-safe rule: only swap when the slot still holds the vanilla fn.
+        // If anything else already swapped it, refuse instead of stacking.
+        if (*slot == k_Type52FitTestOriginal)
+        {
+            s_OriginalType52FitTestFn = k_Type52FitTestOriginal;
+            *slot = (void*)&Type52FitTestStub;
+            ok = true;
+        }
     }
     else
     {
-        if (s_OriginalType52FitTestFn)
-            *slot = s_OriginalType52FitTestFn;
+        // Restore only if the slot still holds OUR stub — never clobber a
+        // patch someone else may have installed after us.
+        if (*slot == (void*)&Type52FitTestStub)
+        {
+            *slot = s_OriginalType52FitTestFn ? s_OriginalType52FitTestFn : k_Type52FitTestOriginal;
+            ok = true;
+        }
     }
     VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
-    return true;
+    return ok;
 }
 
 // ── Hook 4 callbacks: cycle-start tester vtable swap (optional) ───────────────
@@ -473,7 +507,14 @@ FailedWallRunPlugin::FailedWallRunPlugin()
         return static_cast<FailedWallRunPlugin*>(userData)->ChooseAfterSorting(actions, selectedByGame);
     };
     m_Callbacks.m_UserData = this;
-    m_Callbacks.m_CallbackPriority = 5.0f;
+    // Distinct priority (proven pattern: ForcedSidehop used 4.0 vs FreeJump's
+    // 5.0). Equal priorities would make callback order depend on subscription
+    // order, i.e. on which key was pressed first after load. 4.5 =
+    // deterministic: FailedWallRun's force-select runs before FreeJump's array
+    // wipe/overrides when both keys are held (the GPH dispatcher short-circuits
+    // after a callback returns an action, so FreeJump's pass is skipped for
+    // that cycle — no interference in either direction).
+    m_Callbacks.m_CallbackPriority = 4.5f;
     m_Callbacks.m_Name = "FailedWallRunPlugin";
 }
 
@@ -581,7 +622,11 @@ void FailedWallRunPlugin::OnUpdate()
     g_LiftAmount = m_LiftAmount;
     g_LiftSpeed = m_LiftSpeed;
 
-    // Deactivate any extra-layer hooks when in single-stage mode
+    // Deactivate any extra-layer hooks when in single-stage mode.
+    // Every activation is gated on the site still holding vanilla bytes
+    // (fail closed on foreign patches — BreakfallForce/ExactPositionTeleport
+    // fail-safe pattern). Gated hooks that fail verification simply stay
+    // inactive and retry each frame; the UI shows the per-site check state.
     if (singleStage && m_CreatorHookActive)
     {
         m_FailedWallrunCreator.Deactivate();
@@ -589,8 +634,12 @@ void FailedWallRunPlugin::OnUpdate()
     } else if (!m_SingleStageMode) {
         if (shouldBeActive && !m_CreatorHookActive)
         {
-            m_FailedWallrunCreator.Activate();
-            m_CreatorHookActive = true;
+            m_CreatorSiteOk = SiteBytesMatch(0x140135230, k_ExpectedBytes_CreationSite, sizeof(k_ExpectedBytes_CreationSite));
+            if (m_CreatorSiteOk)
+            {
+                m_FailedWallrunCreator.Activate();
+                m_CreatorHookActive = true;
+            }
         }
         else if (!shouldBeActive && m_CreatorHookActive)
         {
@@ -606,8 +655,12 @@ void FailedWallRunPlugin::OnUpdate()
     } else if (!m_SingleStageMode) {
         if (shouldBeActive && m_RangeWidenerEnabled && !m_WidenerHookActive)
         {
-            m_RangeWidener.Activate();
-            m_WidenerHookActive = true;
+            m_WidenerSiteOk = SiteBytesMatch(0x1401AF3B6, k_ExpectedBytes_RangeSetterSite, sizeof(k_ExpectedBytes_RangeSetterSite));
+            if (m_WidenerSiteOk)
+            {
+                m_RangeWidener.Activate();
+                m_WidenerHookActive = true;
+            }
         }
         else if ((!shouldBeActive || !m_RangeWidenerEnabled) && m_WidenerHookActive)
         {
@@ -623,8 +676,8 @@ void FailedWallRunPlugin::OnUpdate()
     } else if (!m_SingleStageMode) {
         if (shouldBeActive && m_SkipFitTestEnabled && !m_FitTestHookActive)
         {
-            if (SwapType52FitTestFn(true))
-                m_FitTestHookActive = true;
+            m_FitTestSlotOk = SwapType52FitTestFn(true);
+            m_FitTestHookActive = m_FitTestSlotOk;
         }
         else if ((!shouldBeActive || !m_SkipFitTestEnabled) && m_FitTestHookActive)
         {
@@ -640,8 +693,13 @@ void FailedWallRunPlugin::OnUpdate()
     } else if (!m_SingleStageMode) {
         if (shouldBeActive && m_VtableSwapEnabled && !m_VTableSwapHookActive)
         {
-            m_VTableSwapHook.Activate();
-            m_VTableSwapHookActive = true;
+            m_SwapSitesOk = SiteBytesMatch(0x141A4D7CB, k_ExpectedBytes_WallingCycleSite, sizeof(k_ExpectedBytes_WallingCycleSite))
+                         && SiteBytesMatch(0x141A1BA0C, k_ExpectedBytes_FailedWallrunCycleSite, sizeof(k_ExpectedBytes_FailedWallrunCycleSite));
+            if (m_SwapSitesOk)
+            {
+                m_VTableSwapHook.Activate();
+                m_VTableSwapHookActive = true;
+            }
         }
         else if ((!shouldBeActive || !m_VtableSwapEnabled) && m_VTableSwapHookActive)
         {
@@ -852,6 +910,19 @@ void FailedWallRunPlugin::OnImGuiRender()
                     m_WidenerHookActive ? "ON" : "off",
                     m_FitTestHookActive ? "ON" : "off",
                     m_VTableSwapHookActive ? "ON" : "off");
+                bool sitesOk = m_CreatorSiteOk && m_WidenerSiteOk && m_FitTestSlotOk && m_SwapSitesOk;
+                ImGui::Text("  Site checks (vanilla bytes): %s",
+                    sitesOk ? "OK" : "MISMATCH — a hook site was modified by something else;"
+                                      " affected layer refused to install");
+                if (!sitesOk)
+                {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f),
+                        "    creation:%s widener:%s fit-slot:%s swap:%s",
+                        m_CreatorSiteOk ? "ok" : "MODIFIED",
+                        m_WidenerSiteOk ? "ok" : "MODIFIED",
+                        m_FitTestSlotOk ? "ok" : "MODIFIED",
+                        m_SwapSitesOk ? "ok" : "MODIFIED");
+                }
             }
 
             ImGui::Unindent();

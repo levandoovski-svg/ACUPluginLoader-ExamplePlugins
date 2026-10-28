@@ -203,7 +203,8 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <!-- FreeJumpPlugin + ParryAssassinPlugin (parry-two-times assassination window + gold highlight cue). -->
+    <!-- FreeJumpPlugin + ParryAssassinPlugin (parry-two-times assassination window + gold highlight cue) + AllowSmokeAssassinatePlugin (defines g_SmokeBombAssaultEnabled read by ParryAssassin's hooks). -->
+    <ClCompile Include="src\AllowSmokeAssassinatePlugin.cpp" />
     <ClCompile Include="src\FreeJumpPlugin.cpp" />
     <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
     <ClCompile Include="src\ParryAssassinPlugin.cpp" />
@@ -217,6 +218,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\AllowSmokeAssassinatePlugin.h" />
     <ClInclude Include="src\FreeJumpPlugin.h" />
     <ClInclude Include="src\ParryAssassinPlugin.h" />
     <ClInclude Include="src\pch.h" />

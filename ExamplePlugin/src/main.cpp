@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "FreeJumpPlugin.h"
 #include "ParryAssassinPlugin.h"
+#include "AllowSmokeAssassinatePlugin.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
 class ExamplePlugin : public ACUPluginInterfaceVirtuals
@@ -10,12 +11,14 @@ public:
     {
         g_freeJump.OnImGuiRender();
         g_parryAssassin.OnImGuiRender();
+        g_allowSmoke.OnImGuiRender();
     }
 
     virtual void EveryFrameEvenWhenMenuIsClosed() override
     {
         g_freeJump.OnUpdate();
         g_parryAssassin.OnUpdate();
+        g_allowSmoke.OnUpdate();
     }
 
     virtual uint64 GetThisPluginVersion() override
@@ -31,9 +34,11 @@ public:
     {
         g_freeJump.OnBeforeActivate();
         g_parryAssassin.LoadSettings();
+        g_allowSmoke.LoadSettings();
         return true;
     }
 
     FreeJumpPlugin g_freeJump;
     ParryAssassinPlugin g_parryAssassin;
+    AllowSmokeAssassinatePlugin g_allowSmoke;
 } g_thisPlugin;
