@@ -22,8 +22,15 @@ private:
     bool    m_UnrestrictedCritEnabled = true;
     bool    m_PatchesActive           = false;
 
+    // Visual cue: gold highlight on the currently-attacked enemy while ready.
+    bool    m_HighlightCueEnabled     = true;
+    bool    m_ForceCriticalState      = true;
+    bool    m_StrictTargetCheck       = true;
+    float   m_GoldHighlightColor[4]   = { 1.0f, 0.84f, 0.0f, 0.0f };
+
     bool IsParryActive();
     void UpdateCritPatches();
+    void SyncHighlightCueGlobals();
 
     static constexpr uint64_t ADDR_PARRYING_PUNCHENEMY = 0x1419AAA90;
 };

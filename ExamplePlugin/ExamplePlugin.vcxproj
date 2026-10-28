@@ -203,9 +203,10 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <!-- Keep this DLL limited to the full-featured FreeJump gameplay plugin. -->
+    <!-- FreeJumpPlugin + ParryAssassinPlugin (parry-two-times assassination window + gold highlight cue). -->
     <ClCompile Include="src\FreeJumpPlugin.cpp" />
     <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
+    <ClCompile Include="src\ParryAssassinPlugin.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\ParkourLogStubs.cpp" />
     <ClCompile Include="src\pch.cpp">
@@ -217,6 +218,7 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\FreeJumpPlugin.h" />
+    <ClInclude Include="src\ParryAssassinPlugin.h" />
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>

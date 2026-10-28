@@ -4,8 +4,14 @@
 #include "ACU_DefineNativeFunction.h"
 #include "ACU/HumanStatesHolder.h"
 #include "ACU/ACUGetSingletons.h"
+#include "ACU/BhvAssassin.h"
+#include "ACU/WhenHighlightedNPCChanges.h"
+#include "ACU/SharedPtr.h"
 #include "ACU/Entity.h"
+#include "ImGuiCTX.h"
 #include <shlobj.h>
+#include <cstdlib>  // strtof
+#include <cstdio>   // snprintf
 #include <mmsystem.h> // PlaySoundW + SND_* flags (not pulled in via windows.h because of WIN32_LEAN_AND_MEAN)
 
 #pragma comment(lib, "winmm.lib")
@@ -91,6 +97,110 @@ static void InstallAssassinationHooks()
     static AutoAssembleWrapper<AssassinateHook2> w2;
     w1.Activate();
     w2.Activate();
+}
+
+// ---- Gold-highlight visual cue (ACU 1.5.0, addresses verified against the runtime dump in MODLOG/scripts) ----
+//
+// The vanilla enemy-highlight FX exposes named parameters "critical color" (Vector4)
+// and "critical state" (float). Their ids are resolved once at startup and cached at
+// 0x145197D74 ("critical color") and 0x145197D78 ("critical state")
+// (see the dynamic-initializer stubs at 0x142D8E850/0x142D8E870, which look the names
+// up via 0x142759CF0).
+//
+// FUN_14087f850 applies the current highlight params to the highlighted NPC's FX instance:
+//   0x14087F9A6  mov rax,[rsi]            ; SharedBlock* of the FX instance
+//   0x14087F9A9  mov [rsp+0x58],rax       ; (refcounted copy for the call)
+//   0x14087F9B2  mov r9,[rsp+0xB8]        ; <- hook A: color source for "critical color"
+//   0x14087F9BA  mov r8d,[0x145197D74]    ; "critical color" param id
+//   0x14087F9C1  lea rdx,[rsp+0x58]
+//   0x14087F9C6  mov rcx,rbp
+//   0x14087F9C9  call 0x141E30220         ; SetParamVector(ctx, &fxShared, id, colorPtr)
+//   0x14087F9CE  mov rax,[rsi]
+//   0x14087F9D1  mov [rsp+0x60],rax
+//   0x14087F9DA  mov r8d,[0x145197D78]    ; "critical state" param id
+//   0x14087F9E1  movss xmm3,[rsp+0xC0]    ; <- hook B: state value (vanilla passes 0.0 or 1.0)
+//   0x14087F9EA  lea rdx,[rsp+0x60]
+//   0x14087F9EF  mov rcx,rbp
+//   0x14087F9F2  call 0x141E302D0         ; SetParamFloat(ctx, &fxShared, id, value)
+//
+// Both hooks are pass-through unless the parry-ready window is open. While it is,
+// the color fed to the highlight FX of the player's currently highlighted NPC
+// (identity-checked against WhenHighlightedNPCChanges::highlightedNPCFxInstance)
+// is replaced with the configured gold, and the "critical state" is forced to 1.0.
+// When the window closes the game re-applies its own values on the next update.
+
+static bool  g_HighlightCueEnabled = false;
+static bool  g_ForceCriticalState  = true;
+static bool  g_StrictTargetCheck   = true;
+static float g_GoldHighlightColor[4] = { 1.0f, 0.84f, 0.0f, 0.0f };
+
+// SharedBlock::GetPtr() semantics (see ACU/SharedPtr.h), applied defensively.
+static void* SharedBlock_GetPtr(void* sharedBlock)
+{
+    if (!sharedBlock) { return nullptr; }
+    SharedBlock& sb = *static_cast<SharedBlock*>(sharedBlock);
+    return sb.GetPtr();
+}
+
+static bool HighlightCueShouldApply(const void* fxSharedBlock)
+{
+    if (!g_HighlightCueEnabled || !g_ParryAssaultEnabled) { return false; }
+    if (!fxSharedBlock) { return false; }
+    if (!g_StrictTargetCheck) { return true; }
+
+    // Identity check: only tint the FX of the NPC the player is currently attacking.
+    BhvAssassin* bhv = ACU::GetPlayerBhvAssassin();
+    if (!bhv || !bhv->toHighlightedNPC) { return false; }
+    const void* playerSlot = bhv->toHighlightedNPC->highlightedNPCFxInstance;
+    if (!playerSlot) { return false; }
+    if (playerSlot == fxSharedBlock) { return true; }
+
+    void* playerFx = SharedBlock_GetPtr(const_cast<void*>(playerSlot));
+    void* hookFx   = SharedBlock_GetPtr(const_cast<void*>(fxSharedBlock));
+    return playerFx && playerFx == hookFx;
+}
+
+// Stolen instruction: mov r9,[rsp+0xB8] (color source for the "critical color" param).
+static void OnHighlightCriticalColor(AllRegisters* params)
+{
+    void* colorPtr = *(void**)(params->GetRSP() + 0xB8);
+    const void* fxShared = *(void* const*)(params->GetRSP() + 0x58);
+    if (HighlightCueShouldApply(fxShared))
+    {
+        colorPtr = &g_GoldHighlightColor;
+    }
+    params->r9_ = reinterpret_cast<unsigned long long>(colorPtr);
+}
+
+// Stolen instruction: movss xmm3,[rsp+0xC0] (value for the "critical state" param).
+static void OnHighlightCriticalState(AllRegisters* params)
+{
+    float value = *(float*)(params->GetRSP() + 0xC0);
+    const void* fxShared = *(void* const*)(params->GetRSP() + 0x60);
+    if (g_ForceCriticalState && HighlightCueShouldApply(fxShared))
+    {
+        value = 1.0f;
+    }
+    params->XMM3.fa[0] = value;
+}
+
+struct HighlightCueHooks : AutoAssemblerCodeHolder_Base
+{
+    HighlightCueHooks()
+    {
+        PresetScript_CCodeInTheMiddle(
+            0x14087F9B2, 8, OnHighlightCriticalColor,
+            RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, false);
+        PresetScript_CCodeInTheMiddle(
+            0x14087F9E1, 9, OnHighlightCriticalState,
+            RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, false);
+    }
+};
+
+static void InstallHighlightCueHooks()
+{
+    static AutoAssembleWrapper<HighlightCueHooks> w;
+    w.Activate();
 }
 
 // ---- Insta-critical kill after two parries (ACU 1.5.0, sites found in ACUFixes "Cheats") ----
@@ -207,9 +317,43 @@ static bool EnsureParryAssassinIniDirectoryExists()
     return !error;
 }
 
+void ParryAssassinPlugin::SyncHighlightCueGlobals()
+{
+    // Effective flag also requires the plugin itself to be enabled; synced here and
+    // at the top of OnUpdate so the cue can never outlive the plugin toggle.
+    g_HighlightCueEnabled = m_Enabled && m_HighlightCueEnabled;
+    g_ForceCriticalState  = m_ForceCriticalState;
+    g_StrictTargetCheck   = m_StrictTargetCheck;
+    std::copy(std::begin(m_GoldHighlightColor), std::end(m_GoldHighlightColor),
+              std::begin(g_GoldHighlightColor));
+}
+
+static void ParseColorIni(const char* str, float out[4])
+{
+    const float defaults[4] = { 1.0f, 0.84f, 0.0f, 0.0f };
+    const char* cursor = str ? str : "";
+    for (int i = 0; i < 4; ++i)
+    {
+        char* end = nullptr;
+        float value = strtof(cursor, &end);
+        out[i] = (end != cursor) ? value : defaults[i];
+        cursor = end;
+        while (*cursor && (*cursor == ',' || *cursor == ' ')) { ++cursor; }
+    }
+}
+
+static std::string ColorToIni(const float color[4])
+{
+    char buf[64] = {};
+    snprintf(buf, sizeof(buf), "%.3f,%.3f,%.3f,%.3f",
+             color[0], color[1], color[2], color[3]);
+    return buf;
+}
+
 void ParryAssassinPlugin::LoadSettings()
 {
     InstallAssassinationHooks();
+    InstallHighlightCueHooks();
 
     const std::string iniPath = GetParryAssassinIniPath();
     m_Enabled = GetPrivateProfileIntA(
@@ -220,11 +364,25 @@ void ParryAssassinPlugin::LoadSettings()
         kParryAssassinIniSection, "BoostCritDamage", m_BoostCritDamage ? 1 : 0, iniPath.c_str()) != 0;
     m_UnrestrictedCritEnabled = GetPrivateProfileIntA(
         kParryAssassinIniSection, "UnrestrictedCritEnabled", m_UnrestrictedCritEnabled ? 1 : 0, iniPath.c_str()) != 0;
+    m_HighlightCueEnabled = GetPrivateProfileIntA(
+        kParryAssassinIniSection, "HighlightCueEnabled", m_HighlightCueEnabled ? 1 : 0, iniPath.c_str()) != 0;
+    m_ForceCriticalState = GetPrivateProfileIntA(
+        kParryAssassinIniSection, "ForceCriticalState", m_ForceCriticalState ? 1 : 0, iniPath.c_str()) != 0;
+    m_StrictTargetCheck = GetPrivateProfileIntA(
+        kParryAssassinIniSection, "StrictTargetCheck", m_StrictTargetCheck ? 1 : 0, iniPath.c_str()) != 0;
+    {
+        char colorBuf[128] = {};
+        GetPrivateProfileStringA(
+            kParryAssassinIniSection, "GoldHighlightColor",
+            ColorToIni(m_GoldHighlightColor).c_str(), colorBuf, sizeof(colorBuf), iniPath.c_str());
+        ParseColorIni(colorBuf, m_GoldHighlightColor);
+    }
 
     // This also creates the file (and its directory) on first run and adds any
     // settings that are missing from an older INI file.
     SaveSettings();
     UpdateCritPatches();
+    SyncHighlightCueGlobals();
 }
 
 void ParryAssassinPlugin::SaveSettings()
@@ -241,10 +399,20 @@ void ParryAssassinPlugin::SaveSettings()
         kParryAssassinIniSection, "BoostCritDamage", m_BoostCritDamage ? "1" : "0", iniPath.c_str());
     WritePrivateProfileStringA(
         kParryAssassinIniSection, "UnrestrictedCritEnabled", m_UnrestrictedCritEnabled ? "1" : "0", iniPath.c_str());
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "HighlightCueEnabled", m_HighlightCueEnabled ? "1" : "0", iniPath.c_str());
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "ForceCriticalState", m_ForceCriticalState ? "1" : "0", iniPath.c_str());
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "StrictTargetCheck", m_StrictTargetCheck ? "1" : "0", iniPath.c_str());
+    WritePrivateProfileStringA(
+        kParryAssassinIniSection, "GoldHighlightColor", ColorToIni(m_GoldHighlightColor).c_str(), iniPath.c_str());
 }
 
 void ParryAssassinPlugin::OnUpdate()
 {
+    SyncHighlightCueGlobals();
+
     if (!m_Enabled)
     {
         UpdateCritPatches(); // restores original bytes if the plugin is switched off mid-window
@@ -308,6 +476,7 @@ void ParryAssassinPlugin::OnImGuiRender()
     if (ImGui::Checkbox("Parry Assassination", &m_Enabled))
     {
         UpdateCritPatches();
+        SyncHighlightCueGlobals();
         SaveSettings();
     }
 
@@ -317,6 +486,32 @@ void ParryAssassinPlugin::OnImGuiRender()
         {
             UpdateCritPatches();
             SaveSettings();
+        }
+
+        if (ImGui::Checkbox("Gold highlight cue while ready", &m_HighlightCueEnabled))
+        {
+            SyncHighlightCueGlobals();
+            SaveSettings();
+        }
+        if (m_HighlightCueEnabled)
+        {
+            ImGuiCTX::Indent _indent;
+            if (ImGui::ColorEdit4("Gold color", m_GoldHighlightColor, ImGuiColorEditFlags_NoInputs))
+            {
+                SyncHighlightCueGlobals();
+                SaveSettings();
+            }
+            if (ImGui::Checkbox("Force \"critical state\" param to 1.0", &m_ForceCriticalState))
+            {
+                SyncHighlightCueGlobals();
+                SaveSettings();
+            }
+            if (ImGui::Checkbox("Strict target check (only the highlighted NPC)", &m_StrictTargetCheck))
+            {
+                SyncHighlightCueGlobals();
+                SaveSettings();
+            }
+            ImGui::TextDisabled("Tints the highlight FX of the enemy you are attacking\nwhile the ready window is open.");
         }
 
         if (m_CritKillEnabled)
