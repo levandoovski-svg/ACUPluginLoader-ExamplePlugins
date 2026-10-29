@@ -23,12 +23,37 @@
 //  Failure analysis this rewrite is based on (1.5.0 Steam runtime dump,
 //  MODLOG/scripts/ACU_dumped_pe.exe, base 0x140000000, no ASLR):
 //
+//  0) WRONG-VTABLE BUG (root cause of every previous failure, fixed here).
+//     Everything below previously assumed the type-52 runtime fancy vtable was
+//     0x143A6FFD0. That table is NOT type 52 -- its fancy idx 0x45
+//     (GetEnumParkourAction, 0x1401AD4B0) is a two-instruction accessor that
+//     returns 0x36 (54). Binary-derived table map:
+//       type 52 wallrunUpFromGroundFailed_mb -> 0x143A522F0 (0x45 = 0x140199500 -> 0x34)
+//       type 53 wallrunUpFromGround_mb        -> 0x143A58280 (0x45 = 0x14019C060 -> 0x35)
+//       type 54 wallrunUpToHang               -> 0x143A6FFD0 (0x45 = 0x1401AD4B0 -> 0x36)
+//     Consequences of the wrong pointer: the 53->52 vtable swap produced a
+//     wallrunUpToHang-typed action (so nothing ever matched type 52 and the
+//     force-select never fired, the array fell back to vanilla picks which
+//     looked like an unrelated move firing), the fit-test slot swap was
+//     installed into type 54's table, and the range-widener patch sat inside
+//     type 54's range-setter and polluted wallrunUpToHang actions instead.
+//     Cross-checks that validate the table map: 0x143A13130 (the vtable
+//     ForcedSidehopPlugin successfully swaps to) maps to type 39
+//     (climbFacade_fromWallDescentSidewaysToGround_alsoSidehop), i.e. a
+//     sidehop; and 0x1439F41C0 maps to type 73 (rise-on-ledge), matching
+//     ACUFixes' rise-on-ledge handling.
+//
 //  1) Ordering bug (the main one): the old plugin widened the type-52
 //     acceptance ranges only AFTER CreateParkourActionForParkourPointIfFits
 //     (0x1401D1CF0) had already run InitialTestIfActionFits (0x1401B4900)
 //     and destroyed the action. On walls where vanilla's ranges reject the
 //     probe the wrapper returned false and the plugin did nothing.
-//     -> fixed by GPH_Type52RangeWidener hooking INSIDE the range-setter.
+//     -> the type-52 per-type fit-test (fancy 0x4A) slot is swapped with a
+//        stub that widens the action's ranges and then returns true. This runs
+//        strictly after 0x64 wrote the vanilla ranges and strictly before 0x4A
+//        consumes them, so the widening always applies in time and no
+//        mid-function code hook is needed (the previous 0x1401AF3B6 hook sat
+//        inside type 54's range-setter and is removed).
 //  2) Null fancy-fn crash: the type-52 ctor chain passes through fancy table
 //     0x143A41930 whose idx 0x45 (GetEnumParkourAction) is NULL. Any plugin
 //     enumerating actions via GetEnumParkourAction() calls address 0 and
@@ -37,21 +62,26 @@
 //     -> added GPH ChooseBeforeFiltering/ChooseAfterSorting enforcement
 //        (the same mechanism the reverse-engineered ACU_ParkourPatches.dll
 //        uses when it returns the mutated candidate from sort&select).
+//  4) "Nothing happens" / unrelated move fires: the structural causes are the
+//     discarded-at-creation 52 (fixed by OverrideCreationDiscard) and the
+//     wrong-vtable constant (fixed by note 0).
 //
 //  Type-52 chain (all dump-verified):
 //    creation wrapper 0x1401D1CF0
 //      -> factory 0x1401CC990 (jump table 0x1401D1AF4[0x34] -> ctor 0x1401BC7F0)
-//         -> post-init 0x1401D9210 sets runtime fancy vtable = 0x143A6FFD0
 //      -> fancy 0x3D Set2Floats
 //      -> fancy 0x4B InitialTestIfActionFits = 0x1401B4900
 //           -> fancy 0x64 SetExpectedDistanceRangesAccordingToParkourMode
-//              = 0x1401AF2E0   (hooked at 0x1401AF3B6 by GPH_Type52RangeWidener)
-//           -> fancy 0x49 (0x1401ACBD0)
-//           -> fancy 0x4A per-type geometry test = 0x1401B0340
-//                -> 0x1401B5700 = 5 per-context quick-checks
-//                   (parkour mode / wall slope / mesh / ...) = "wall context" gate
-//           -> TEST AL,AL / JZ reject   (verdict overridden for type 52 by
-//              swapping the fancy-table slot 0x143A70920)
+//              (type 52 = 0x14019AA50, slot 0x143A52F80; type 54 =
+//               0x1401AF2E0, slot 0x143A70C60 -- NOT patched here)
+//           -> fancy 0x49 = 0x1401ACBD0 (shared)
+//           -> fancy 0x4A per-type test. Type 52 = 0x14019B6F0 (slot
+//              0x143A52C40). The transient base table's 0x4A (slot
+//              0x143A42280) holds 0x1401B5700, a SHARED quick-check used by 22
+//              tables -- so both 0x4A paths are swapped, see below.
+//           -> the fit-test VERDICT is overridden from inside the swapped
+//              stub: it widens the action's ranges (safe here -- 0x64 already
+//              ran, 0x4A is what consumes them) and returns true.
 // ============================================================================
 
 // Extended action base with padding matching the game's full action size
@@ -77,14 +107,29 @@ namespace
 
 // ── Type-52 identification constants (runtime dump) ───────────────────────────
 
-// The fancy vtable the type-52 post-init (0x1401D9210) installs. Its fancy
-// idx 0x45 (GetEnumParkourAction) is valid (0x1401AD4B0).
-static constexpr uint64 k_Type52FancyVTable_Runtime = 0x143A6FFD0;
+// The type-52 RUNTIME fancy vtable. Dump-verified: its fancy idx 0x45 slot
+// (0x143A52BA0) holds 0x140199500, a two-instruction `mov eax, 0x34; ret`
+// accessor returning EnumParkourAction 52 = wallrunUpFromGroundFailed_mb.
+// This is the ONLY table in the binary whose 0x45 accessor returns 52.
+// (The value previously used here, 0x143A6FFD0, returns 0x36 = 54 =
+//  wallrunUpToHang -- see note 0) at the top of this file.)
+static constexpr uint64 k_Type52FancyVTable_Runtime = 0x143A522F0;
 
 // Transient base table installed by the shared base ctor (0x1401B9C80) before
-// the post-init replaces it. Its fancy idx 0x45 is NULL — calling
+// the post-init replaces it. Its fancy idx 0x45 is NULL -- calling
 // GetEnumParkourAction() on an action carrying this table crashes.
+// NOTE: its 0x4A slot holds 0x1401B5700, a quick-check SHARED by 22 tables, so
+// this fallback can also match other action types. It is only used to avoid a
+// null dispatch, never to identify the action for conversion.
 static constexpr uint64 k_Type52FancyVTable_TransientBase = 0x143A41930;
+
+// ── Type-52 per-type fit-test slots (the "wall context" gate) ────────────────
+// Reached as fancy idx 0x4A from InitialTestIfActionFits (0x1401B4900). Both
+// addresses below are read straight out of the dump; the vanilla values are
+// re-verified at install time by the fail-safe further down.
+static constexpr uintptr_t k_Type52FitTestSlot_Runtime  = 0x143A52C40;  // -> 0x14019B6F0
+static constexpr uintptr_t k_Type52FitTestSlot_Transient = 0x143A42280; // -> 0x1401B5700 (shared)
+
 
 // climbFacadeTester fancy vtables used by the optional cycle-start swap
 // (ACUFixes-0.9.3 / ACU_ParkourPatches values; both valid tables in the dump

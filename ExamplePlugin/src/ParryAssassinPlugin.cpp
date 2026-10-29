@@ -280,8 +280,17 @@ struct HighlightCueHooks : AutoAssemblerCodeHolder_Base
         PresetScript_CCodeInTheMiddle(
             0x14087FC88, 5, OnHighlightCandidateColor,
             RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+        // Stolen bytes must be whole instructions and at least 5 (the jmp).
+        // The vanilla bytes at 0x14087FD09 are only `test al,al` + `jne rel8`
+        // (4 bytes, with a relative branch), so this hook sits at the next
+        // whole instruction instead: `mov rax,[rbx+0x440]` (7 bytes). The
+        // stack top is unchanged there, so the return-address correlation in
+        // the callback behaves exactly as it did at the original site; the
+        // hook simply no longer fires on the `jne`-taken path, where the
+        // function exits directly with the pending candidate left to expire
+        // (the deep hooks still validate it by return address + FX identity).
         PresetScript_CCodeInTheMiddle(
-            0x14087FD09, 3, ClearPendingHighlightCandidate,
+            0x14087FD0D, 7, ClearPendingHighlightCandidate,
             RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
         PresetScript_CCodeInTheMiddle(
             0x14087F9B2, 8, OnHighlightCriticalColor,
