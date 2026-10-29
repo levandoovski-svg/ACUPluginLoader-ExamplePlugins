@@ -181,7 +181,6 @@ private:
     bool m_BuildCompatible = false;
     bool m_RaycastCompatible = false;
     bool m_BreakfallRequestCompatible = false;
-    bool m_PrevKeyDown = false;
     bool m_ForceActive = false;
     bool m_PendingBreakfall = false;
     bool m_LastTransformApplied = false;

@@ -618,7 +618,9 @@ namespace
         }
 
         file << "// ExactPositionTeleport settings\n"
-             << "// ForceKey is a Windows virtual-key code in hexadecimal (54 = T).\n"
+             << "// ForceKey is a Windows virtual-key code in hexadecimal (54 = T),\n"
+             << "// or a gamepad code 0x1000+ (0x100A = Pad A; names in\n"
+             << "// ExactPositionTeleportPlugin.h, same mechanism as FreeJumpPlugin).\n"
              << "ForceKey=" << std::hex << kDefaultForceKey << std::dec << "\n"
              << "// Dispatch the HSTE ResetBehavior after the transform write.\n"
              << "// This is what forces the parkour system to re-evaluate the context\n"
@@ -894,7 +896,15 @@ void ExactPositionTeleportPlugin::Init()
     m_BuildCompatible = setTransformMatches && resetBehaviorMatches;
     m_BreakfallRequestCompatible = parkourRequestMatches;
     m_RaycastCompatible = raycastCtorMatches && raycastCastMatches && raycastDestroyMatches;
-    m_PrevKeyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
+    // Poll the pads once and seed the rising-edge detector, so a key or pad
+    // button that is already held at startup does not register as a fresh
+    // press on the first frame (extends the old startup seeding to the whole
+    // bindable-code range and to XInput).
+    UpdatePadStates();
+    if (IsValidBindableKey(m_ForceKey))
+    {
+        m_PreviousKeyDown[m_ForceKey] = IsForceKeyDown();
+    }
 
     Log("ini=" + m_IniPath + " log=" + GetLogPath());
 
@@ -946,6 +956,58 @@ void ExactPositionTeleportPlugin::Init()
 
 void ExactPositionTeleportPlugin::OnUpdate()
 {
+    // ── Input polling (always runs, so key rebinding also works while the
+    // plugin is disabled). Same mechanism as FreeJumpPlugin: XInput pads are
+    // polled here, per-code rising edges are computed, and a rebind press is
+    // captured before any gameplay work happens.
+    m_KeyStateUpdatedThisFrame.fill(false);
+    m_JustCapturedKey = 0;
+    UpdatePadStates();
+
+    UpdateKeyState(m_ForceKey);
+    if (m_WaitingForKey)
+    {
+        UpdateAllKeyStates();
+    }
+
+    const auto captureForceKey = [this]() -> bool
+    {
+        for (int vkCode = kKeyboardKeyMin; vkCode <= kKeyboardKeyMax; ++vkCode)
+        {
+            // The left/right mouse buttons belong to the loader UI and would
+            // otherwise be captured by the click that starts a rebind. The
+            // middle and extra mouse buttons, and all gamepad buttons, are
+            // bindable.
+            if (vkCode == VK_LBUTTON || vkCode == VK_RBUTTON)
+                continue;
+            if (WasKeyPressed(vkCode))
+            {
+                m_ForceKey = vkCode;
+                m_JustCapturedKey = m_ForceKey;
+                SetStatus("Force key rebound to " + KeyCodeLabel(m_ForceKey));
+                return true;
+            }
+        }
+        for (int padCode = 0; padCode < ExactTeleportPad_COUNT; ++padCode)
+        {
+            if (WasKeyPressed(kExactTeleportPadKeyBase + padCode))
+            {
+                m_ForceKey = kExactTeleportPadKeyBase + padCode;
+                m_JustCapturedKey = m_ForceKey;
+                SetStatus("Force key rebound to " + KeyCodeLabel(m_ForceKey));
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (m_WaitingForKey && captureForceKey())
+    {
+        m_WaitingForKey = false;
+        // The loader provides no deactivate callback, so persist eagerly.
+        SaveSettings();
+    }
+
     if (!m_PluginEnabled)
     {
         if (m_ForceActive)
@@ -975,13 +1037,15 @@ void ExactPositionTeleportPlugin::OnUpdate()
             : "Deferred HSTE reset failed: player Human was unavailable");
     }
 
-    const bool keyDown = (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
+    const bool keyDown = IsForceKeyDown();
     const bool shiftHeld = IsShiftHeld();
 
-    // Shift + CatchLedge key is not a valid CatchLedge input. Track the
-    // physical key state below so releasing Shift while the key remains held
-    // cannot turn the rejected press into a new valid input.
-    if (!m_WaitingForKey && keyDown && !m_PrevKeyDown)
+    // Shift + CatchLedge key is not a valid CatchLedge input. The rising-edge
+    // detector replaces the old manual key tracking, and a press that was
+    // consumed by the rebind capture never triggers the force. Releasing
+    // Shift while the key remains held therefore cannot turn the rejected
+    // press into a new valid input.
+    if (WasKeyPressed(m_ForceKey) && m_ForceKey != m_JustCapturedKey)
     {
         if (shiftHeld)
         {
@@ -1011,8 +1075,6 @@ void ExactPositionTeleportPlugin::OnUpdate()
             }
         }
     }
-
-    m_PrevKeyDown = keyDown;
 
     ProcessPendingBreakfall();
 }
@@ -1515,38 +1577,37 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show the collapsible debug / parameters section.");
 
-    ImGui::Text("Catch ledge keybind: 0x%02X", m_ForceKey);
-    if (m_ForceKey >= 0x20 && m_ForceKey <= 0x7E)
+    ImGui::Text("Catch ledge keybind: %s", KeyCodeLabel(m_ForceKey).c_str());
+    if (!IsPadCode(m_ForceKey) && m_ForceKey >= 0x20 && m_ForceKey <= 0x7E)
     {
         ImGui::SameLine();
         ImGui::Text("('%c')", static_cast<char>(m_ForceKey));
     }
+    if (m_WaitingForKey)
+    {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f),
+            "Press a keyboard key, mouse button or gamepad button to bind it...");
+    }
     ImGui::SameLine();
     if (ImGui::Button(m_WaitingForKey ? "Cancel rebind" : "Rebind"))
     {
+        // The capture itself runs in OnUpdate (same as FreeJumpPlugin), so it
+        // keeps working while the loader menu is closed.
         m_WaitingForKey = !m_WaitingForKey;
-        if (m_WaitingForKey)
-        {
-            for (int vk = 1; vk <= 0xFF; ++vk)
-                m_CaptureKeyWasDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
-        }
     }
 
-    if (m_WaitingForKey)
+    // Same gamepad status readout as FreeJumpPlugin.
+    if (m_PadDllLoaded)
     {
-        for (int vk = 1; vk <= 0xFF; ++vk)
-        {
-            const bool keyDown = (GetAsyncKeyState(vk) & 0x8000) != 0;
-            const bool newlyPressed = keyDown && !m_CaptureKeyWasDown[vk];
-            m_CaptureKeyWasDown[vk] = keyDown;
-            if (!newlyPressed) continue;
-            m_ForceKey = vk; m_WaitingForKey = false;
-            m_PrevKeyDown = keyDown; SaveSettings();
-            SetStatus("Force key rebound to 0x" + std::to_string(vk));
-            break;
-        }
-        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f),
-            "Press any keyboard key or mouse button to bind it...");
+        if (m_ActivePadSlot >= 0)
+            ImGui::Text("Gamepad: connected (slot %d)", m_ActivePadSlot);
+        else
+            ImGui::Text("Gamepad: none detected");
+    }
+    else
+    {
+        ImGui::TextDisabled("Gamepad: XInput unavailable on this system");
     }
 
     // Collapsible debug section: all parameters, sliders, gates, diagnostics.
@@ -1777,10 +1838,10 @@ void ExactPositionTeleportPlugin::LoadSettings()
         {
             try
             {
-                const int hexKey = std::stoi(value, nullptr, 16);
-                if (hexKey >= 1 && hexKey <= 0xFF)
+                const int parsedKey = std::stoi(value, nullptr, 16);
+                if (IsValidBindableKey(parsedKey))
                 {
-                    m_ForceKey = hexKey;
+                    m_ForceKey = parsedKey;
                 }
             }
             catch (...) {}
@@ -1854,7 +1915,9 @@ void ExactPositionTeleportPlugin::SaveSettings()
         }
 
         file << "// ExactPositionTeleport settings\n"
-             << "// ForceKey is a Windows virtual-key code in hexadecimal (54 = T).\n"
+             << "// ForceKey is a Windows virtual-key code in hexadecimal (54 = T),\n"
+             << "// or a gamepad code 0x1000+ (0x100A = Pad A; names in\n"
+             << "// ExactPositionTeleportPlugin.h, same mechanism as FreeJumpPlugin).\n"
              << "ForceKey=" << std::hex << m_ForceKey << std::dec << "\n"
              << "BreakfallAfterTeleport=" << (m_BreakfallAfterTeleport ? 1 : 0) << "\n"
              << "HoldBreakfallWhileHeld=" << (m_HoldBreakfallWhileHeld ? 1 : 0) << "\n"
