@@ -108,8 +108,6 @@ private:
     int  m_SnapDirectionKey  = VK_F8;
     bool m_WaitingForSnapKey = false;
     bool m_SnapDirectionMode = false;
-    bool m_MouseLockEnabled  = false;
-    bool m_LastMouseLockEnabled = false;
 
     // Parkour mode: while active, the selected ActionKeyCode entries are forced
     // unpressed so their physical keys are free to trigger override bindings.
@@ -145,17 +143,7 @@ private:
     // Overrides
     std::vector<ParkourActionOverride> m_Overrides;
 
-    // Ability set management for mouse lock
-    struct SavedAbilityFlags
-    {
-        uint8_t byte22 = 0, byte29 = 0, byte2A = 0;
-    } m_SavedFlags;
-    bool m_FlagsSaved = false;
-    bool ApplyMouseLock(bool enable);
-    bool SaveCurrentFlags();
-    bool RestoreFlags();
-    static class AssassinAbilitySet* GetActiveAbilitySet();
-
-    // Parkour mode suppression hook (active only while the mode is enabled).
+    // Parkour mode suppression hooks (active only while the mode is enabled;
+    // one site on the keyboard/mouse keymap stage, one on the gamepad stage).
     void ApplyParkourMode(bool enable);
 };

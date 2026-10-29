@@ -4,8 +4,6 @@
 #include "ParkourDebugging/AvailableParkourAction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
 #include "ParkourDebugging/FancyVFunctionDescription.h"
-#include "ACU/PlayerProgressionManager.h"
-#include "ACU/AssassinAbilitySet.h"
 #include "ACU_DefineNativeFunction.h"
 #include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include <Windows.h>
@@ -28,6 +26,12 @@
 
 // ACU 1.5.0 / ACUFixes-0.9.3 verified SmallArray POD-removal entry point.
 DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
+
+// Pad analog of the mouse-vector update (0x14273C190): reads the gamepad
+// keymap's axis entries plus the pad state buffer at InputContainerBig+0x864
+// and writes the pad wasd/mouse vectors. Reproduced by the Parkour Mode
+// gamepad-site callback (its rel32 call is stolen, not re-executed).
+DEFINE_GAME_FUNCTION(PadActionAxisAndVectorUpdate, 0x14273C4C0, void, __fastcall, (void* inputContainerBig, void* padStateBuffer, void* padKeymap));
 
 namespace
 {
@@ -358,17 +362,39 @@ namespace
     }
 
     // ── Parkour mode: action-key suppression ──────────────────────
-    // 0x14273BC7B is inside the per-frame input update function (0x14273BAC0),
-    // after the game has filled InputContainerBig::keyStates_thisFrame from the
-    // keymap (0x14273B2B0) and before the mouse-vector update. At this point
-    // rbx_ is the InputContainerBig* — the same register the ACUFixes-0.9.3
-    // mousewheel-cycle hook at 0x14273BC75 relies on for the same struct.
-    // Clearing isPressed_byAction[] entries here disables the corresponding
-    // ActionKeyCode for the whole frame without touching the player's actual
-    // bindings (verified against the 1.5.0 dump: bytes 48 8B D6 48 8B CB).
+    // The per-frame input-update chain (vfunc slot 0x0C of the keymap owner)
+    // fills InputContainerBig::keyStates_thisFrame (+0x30) from two device
+    // keymaps, and Parkour Mode clears disabled entries after BOTH fills:
+    //
+    // Site 1 (keyboard/mouse), 0x14273BC7B: inside the chain section that runs
+    // after the KBM keymap fill (0x14273B2B0) and before the mouse-vector
+    // update (0x14273C190). rbx_ is the InputContainerBig*. The 6 stolen
+    // bytes (48 8B D6 48 8B CB = mov rdx,rsi; mov rcx,rbx) are whole
+    // instructions re-executed by the trampoline. Verified against the 1.5.0
+    // runtime dump; chains behind the ACUFixes-0.9.3 mousewheel-cycle hook at
+    // 0x14273BC75, whose trampoline returns exactly to 0x14273BC7B.
+    //
+    // Site 2 (gamepad), 0x14273BED2: the chain continues into a pad-specific
+    // stage (entered at 0x14273BE10, which only proceeds when the active
+    // input device is the gamepad: cmp dword ptr [InputContainerBig+0x830],9).
+    // There FUN_14273BE6D polls the pad into InputContainerBig+0x864 and
+    // FUN_14273b390 re-fills ALL 32 keyStates_thisFrame entries from the pad
+    // keymap (rdi) — AFTER site 1 — so pad presses would resurrect suppressed
+    // actions. Site 2 sits between that pad fill and the per-action
+    // bool→float conversion; the stolen instruction is the whole rel32 call
+    // `call FUN_14273c4c0` (vanilla bytes E8 E9 05 00 00, pad analog of the
+    // mouse-vector update). A rel32 call cannot be re-executed verbatim from
+    // the trampoline, so the callback reproduces it from the saved registers
+    // (rcx=InputContainerBig*, rdx=+0x864 pad state, r8=pad keymap — all set
+    // by the preceding instructions) and THEN clears the disabled entries, so
+    // the following conversion (and therefore fltIsPressed_* and every
+    // downstream consumer) sees zeros. When the gamepad is not the active
+    // device the pad stage is skipped entirely and site 2 never executes.
+    // Both sites' vanilla bytes are asserted before install (dump:
+    // MODLOG/scripts/pad_input_out.txt, pad_chain_out.txt).
     FreeJumpPlugin* g_ParkourModeInstance = nullptr;
 
-    void SuppressDisabledActionKeys(AllRegisters* params)
+    void ZeroDisabledActionKeyStates(AllRegisters* params)
     {
         FreeJumpPlugin* owner = g_ParkourModeInstance;
         if (!owner)
@@ -388,6 +414,27 @@ namespace
         }
     }
 
+    void SuppressDisabledActionKeys(AllRegisters* params)
+    {
+        ZeroDisabledActionKeyStates(params);
+    }
+
+    void SuppressDisabledActionKeysAfterPadFill(AllRegisters* params)
+    {
+        // Reproduce the stolen `call PadActionAxisAndVectorUpdate` first, with
+        // the exact register state the original call site had, so the
+        // pad-vector update sees its original inputs. AllRegisters is only
+        // written back after the callback returns, and the code that resumes
+        // at 0x14273BED7 reloads every register it uses before reading one,
+        // so the call's register clobbers do not leak.
+        PadActionAxisAndVectorUpdate(
+            reinterpret_cast<void*>(static_cast<uintptr_t>(params->rcx_)),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(params->rdx_)),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(params->r8_)));
+
+        ZeroDisabledActionKeyStates(params);
+    }
+
     struct ParkourModeSuppressHook : AutoAssemblerCodeHolder_Base
     {
         ParkourModeSuppressHook()
@@ -397,6 +444,11 @@ namespace
                 SuppressDisabledActionKeys,
                 RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
                 true);
+            PresetScript_CCodeInTheMiddle(
+                0x14273BED2, 5,
+                SuppressDisabledActionKeysAfterPadFill,
+                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
+                false);
         }
     };
 
@@ -408,21 +460,25 @@ namespace
 
     bool IsParkourSuppressSitePatched()
     {
-        // Vanilla bytes at 0x14273BC7B: mov rdx,rsi ; mov rcx,rbx.
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BC7B);
-        return !(site[0] == 0x48 && site[1] == 0x8B && site[2] == 0xD6
-            && site[3] == 0x48 && site[4] == 0x8B && site[5] == 0xCB);
+        // Site 1 vanilla bytes: mov rdx,rsi ; mov rcx,rbx.
+        const uint8_t* site1 = reinterpret_cast<const uint8_t*>(0x14273BC7B);
+        if (site1[0] != 0x48 || site1[1] != 0x8B || site1[2] != 0xD6
+            || site1[3] != 0x48 || site1[4] != 0x8B || site1[5] != 0xCB)
+        {
+            return true;
+        }
+        // Site 2 vanilla bytes: call FUN_14273c4c0 (E8 E9 05 00 00).
+        const uint8_t* site2 = reinterpret_cast<const uint8_t*>(0x14273BED2);
+        if (site2[0] != 0xE8 || site2[1] != 0xE9 || site2[2] != 0x05
+            || site2[3] != 0x00 || site2[4] != 0x00)
+        {
+            return true;
+        }
+        return false;
     }
 }
 
-// ── AssassinAbilitySet helpers ────────────────────────────────────────
-
-AssassinAbilitySet* FreeJumpPlugin::GetActiveAbilitySet()
-{
-    PlayerProgressionManager* mgr = PlayerProgressionManager::GetSingleton();
-    if (!mgr) return nullptr;
-    return mgr->assassinAbilitySets.GetHighestPrioritySet();
-}
+// ── INI persistence ───────────────────────────────────────────────────
 
 static std::string GetIniPath()
 {
@@ -499,12 +555,6 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseBool(value, enabled))
                 m_SnapDirectionMode = enabled;
         }
-        else if (TryGetValue(trimmedLine, "MouseLockEnabled=", value))
-        {
-            bool enabled = false;
-            if (TryParseBool(value, enabled))
-                m_MouseLockEnabled = enabled;
-        }
         else if (TryGetValue(trimmedLine, "NumOverrides=", value))
         {
             int count = 0;
@@ -557,7 +607,6 @@ void FreeJumpPlugin::SaveSettings()
     file << "FreeJumpKey=" << std::hex << m_ToggleKey << std::dec << "\n";
     file << "SnapDirectionKey=" << std::hex << m_SnapDirectionKey << std::dec << "\n";
     file << "SnapDirectionMode=" << (m_SnapDirectionMode ? 1 : 0) << "\n";
-    file << "MouseLockEnabled=" << (m_MouseLockEnabled ? 1 : 0) << "\n";
     file << "ParkourModeKey=" << std::hex << m_ParkourModeKey << std::dec << "\n";
     file << "ParkourModeOn=" << (m_ParkourModeOn ? 1 : 0) << "\n";
     file << "ParkourDisabledActions=";
@@ -613,49 +662,6 @@ void FreeJumpPlugin::SaveSettings()
     }
 }
 
-bool FreeJumpPlugin::SaveCurrentFlags()
-{
-    AssassinAbilitySet* set = GetActiveAbilitySet();
-    if (!set) return false;
-    m_SavedFlags.byte22 = *(uint8_t*)((uintptr_t)set + 0x22);
-    m_SavedFlags.byte29 = *(uint8_t*)((uintptr_t)set + 0x29);
-    m_SavedFlags.byte2A = *(uint8_t*)((uintptr_t)set + 0x2A);
-    m_FlagsSaved = true;
-    return true;
-}
-
-bool FreeJumpPlugin::RestoreFlags()
-{
-    if (!m_FlagsSaved) return true;
-    AssassinAbilitySet* set = GetActiveAbilitySet();
-    if (!set) return false;
-    *(uint8_t*)((uintptr_t)set + 0x22) = m_SavedFlags.byte22;
-    *(uint8_t*)((uintptr_t)set + 0x29) = m_SavedFlags.byte29;
-    *(uint8_t*)((uintptr_t)set + 0x2A) = m_SavedFlags.byte2A;
-    m_FlagsSaved = false;
-    return true;
-}
-
-bool FreeJumpPlugin::ApplyMouseLock(bool enable)
-{
-    AssassinAbilitySet* set = GetActiveAbilitySet();
-    if (!set) return false;
-    if (enable)
-    {
-        if (!m_FlagsSaved && !SaveCurrentFlags())
-            return false;
-        uint8_t* byte22 = (uint8_t*)((uintptr_t)set + 0x22);
-        *byte22 &= ~(1 << 2);
-        uint8_t* byte29 = (uint8_t*)((uintptr_t)set + 0x29);
-        *byte29 &= ~((1 << 1) | (1 << 4));
-        uint8_t* byte2A = (uint8_t*)((uintptr_t)set + 0x2A);
-        *byte2A &= ~(1 << 0);
-        return true;
-    }
-
-    return RestoreFlags();
-}
-
 static Vector2f GetCameraFlatForward()
 {
     auto* cam = ACUPlayerCameraComponent::GetSingleton();
@@ -691,8 +697,6 @@ void FreeJumpPlugin::OnBeforeActivate()
     m_Callbacks.m_CallbackPriority = 5.0f;
     m_Callbacks.m_Name = "FreeJumpPlugin";
 
-    if (m_MouseLockEnabled)
-        m_LastMouseLockEnabled = ApplyMouseLock(true);
     if (m_ParkourModeOn && m_DisabledActionMask)
         ApplyParkourMode(true);
 }
@@ -706,11 +710,6 @@ void FreeJumpPlugin::OnBeforeDeactivate()
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
         m_HookActivator.reset();
         m_HookActive = false;
-    }
-    if (m_FlagsSaved)
-    {
-        ApplyMouseLock(false);
-        m_LastMouseLockEnabled = false;
     }
     SaveSettings();
 }
@@ -1002,12 +1001,6 @@ void FreeJumpPlugin::OnUpdate()
         }
     }
 
-    if (m_MouseLockEnabled != m_LastMouseLockEnabled)
-    {
-        if (ApplyMouseLock(m_MouseLockEnabled))
-            m_LastMouseLockEnabled = m_MouseLockEnabled;
-    }
-
     const bool freeJumpHeld = m_ToggleKey != m_JustCapturedKey
         && !MouseBindWouldHitUi(m_ToggleKey)
         && IsKeyHeld(m_ToggleKey);
@@ -1079,9 +1072,10 @@ void FreeJumpPlugin::OnImGuiRender()
     if (m_ParkourHookRefused)
     {
         ImGui::TextWrapped(
-            "The input-update site used by Parkour Mode (0x14273BC7B) is already "
-            "patched by another plugin, so Parkour Mode was not installed. Remove the "
-            "conflicting input-modifying plugin, then toggle Parkour Mode again.");
+            "An input-update site used by Parkour Mode (0x14273BC7B keyboard/mouse, "
+            "0x14273BED2 gamepad) is already patched by another plugin, so Parkour Mode "
+            "was not installed. Remove the conflicting input-modifying plugin, then "
+            "toggle Parkour Mode again.");
     }
     if (m_PadDllLoaded)
     {
@@ -1133,11 +1127,6 @@ void FreeJumpPlugin::OnImGuiRender()
         }
 
         ImGui::Separator();
-        bool mouseLock = m_MouseLockEnabled;
-        if (ImGui::Checkbox("Disable Left/Right Mouse Buttons (sword/aim)", &mouseLock))
-        { m_MouseLockEnabled = mouseLock; SaveSettings(); }
-
-        ImGui::Separator();
         ImGui::Text("Parkour Mode:");
         ImGui::SameLine();
         ImGui::TextColored(m_ParkourModeOn ? activeColor : inactiveColor,
@@ -1163,9 +1152,10 @@ void FreeJumpPlugin::OnImGuiRender()
         if (ImGui::TreeNode("Actions disabled while Parkour Mode is on"))
         {
             ImGui::TextWrapped(
-                "While Parkour Mode is active these ActionKeyCode entries are forced unpressed, "
-                "so their physical keys are free for override bindings. Your keybindings are "
-                "never modified, and everything returns to normal when the mode is switched off.");
+                "While Parkour Mode is active these ActionKeyCode entries are forced unpressed "
+                "(keyboard, mouse, and gamepad bindings), so their buttons are free for override "
+                "bindings. Your keybindings are never modified, and everything returns to normal "
+                "when the mode is switched off.");
             bool maskChanged = false;
             for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
             {

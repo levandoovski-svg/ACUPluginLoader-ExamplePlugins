@@ -19,12 +19,30 @@
 #include <filesystem>
 #include <fstream>
 #include <shlobj.h>
+#include <sstream>
+#include <string>
+#include <Windows.h>
 #include <xmmintrin.h>
 
 namespace
 {
     constexpr int kDefaultForceKey = 'T'; // VK_T
     constexpr int kDefaultBreakfallDelayMs = 100;
+
+    // Bindable keyboard/mouse range: Win32 virtual-key codes. These mirror
+    // FreeJumpPlugin.h so both plugins share the same code semantics.
+    constexpr int kKeyboardKeyMin = 0x01;
+    constexpr int kKeyboardKeyMax = 0xFE;
+
+    bool IsBindableKeyboardCode(int bindableKeyCode)
+    {
+        return bindableKeyCode >= kKeyboardKeyMin && bindableKeyCode <= kKeyboardKeyMax;
+    }
+    bool IsBindablePadCode(int bindableKeyCode)
+    {
+        return bindableKeyCode >= kExactTeleportPadKeyBase
+            && bindableKeyCode < kExactTeleportPadKeyBase + ExactTeleportPad_COUNT;
+    }
 
     // ACUFixes-0.9.3 addresses for the build represented by the runtime dump
     // in MODLOG/breakfall-gate.md (base 0x140000000, no ASLR).
@@ -235,6 +253,89 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
         }
+    }
+
+    // Gamepad (XInput) input, same mechanism as FreeJumpPlugin.
+    //
+    // XInput is loaded dynamically: no XInput import library is linked into
+    // the plugin, and the loader environment may predate xinput1_4.dll. The
+    // game itself imports xinput1_3.dll, so an XInput-capable pad is already
+    // a supported controller for ACU on PC (a DualStyle/DualShock pad needs
+    // Steam Input or DS4Windows to appear as an XInput device).
+    struct XInputPadState
+    {
+        uint32_t packetNumber;
+        uint16_t buttons;
+        uint8_t leftTrigger;
+        uint8_t rightTrigger;
+        int16_t thumbLX, thumbLY, thumbRX, thumbRY;
+    };
+    using XInputGetState_t = DWORD(WINAPI*)(DWORD, XInputPadState*);
+
+    XInputGetState_t GetXInputGetState()
+    {
+        static const XInputGetState_t cached = []() -> XInputGetState_t
+        {
+            const char* dllNames[] = {
+                "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinput1_2.dll", "xinput1_1.dll"
+            };
+            for (const char* dllName : dllNames)
+            {
+                if (HMODULE module = LoadLibraryA(dllName))
+                {
+                    if (auto named = (XInputGetState_t)GetProcAddress(module, "XInputGetState"))
+                        return named;
+                    // xinput9_1_0.dll only exports the function by ordinal.
+                    if (auto byOrdinal = (XInputGetState_t)GetProcAddress(module, (const char*)100))
+                        return byOrdinal;
+                }
+            }
+            return nullptr;
+        }();
+        return cached;
+    }
+
+    const char* PadCodeName(int bindableKeyCode)
+    {
+        static const char* names[ExactTeleportPad_COUNT] = {
+            "Pad DPad Up", "Pad DPad Down", "Pad DPad Left", "Pad DPad Right",
+            "Pad Start", "Pad Back",
+            "Pad L3", "Pad R3",
+            "Pad LB", "Pad RB",
+            "Pad A", "Pad B", "Pad X", "Pad Y",
+            "Pad Left Trigger", "Pad Right Trigger",
+            "Pad LStick Up", "Pad LStick Down", "Pad LStick Left", "Pad LStick Right",
+            "Pad RStick Up", "Pad RStick Down", "Pad RStick Left", "Pad RStick Right",
+        };
+        if (!IsBindablePadCode(bindableKeyCode))
+            return "";
+        return names[bindableKeyCode - kExactTeleportPadKeyBase];
+    }
+
+    std::string KeyCodeLabel(int bindableKeyCode)
+    {
+        if (IsBindablePadCode(bindableKeyCode))
+        {
+            std::ostringstream label;
+            label << "0x" << std::uppercase << std::hex << bindableKeyCode
+                  << " (" << PadCodeName(bindableKeyCode) << ")";
+            return label.str();
+        }
+        const char* mouseName = nullptr;
+        switch (bindableKeyCode)
+        {
+        case VK_LBUTTON:  mouseName = "Mouse Left"; break;
+        case VK_RBUTTON:  mouseName = "Mouse Right"; break;
+        case VK_MBUTTON:  mouseName = "Mouse Middle"; break;
+        case VK_XBUTTON1: mouseName = "Mouse X1"; break;
+        case VK_XBUTTON2: mouseName = "Mouse X2"; break;
+        default: break;
+        }
+        std::ostringstream label;
+        label << "0x" << std::uppercase << std::hex << bindableKeyCode;
+        if (mouseName)
+            label << " (" << mouseName << ")";
+        return label.str();
     }
 
     bool IsShiftHeld()
@@ -575,6 +676,128 @@ namespace
         file.flush();
         return static_cast<bool>(file);
     }
+}
+
+// ── Bindable key input ─────────────────────────────────────────────────────
+// Same mechanism as FreeJumpPlugin: Win32 GetAsyncKeyState for the
+// keyboard/mouse codes, XInput (polled by the plugin itself) for the pad
+// codes, and a rising-edge detector that does not rely on the unreliable low
+// bit of GetAsyncKeyState.
+
+bool ExactPositionTeleportPlugin::IsValidBindableKey(int bindableKeyCode)
+{
+    return IsBindableKeyboardCode(bindableKeyCode) || IsBindablePadCode(bindableKeyCode);
+}
+
+bool ExactPositionTeleportPlugin::IsPadCode(int bindableKeyCode)
+{
+    return IsBindablePadCode(bindableKeyCode);
+}
+
+void ExactPositionTeleportPlugin::UpdatePadStates()
+{
+    m_ActivePadSlot = -1;
+    m_PadDown.fill(false);
+
+    XInputGetState_t getState = GetXInputGetState();
+    if (!getState)
+    {
+        m_PadDllLoaded = false;
+        return;
+    }
+    m_PadDllLoaded = true;
+
+    constexpr int kLeftThumbDeadzone = 7849;   // XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
+    constexpr int kTriggerThreshold = 30;      // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+    constexpr int kPadSlotCount = 4;
+    for (int slot = 0; slot < kPadSlotCount; ++slot)
+    {
+        XInputPadState state{};
+        if (getState(slot, &state) != ERROR_SUCCESS)
+            continue;
+
+        auto markPadCode = [this](int padCode)
+        {
+            m_PadDown[padCode] = true;
+        };
+
+        if (state.buttons & 0x0001) markPadCode(ExactTeleportPad_DPadUp);
+        if (state.buttons & 0x0002) markPadCode(ExactTeleportPad_DPadDown);
+        if (state.buttons & 0x0004) markPadCode(ExactTeleportPad_DPadLeft);
+        if (state.buttons & 0x0008) markPadCode(ExactTeleportPad_DPadRight);
+        if (state.buttons & 0x0010) markPadCode(ExactTeleportPad_Start);
+        if (state.buttons & 0x0020) markPadCode(ExactTeleportPad_Back);
+        if (state.buttons & 0x0040) markPadCode(ExactTeleportPad_L3);
+        if (state.buttons & 0x0080) markPadCode(ExactTeleportPad_R3);
+        if (state.buttons & 0x0100) markPadCode(ExactTeleportPad_LB);
+        if (state.buttons & 0x0200) markPadCode(ExactTeleportPad_RB);
+        if (state.buttons & 0x1000) markPadCode(ExactTeleportPad_A);
+        if (state.buttons & 0x2000) markPadCode(ExactTeleportPad_B);
+        if (state.buttons & 0x4000) markPadCode(ExactTeleportPad_X);
+        if (state.buttons & 0x8000) markPadCode(ExactTeleportPad_Y);
+        if (state.leftTrigger > kTriggerThreshold) markPadCode(ExactTeleportPad_LeftTrigger);
+        if (state.rightTrigger > kTriggerThreshold) markPadCode(ExactTeleportPad_RightTrigger);
+        if (state.thumbLY > kLeftThumbDeadzone)  markPadCode(ExactTeleportPad_LeftStickUp);
+        if (state.thumbLY < -kLeftThumbDeadzone) markPadCode(ExactTeleportPad_LeftStickDown);
+        if (state.thumbLX < -kLeftThumbDeadzone) markPadCode(ExactTeleportPad_LeftStickLeft);
+        if (state.thumbLX > kLeftThumbDeadzone)  markPadCode(ExactTeleportPad_LeftStickRight);
+        if (state.thumbRY > kLeftThumbDeadzone)  markPadCode(ExactTeleportPad_RightStickUp);
+        if (state.thumbRY < -kLeftThumbDeadzone) markPadCode(ExactTeleportPad_RightStickDown);
+        if (state.thumbRX < -kLeftThumbDeadzone) markPadCode(ExactTeleportPad_RightStickLeft);
+        if (state.thumbRX > kLeftThumbDeadzone)  markPadCode(ExactTeleportPad_RightStickRight);
+
+        if (state.buttons
+            || state.leftTrigger > kTriggerThreshold
+            || state.rightTrigger > kTriggerThreshold
+            || state.thumbLX > kLeftThumbDeadzone || state.thumbLX < -kLeftThumbDeadzone
+            || state.thumbLY > kLeftThumbDeadzone || state.thumbLY < -kLeftThumbDeadzone
+            || state.thumbRX > kLeftThumbDeadzone || state.thumbRX < -kLeftThumbDeadzone
+            || state.thumbRY > kLeftThumbDeadzone || state.thumbRY < -kLeftThumbDeadzone)
+        {
+            m_ActivePadSlot = slot;
+        }
+    }
+}
+
+void ExactPositionTeleportPlugin::UpdateKeyState(int bindableKeyCode)
+{
+    if (!IsValidBindableKey(bindableKeyCode) || m_KeyStateUpdatedThisFrame[bindableKeyCode])
+        return;
+
+    bool keyIsDown = false;
+    if (bindableKeyCode <= kKeyboardKeyMax)
+    {
+        keyIsDown = (GetAsyncKeyState(bindableKeyCode) & 0x8000) != 0;
+    }
+    else
+    {
+        keyIsDown = m_PadDown[bindableKeyCode - kExactTeleportPadKeyBase];
+    }
+    m_KeyPressedThisFrame[bindableKeyCode] = keyIsDown && !m_PreviousKeyDown[bindableKeyCode];
+    m_PreviousKeyDown[bindableKeyCode] = keyIsDown;
+    m_KeyStateUpdatedThisFrame[bindableKeyCode] = true;
+}
+
+void ExactPositionTeleportPlugin::UpdateAllKeyStates()
+{
+    for (int vkCode = kKeyboardKeyMin; vkCode <= kKeyboardKeyMax; ++vkCode)
+        UpdateKeyState(vkCode);
+    for (int padCode = 0; padCode < ExactTeleportPad_COUNT; ++padCode)
+        UpdateKeyState(kExactTeleportPadKeyBase + padCode);
+}
+
+bool ExactPositionTeleportPlugin::WasKeyPressed(int bindableKeyCode) const
+{
+    return IsValidBindableKey(bindableKeyCode) && m_KeyPressedThisFrame[bindableKeyCode];
+}
+
+bool ExactPositionTeleportPlugin::IsForceKeyDown() const
+{
+    if (IsPadCode(m_ForceKey))
+        return m_PadDown[m_ForceKey - kExactTeleportPadKeyBase];
+    if (IsBindableKeyboardCode(m_ForceKey))
+        return (GetAsyncKeyState(m_ForceKey) & 0x8000) != 0;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
