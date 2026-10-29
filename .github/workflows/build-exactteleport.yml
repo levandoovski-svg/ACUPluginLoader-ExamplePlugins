@@ -1,0 +1,68 @@
+name: Build ExactPositionTeleportPlugin
+
+# Dedicated workflow for the ExactPositionTeleportPlugin build. Builds
+# ExamplePlugin/ExactPositionTeleportPlugin.vcxproj (its own entry point,
+# src/main.exactteleport.cpp) into a standalone ExactPositionTeleportPlugin.dll
+# so the root build.yml (FreeJumpPlugin / ExamplePlugin.vcxproj) never needs
+# its project reference switched when working on another plugin. Runs only
+# when ExactPositionTeleport-related files (or shared CommonLibACU) change,
+# or on manual dispatch.
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - "ExamplePlugin/src/ExactPositionTeleportPlugin.cpp"
+      - "ExamplePlugin/src/ExactPositionTeleportPlugin.h"
+      - "ExamplePlugin/src/main.exactteleport.cpp"
+      - "ExamplePlugin/src/pch.cpp"
+      - "ExamplePlugin/src/pch.h"
+      - "ExamplePlugin/ExactPositionTeleportPlugin.vcxproj"
+      - "CommonLibACU/**"
+      - ".github/workflows/build-exactteleport.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable Long Paths
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Checkout plugin repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        path: 's'
+        submodules: 'recursive'
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Checkout ACUFixes repo
+      uses: actions/checkout@v4
+      with:
+        repository: NameTaken3125/ACUFixes
+        fetch-depth: 0
+        path: 'ACUFixes'
+
+    - name: Clean build artifacts
+      shell: pwsh
+      run: |
+        $buildDir = "${{ github.workspace }}\s\ExamplePlugin\build"
+        if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build ExactPositionTeleportPlugin
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\ExamplePlugin\ExactPositionTeleportPlugin.vcxproj" /p:Configuration=Release /p:Platform=x64 "/p:ACUFixesInclude=$root\s\ACUFixes-master\ACUFixes\src" /m
+
+    - name: Upload DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: exactteleport-plugin-dll
+        path: |
+          s/ExamplePlugin/build/x64/Release/plugins/ExactPositionTeleportPlugin.dll
