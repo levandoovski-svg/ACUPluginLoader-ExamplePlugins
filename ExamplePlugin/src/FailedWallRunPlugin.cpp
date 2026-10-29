@@ -459,30 +459,41 @@ void FailedWallRunPlugin::LoadSettings()
     std::string line;
     while (std::getline(file, line))
     {
-        if (line.rfind("ToggleKey=", 0) == 0)
-            try { m_ToggleKey = std::stoi(line.substr(10), nullptr, 16); } catch (...) {}
-        else if (line.rfind("Enabled=", 0) == 0)
-            m_PluginEnabled = (line.substr(8) == "1");
-        else if (line.rfind("HoldMode=", 0) == 0)
-            try { m_HoldMode = std::stoi(line.substr(9)) != 0; } catch (...) {}
-        else if (line.rfind("ToggleState=", 0) == 0)
-            try { m_ToggleState = std::stoi(line.substr(12)) != 0; } catch (...) {}
-        else if (line.rfind("LiftAmount=", 0) == 0)
-            try { m_LiftAmount = std::stof(line.substr(11)); } catch (...) {}
-        else if (line.rfind("AnimationCancel=", 0) == 0)
-            m_CancelEnabled = (line.substr(15) == "1");
-        else if (line.rfind("LiftSpeed=", 0) == 0)
-            try { m_LiftSpeed = std::stof(line.substr(10)); } catch (...) {}
-        else if (line.rfind("EnforceEnabled=", 0) == 0)
-            m_EnforceEnabled = (line.substr(15) == "1");
-        else if (line.rfind("RangeWidenerEnabled=", 0) == 0)
-            m_RangeWidenerEnabled = (line.substr(20) == "1");
-        else if (line.rfind("SkipFitTest=", 0) == 0)
-            m_SkipFitTestEnabled = (line.substr(12) == "1");
-        else if (line.rfind("VtableSwapEnabled=", 0) == 0)
-            m_VtableSwapEnabled = (line.substr(18) == "1");
-        else if (line.rfind("SingleStageMode=", 0) == 0)
-            m_SingleStageMode = (line.substr(18) == "1");
+        // Defensive: a malformed or unexpectedly short line must never throw
+        // out of the init stage (an uncaught std::out_of_range here previously
+        // terminated the process at game startup through the loader's plugin
+        // init call — the substr offsets below must match their key lengths).
+        try
+        {
+            if (line.rfind("ToggleKey=", 0) == 0)                 // 10 chars
+                try { m_ToggleKey = std::stoi(line.substr(10), nullptr, 16); } catch (...) {}
+            else if (line.rfind("Enabled=", 0) == 0)              // 8 chars
+                m_PluginEnabled = (line.substr(8) == "1");
+            else if (line.rfind("HoldMode=", 0) == 0)             // 9 chars
+                try { m_HoldMode = std::stoi(line.substr(9)) != 0; } catch (...) {}
+            else if (line.rfind("ToggleState=", 0) == 0)          // 12 chars
+                try { m_ToggleState = std::stoi(line.substr(12)) != 0; } catch (...) {}
+            else if (line.rfind("LiftAmount=", 0) == 0)           // 11 chars
+                try { m_LiftAmount = std::stof(line.substr(11)); } catch (...) {}
+            else if (line.rfind("AnimationCancel=", 0) == 0)      // 16 chars
+                m_CancelEnabled = (line.substr(16) == "1");
+            else if (line.rfind("LiftSpeed=", 0) == 0)            // 10 chars
+                try { m_LiftSpeed = std::stof(line.substr(10)); } catch (...) {}
+            else if (line.rfind("EnforceEnabled=", 0) == 0)       // 15 chars
+                m_EnforceEnabled = (line.substr(15) == "1");
+            else if (line.rfind("RangeWidenerEnabled=", 0) == 0)  // 20 chars
+                m_RangeWidenerEnabled = (line.substr(20) == "1");
+            else if (line.rfind("SkipFitTest=", 0) == 0)          // 12 chars
+                m_SkipFitTestEnabled = (line.substr(12) == "1");
+            else if (line.rfind("VtableSwapEnabled=", 0) == 0)    // 18 chars
+                m_VtableSwapEnabled = (line.substr(18) == "1");
+            else if (line.rfind("SingleStageMode=", 0) == 0)      // 16 chars
+                m_SingleStageMode = (line.substr(16) == "1");
+        }
+        catch (...)
+        {
+            // Never let INI parsing take the game down.
+        }
     }
 }
 

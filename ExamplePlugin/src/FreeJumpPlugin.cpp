@@ -7,6 +7,7 @@
 #include "ACU/PlayerProgressionManager.h"
 #include "ACU/AssassinAbilitySet.h"
 #include "ACU_DefineNativeFunction.h"
+#include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include <Windows.h>
 #include <shlobj.h>
 #include <algorithm>
@@ -111,9 +112,131 @@ namespace
         return false;
     }
 
-    bool IsValidVirtualKey(int virtualKey)
+    bool IsValidBindableKey(int bindableKeyCode)
     {
-        return virtualKey >= 1 && virtualKey <= 0xFE;
+        if (bindableKeyCode >= kKeyboardKeyMin && bindableKeyCode <= kKeyboardKeyMax)
+            return true;
+        return bindableKeyCode >= kPadKeyBase && bindableKeyCode < kPadKeyBase + PadCode_COUNT;
+    }
+
+    bool IsPadCode(int bindableKeyCode)
+    {
+        return bindableKeyCode >= kPadKeyBase && bindableKeyCode < kPadKeyBase + PadCode_COUNT;
+    }
+
+    // XInput is loaded dynamically: the loader environment may predate
+    // xinput1_4.dll, and no XInput import library is linked into the plugin.
+    // The game itself imports xinput1_3.dll, so an XInput-capable pad is already
+    // a supported controller for ACU on PC (DualSense via Steam Input or
+    // DS4Windows, which present as XInput devices).
+    struct XInputPadState
+    {
+        uint32_t packetNumber;
+        uint16_t buttons;
+        uint8_t leftTrigger;
+        uint8_t rightTrigger;
+        int16_t thumbLX, thumbLY, thumbRX, thumbRY;
+    };
+    using XInputGetState_t = DWORD(WINAPI*)(DWORD, XInputPadState*);
+
+    XInputGetState_t GetXInputGetState()
+    {
+        static const XInputGetState_t cached = []() -> XInputGetState_t
+        {
+            const char* dllNames[] = {
+                "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinput1_2.dll", "xinput1_1.dll"
+            };
+            for (const char* dllName : dllNames)
+            {
+                if (HMODULE module = LoadLibraryA(dllName))
+                {
+                    if (auto named = (XInputGetState_t)GetProcAddress(module, "XInputGetState"))
+                        return named;
+                    // xinput9_1_0.dll only exports the function by ordinal.
+                    if (auto byOrdinal = (XInputGetState_t)GetProcAddress(module, (const char*)100))
+                        return byOrdinal;
+                }
+            }
+            return nullptr;
+        }();
+        return cached;
+    }
+
+    const char* ActionKeyName(int actionIdx)
+    {
+        static const char* names[kActionKeyCount] = {
+            "ParkourUp (Space)",
+            "LMB (Attack)",
+            "EagleVision",
+            "ParkourDownInteract",
+            "Disguise",
+            "Numpad4 CycleLeftHand",
+            "Medicine",
+            "Numpad6 CycleBombs",
+            "Map",
+            "Escape",
+            "Crouch",
+            "RMB (Aim)",
+            "Sprint",
+            "BombDrop",
+            "Reload",
+            "CenterCamera",
+            "SlotPhantom",
+            "SlotBerserk",
+            "SlotGun",
+            "SlotSmokeBomb",
+            "SlotStunBomb",
+            "SlotCherryBomb",
+            "SlotPoisonBomb",
+            "SlotMoneyPouch",
+            "Slot9_booster",
+        };
+        if (actionIdx < 0 || actionIdx >= kActionKeyCount)
+            return "";
+        return names[actionIdx];
+    }
+
+    const char* PadCodeName(int bindableKeyCode)
+    {
+        static const char* names[PadCode_COUNT] = {
+            "Pad DPad Up", "Pad DPad Down", "Pad DPad Left", "Pad DPad Right",
+            "Pad Start", "Pad Back",
+            "Pad L3", "Pad R3",
+            "Pad LB", "Pad RB",
+            "Pad A", "Pad B", "Pad X", "Pad Y",
+            "Pad Left Trigger", "Pad Right Trigger",
+            "Pad LStick Up", "Pad LStick Down", "Pad LStick Left", "Pad LStick Right",
+            "Pad RStick Up", "Pad RStick Down", "Pad RStick Left", "Pad RStick Right",
+        };
+        if (!IsPadCode(bindableKeyCode))
+            return "";
+        return names[bindableKeyCode - kPadKeyBase];
+    }
+
+    std::string KeyCodeLabel(int bindableKeyCode)
+    {
+        if (IsPadCode(bindableKeyCode))
+        {
+            std::ostringstream label;
+            label << "0x" << std::uppercase << std::hex << bindableKeyCode
+                  << " (" << PadCodeName(bindableKeyCode) << ")";
+            return label.str();
+        }
+        const char* mouseName = nullptr;
+        switch (bindableKeyCode)
+        {
+        case VK_LBUTTON:  mouseName = "Mouse Left"; break;
+        case VK_RBUTTON:  mouseName = "Mouse Right"; break;
+        case VK_MBUTTON:  mouseName = "Mouse Middle"; break;
+        case VK_XBUTTON1: mouseName = "Mouse X1"; break;
+        case VK_XBUTTON2: mouseName = "Mouse X2"; break;
+        default: break;
+        }
+        std::ostringstream label;
+        label << "0x" << std::uppercase << std::hex << bindableKeyCode;
+        if (mouseName)
+            label << " (" << mouseName << ")";
+        return label.str();
     }
 
     std::vector<std::string_view> Split(std::string_view text, char delimiter)
@@ -144,7 +267,7 @@ namespace
         int keyCode = 0;
         if (!TryParseInteger(fields[0], 10, overrideIndex)
             || !TryParseInteger(fields[1], 10, keyCode)
-            || !IsValidVirtualKey(keyCode))
+            || !IsValidBindableKey(keyCode))
         {
             return false;
         }
@@ -207,6 +330,63 @@ namespace
                 ParkourActionKnownFancyVFuncs::GetEnumParkourAction)(
                     const_cast<AvailableParkourAction*>(action)));
     }
+
+    // ── Parkour mode: action-key suppression ──────────────────────
+    // 0x14273BC7B is inside the per-frame input update function (0x14273BAC0),
+    // after the game has filled InputContainerBig::keyStates_thisFrame from the
+    // keymap (0x14273B2B0) and before the mouse-vector update. At this point
+    // rbx_ is the InputContainerBig* — the same register the ACUFixes-0.9.3
+    // mousewheel-cycle hook at 0x14273BC75 relies on for the same struct.
+    // Clearing isPressed_byAction[] entries here disables the corresponding
+    // ActionKeyCode for the whole frame without touching the player's actual
+    // bindings (verified against the 1.5.0 dump: bytes 48 8B D6 48 8B CB).
+    FreeJumpPlugin* g_ParkourModeInstance = nullptr;
+
+    void SuppressDisabledActionKeys(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_ParkourModeInstance;
+        if (!owner)
+            return;
+        const uint32_t disabledMask = owner->GetDisabledActionMask();
+        if (!disabledMask)
+            return;
+        auto* inputContainer = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_));
+        if (!inputContainer)
+            return;
+
+        uint8_t* keyStatesThisFrame = inputContainer + 0x30; // InputContainer::keyStates_thisFrame
+        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+        {
+            if (disabledMask & (1u << actionIdx))
+                keyStatesThisFrame[actionIdx] = 0;
+        }
+    }
+
+    struct ParkourModeSuppressHook : AutoAssemblerCodeHolder_Base
+    {
+        ParkourModeSuppressHook()
+        {
+            PresetScript_CCodeInTheMiddle(
+                0x14273BC7B, 6,
+                SuppressDisabledActionKeys,
+                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
+                true);
+        }
+    };
+
+    AutoAssembleWrapper<ParkourModeSuppressHook>& GetParkourModeSuppressHook()
+    {
+        static AutoAssembleWrapper<ParkourModeSuppressHook> s_hook;
+        return s_hook;
+    }
+
+    bool IsParkourSuppressSitePatched()
+    {
+        // Vanilla bytes at 0x14273BC7B: mov rdx,rsi ; mov rcx,rbx.
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BC7B);
+        return !(site[0] == 0x48 && site[1] == 0x8B && site[2] == 0xD6
+            && site[3] == 0x48 && site[4] == 0x8B && site[5] == 0xCB);
+    }
 }
 
 // ── AssassinAbilitySet helpers ────────────────────────────────────────
@@ -252,14 +432,40 @@ void FreeJumpPlugin::LoadSettings()
         if (TryGetValue(trimmedLine, "FreeJumpKey=", value))
         {
             int keyCode = 0;
-            if (TryParseInteger(value, 16, keyCode) && IsValidVirtualKey(keyCode))
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_ToggleKey = keyCode;
         }
         else if (TryGetValue(trimmedLine, "SnapDirectionKey=", value))
         {
             int keyCode = 0;
-            if (TryParseInteger(value, 16, keyCode) && IsValidVirtualKey(keyCode))
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_SnapDirectionKey = keyCode;
+        }
+        else if (TryGetValue(trimmedLine, "ParkourModeKey=", value))
+        {
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
+                m_ParkourModeKey = keyCode;
+        }
+        else if (TryGetValue(trimmedLine, "ParkourModeOn=", value))
+        {
+            bool enabled = false;
+            if (TryParseBool(value, enabled))
+                m_ParkourModeOn = enabled;
+        }
+        else if (TryGetValue(trimmedLine, "ParkourDisabledActions=", value))
+        {
+            uint32_t mask = 0;
+            for (const std::string_view actionToken : Split(value, '|'))
+            {
+                int actionIdx = 0;
+                if (TryParseInteger(actionToken, 10, actionIdx)
+                    && actionIdx >= 0 && actionIdx < kActionKeyCount)
+                {
+                    mask |= (1u << actionIdx);
+                }
+            }
+            m_DisabledActionMask = mask;
         }
         else if (TryGetValue(trimmedLine, "SnapDirectionMode=", value))
         {
@@ -326,6 +532,22 @@ void FreeJumpPlugin::SaveSettings()
     file << "SnapDirectionKey=" << std::hex << m_SnapDirectionKey << std::dec << "\n";
     file << "SnapDirectionMode=" << (m_SnapDirectionMode ? 1 : 0) << "\n";
     file << "MouseLockEnabled=" << (m_MouseLockEnabled ? 1 : 0) << "\n";
+    file << "ParkourModeKey=" << std::hex << m_ParkourModeKey << std::dec << "\n";
+    file << "ParkourModeOn=" << (m_ParkourModeOn ? 1 : 0) << "\n";
+    file << "ParkourDisabledActions=";
+    {
+        bool firstAction = true;
+        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+        {
+            if (!(m_DisabledActionMask & (1u << actionIdx)))
+                continue;
+            if (!firstAction)
+                file << "|";
+            file << actionIdx;
+            firstAction = false;
+        }
+    }
+    file << "\n";
     file << "NumOverrides=" << m_Overrides.size() << "\n";
     file << std::setprecision(std::numeric_limits<float>::max_digits10);
     for (size_t i = 0; i < m_Overrides.size(); ++i)
@@ -445,10 +667,14 @@ void FreeJumpPlugin::OnBeforeActivate()
 
     if (m_MouseLockEnabled)
         m_LastMouseLockEnabled = ApplyMouseLock(true);
+    if (m_ParkourModeOn && m_DisabledActionMask)
+        ApplyParkourMode(true);
 }
 
 void FreeJumpPlugin::OnBeforeDeactivate()
 {
+    if (m_ParkourHookActive)
+        ApplyParkourMode(false);
     if (m_HookActive)
     {
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
@@ -463,26 +689,138 @@ void FreeJumpPlugin::OnBeforeDeactivate()
     SaveSettings();
 }
 
-void FreeJumpPlugin::UpdateKeyState(int vkCode)
+void FreeJumpPlugin::ApplyParkourMode(bool enable)
 {
-    if (!IsValidVirtualKey(vkCode) || m_KeyStateUpdatedThisFrame[vkCode])
+    if (enable)
+    {
+        if (m_ParkourHookActive)
+            return;
+        if (IsParkourSuppressSitePatched())
+        {
+            // Another plugin owns the keymap-tail site; do not fight over it.
+            m_ParkourHookRefused = true;
+            return;
+        }
+        m_ParkourHookRefused = false;
+        g_ParkourModeInstance = this;
+        GetParkourModeSuppressHook().Activate();
+        m_ParkourHookActive = true;
+    }
+    else
+    {
+        if (!m_ParkourHookActive)
+            return;
+        GetParkourModeSuppressHook().Deactivate();
+        if (g_ParkourModeInstance == this)
+            g_ParkourModeInstance = nullptr;
+        m_ParkourHookActive = false;
+    }
+}
+
+void FreeJumpPlugin::UpdatePadStates()
+{
+    m_ActivePadSlot = -1;
+    m_PadDown.fill(false);
+
+    XInputGetState_t getState = GetXInputGetState();
+    if (!getState)
+    {
+        m_PadDllLoaded = false;
+        return;
+    }
+    m_PadDllLoaded = true;
+
+    constexpr int kLeftThumbDeadzone = 7849;   // XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
+    constexpr int kTriggerThreshold = 30;      // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+    constexpr int kPadSlotCount = 4;
+    for (int slot = 0; slot < kPadSlotCount; ++slot)
+    {
+        XInputPadState state{};
+        if (getState(slot, &state) != ERROR_SUCCESS)
+            continue;
+
+        auto markPadCode = [this](int padCode)
+        {
+            m_PadDown[padCode] = true;
+        };
+
+        if (state.buttons & 0x0001) markPadCode(PadCode_DPAD_UP);
+        if (state.buttons & 0x0002) markPadCode(PadCode_DPAD_DOWN);
+        if (state.buttons & 0x0004) markPadCode(PadCode_DPAD_LEFT);
+        if (state.buttons & 0x0008) markPadCode(PadCode_DPAD_RIGHT);
+        if (state.buttons & 0x0010) markPadCode(PadCode_START);
+        if (state.buttons & 0x0020) markPadCode(PadCode_BACK);
+        if (state.buttons & 0x0040) markPadCode(PadCode_L3);
+        if (state.buttons & 0x0080) markPadCode(PadCode_R3);
+        if (state.buttons & 0x0100) markPadCode(PadCode_LB);
+        if (state.buttons & 0x0200) markPadCode(PadCode_RB);
+        if (state.buttons & 0x1000) markPadCode(PadCode_A);
+        if (state.buttons & 0x2000) markPadCode(PadCode_B);
+        if (state.buttons & 0x4000) markPadCode(PadCode_X);
+        if (state.buttons & 0x8000) markPadCode(PadCode_Y);
+        if (state.leftTrigger > kTriggerThreshold) markPadCode(PadCode_LT);
+        if (state.rightTrigger > kTriggerThreshold) markPadCode(PadCode_RT);
+        if (state.thumbLY > kLeftThumbDeadzone)  markPadCode(PadCode_LSTICK_UP);
+        if (state.thumbLY < -kLeftThumbDeadzone) markPadCode(PadCode_LSTICK_DOWN);
+        if (state.thumbLX < -kLeftThumbDeadzone) markPadCode(PadCode_LSTICK_LEFT);
+        if (state.thumbLX > kLeftThumbDeadzone)  markPadCode(PadCode_LSTICK_RIGHT);
+        if (state.thumbRY > kLeftThumbDeadzone)  markPadCode(PadCode_RSTICK_UP);
+        if (state.thumbRY < -kLeftThumbDeadzone) markPadCode(PadCode_RSTICK_DOWN);
+        if (state.thumbRX < -kLeftThumbDeadzone) markPadCode(PadCode_RSTICK_LEFT);
+        if (state.thumbRX > kLeftThumbDeadzone)  markPadCode(PadCode_RSTICK_RIGHT);
+
+        if (state.buttons
+            || state.leftTrigger > kTriggerThreshold
+            || state.rightTrigger > kTriggerThreshold
+            || state.thumbLX > kLeftThumbDeadzone || state.thumbLX < -kLeftThumbDeadzone
+            || state.thumbLY > kLeftThumbDeadzone || state.thumbLY < -kLeftThumbDeadzone
+            || state.thumbRX > kLeftThumbDeadzone || state.thumbRX < -kLeftThumbDeadzone
+            || state.thumbRY > kLeftThumbDeadzone || state.thumbRY < -kLeftThumbDeadzone)
+        {
+            m_ActivePadSlot = slot;
+        }
+    }
+}
+
+void FreeJumpPlugin::UpdateKeyState(int bindableKeyCode)
+{
+    if (!IsValidBindableKey(bindableKeyCode) || m_KeyStateUpdatedThisFrame[bindableKeyCode])
         return;
 
-    const bool keyIsDown = (GetAsyncKeyState(vkCode) & 0x8000) != 0;
-    m_KeyPressedThisFrame[vkCode] = keyIsDown && !m_PreviousKeyDown[vkCode];
-    m_PreviousKeyDown[vkCode] = keyIsDown;
-    m_KeyStateUpdatedThisFrame[vkCode] = true;
+    bool keyIsDown = false;
+    if (bindableKeyCode <= kKeyboardKeyMax)
+    {
+        keyIsDown = (GetAsyncKeyState(bindableKeyCode) & 0x8000) != 0;
+    }
+    else
+    {
+        keyIsDown = m_PadDown[bindableKeyCode - kPadKeyBase];
+    }
+    m_KeyPressedThisFrame[bindableKeyCode] = keyIsDown && !m_PreviousKeyDown[bindableKeyCode];
+    m_PreviousKeyDown[bindableKeyCode] = keyIsDown;
+    m_KeyStateUpdatedThisFrame[bindableKeyCode] = true;
 }
 
 void FreeJumpPlugin::UpdateAllKeyStates()
 {
-    for (int vkCode = 1; vkCode <= 0xFE; ++vkCode)
+    for (int vkCode = kKeyboardKeyMin; vkCode <= kKeyboardKeyMax; ++vkCode)
         UpdateKeyState(vkCode);
+    for (int padCode = 0; padCode < PadCode_COUNT; ++padCode)
+        UpdateKeyState(kPadKeyBase + padCode);
 }
 
-bool FreeJumpPlugin::WasKeyPressed(int vkCode) const
+bool FreeJumpPlugin::WasKeyPressed(int bindableKeyCode) const
 {
-    return IsValidVirtualKey(vkCode) && m_KeyPressedThisFrame[vkCode];
+    return IsValidBindableKey(bindableKeyCode) && m_KeyPressedThisFrame[bindableKeyCode];
+}
+
+bool FreeJumpPlugin::IsKeyHeld(int bindableKeyCode) const
+{
+    if (IsPadCode(bindableKeyCode))
+        return m_PadDown[bindableKeyCode - kPadKeyBase];
+    if (bindableKeyCode >= kKeyboardKeyMin && bindableKeyCode <= kKeyboardKeyMax)
+        return (GetAsyncKeyState(bindableKeyCode) & 0x8000) != 0;
+    return false;
 }
 
 bool FreeJumpPlugin::IsSortAndSelectSiteAlreadyPatched() const
@@ -502,6 +840,7 @@ void FreeJumpPlugin::OnUpdate()
 {
     m_KeyStateUpdatedThisFrame.fill(false);
     m_JustCapturedKey = 0;
+    UpdatePadStates();
 
     UpdateKeyState(m_ToggleKey);
     UpdateKeyState(m_SnapDirectionKey);
@@ -512,20 +851,30 @@ void FreeJumpPlugin::OnUpdate()
         m_Overrides.begin(),
         m_Overrides.end(),
         [](const ParkourActionOverride& override) { return override.waitingForKey; });
-    if (m_WaitingForKey || m_WaitingForSnapKey || waitingForOverrideKey)
+    if (m_WaitingForKey || m_WaitingForSnapKey || m_WaitingForParkourKey || waitingForOverrideKey)
         UpdateAllKeyStates();
 
     const auto captureKey = [this](int& destinationKey) -> bool
     {
-        for (int vkCode = 1; vkCode <= 0xFE; ++vkCode)
+        for (int vkCode = kKeyboardKeyMin; vkCode <= kKeyboardKeyMax; ++vkCode)
         {
-            // The left/right/middle mouse buttons are used by the loader UI and
-            // would otherwise be captured by the click that starts a rebind.
-            if (vkCode <= VK_MBUTTON)
+            // The left/right mouse buttons belong to the loader UI and would
+            // otherwise be captured by the click that starts a rebind. The
+            // middle and extra mouse buttons, and all gamepad buttons, are
+            // bindable.
+            if (vkCode == VK_LBUTTON || vkCode == VK_RBUTTON)
                 continue;
             if (WasKeyPressed(vkCode))
             {
                 destinationKey = vkCode;
+                return true;
+            }
+        }
+        for (int padCode = 0; padCode < PadCode_COUNT; ++padCode)
+        {
+            if (WasKeyPressed(kPadKeyBase + padCode))
+            {
+                destinationKey = kPadKeyBase + padCode;
                 return true;
             }
         }
@@ -550,6 +899,15 @@ void FreeJumpPlugin::OnUpdate()
             SaveSettings();
         }
     }
+    else if (m_WaitingForParkourKey)
+    {
+        if (captureKey(m_ParkourModeKey))
+        {
+            m_JustCapturedKey = m_ParkourModeKey;
+            m_WaitingForParkourKey = false;
+            SaveSettings();
+        }
+    }
     else if (waitingForOverrideKey)
     {
         for (ParkourActionOverride& override : m_Overrides)
@@ -564,6 +922,12 @@ void FreeJumpPlugin::OnUpdate()
             }
             break;
         }
+    }
+
+    if (WasKeyPressed(m_ParkourModeKey) && m_ParkourModeKey != m_JustCapturedKey)
+    {
+        m_ParkourModeOn = !m_ParkourModeOn;
+        SaveSettings();
     }
 
     if (WasKeyPressed(m_SnapDirectionKey) && m_SnapDirectionKey != m_JustCapturedKey)
@@ -590,12 +954,12 @@ void FreeJumpPlugin::OnUpdate()
     }
 
     const bool freeJumpHeld = m_ToggleKey != m_JustCapturedKey
-        && (GetAsyncKeyState(m_ToggleKey) & 0x8000) != 0;
+        && IsKeyHeld(m_ToggleKey);
     bool anyOverrideActive = false;
     for (const ParkourActionOverride& override : m_Overrides)
     {
         const bool overrideKeyHeld = override.keyCode != m_JustCapturedKey
-            && (GetAsyncKeyState(override.keyCode) & 0x8000) != 0;
+            && IsKeyHeld(override.keyCode);
         if (override.enable
             && (override.toggleMode
                 ? override.toggleState
@@ -604,6 +968,13 @@ void FreeJumpPlugin::OnUpdate()
             anyOverrideActive = true;
         }
     }
+
+    const bool wantParkourHook = m_ParkourModeOn && m_DisabledActionMask != 0;
+    if (wantParkourHook && !m_ParkourHookActive)
+        ApplyParkourMode(true);
+    else if (!wantParkourHook && m_ParkourHookActive)
+        ApplyParkourMode(false);
+
     const bool needHook = freeJumpHeld || anyOverrideActive || m_SnapDirectionMode;
 
     if (needHook && !m_HookActive)
@@ -633,7 +1004,7 @@ void FreeJumpPlugin::OnUpdate()
 
 void FreeJumpPlugin::OnImGuiRender()
 {
-    bool freeMode   = (GetAsyncKeyState(m_ToggleKey) & 0x8000) != 0;
+    bool freeMode   = IsKeyHeld(m_ToggleKey);
     bool snapMode   = m_SnapDirectionMode;
     const ImVec4 activeColor(0.20f, 0.90f, 0.30f, 1.00f);
     const ImVec4 inactiveColor(1.00f, 0.55f, 0.10f, 1.00f);
@@ -648,12 +1019,30 @@ void FreeJumpPlugin::OnImGuiRender()
             "FreeJump hook was not installed. Disable/remove the conflicting parkour "
             "plugin (for example ACU_ParkourPatches.dll) before testing these features.");
     }
+    if (m_ParkourHookRefused)
+    {
+        ImGui::TextWrapped(
+            "The input-update site used by Parkour Mode (0x14273BC7B) is already "
+            "patched by another plugin, so Parkour Mode was not installed. Remove the "
+            "conflicting input-modifying plugin, then toggle Parkour Mode again.");
+    }
+    if (m_PadDllLoaded)
+    {
+        if (m_ActivePadSlot >= 0)
+            ImGui::Text("Gamepad: connected (slot %d)", m_ActivePadSlot);
+        else
+            ImGui::Text("Gamepad: none detected");
+    }
+    else
+    {
+        ImGui::TextDisabled("Gamepad: XInput unavailable on this system");
+    }
     if (ImGui::CollapsingHeader("Basic Features", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Text("Free Jump:");
         ImGui::SameLine();
         ImGui::TextColored(freeMode ? activeColor : inactiveColor, freeMode ? "ACTIVE (HOLD)" : "OFF");
-        ImGui::Text("  Bound key: 0x%02X", m_ToggleKey);
+        ImGui::Text("  Bound key: %s", KeyCodeLabel(m_ToggleKey).c_str());
         if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForKey ? "Cancel Rebind" : "Rebind##FreeJump"))
         {
@@ -661,6 +1050,7 @@ void FreeJumpPlugin::OnImGuiRender()
             if (m_WaitingForKey)
             {
                 m_WaitingForSnapKey = false;
+                m_WaitingForParkourKey = false;
                 for (ParkourActionOverride& override : m_Overrides)
                     override.waitingForKey = false;
             }
@@ -671,7 +1061,7 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::SameLine();
         ImGui::TextColored(snapMode ? ImVec4(0.20f,0.60f,0.90f,1.0f) : ImVec4(0.70f,0.70f,0.70f,1.0f),
                            snapMode ? "ON" : "OFF");
-        ImGui::Text("  Toggle key: 0x%02X", m_SnapDirectionKey);
+        ImGui::Text("  Toggle key: %s", KeyCodeLabel(m_SnapDirectionKey).c_str());
         if (m_WaitingForSnapKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForSnapKey ? "Cancel Rebind" : "Rebind##Snap"))
         {
@@ -679,6 +1069,7 @@ void FreeJumpPlugin::OnImGuiRender()
             if (m_WaitingForSnapKey)
             {
                 m_WaitingForKey = false;
+                m_WaitingForParkourKey = false;
                 for (ParkourActionOverride& override : m_Overrides)
                     override.waitingForKey = false;
             }
@@ -688,6 +1079,59 @@ void FreeJumpPlugin::OnImGuiRender()
         bool mouseLock = m_MouseLockEnabled;
         if (ImGui::Checkbox("Disable Left/Right Mouse Buttons (sword/aim)", &mouseLock))
         { m_MouseLockEnabled = mouseLock; SaveSettings(); }
+
+        ImGui::Separator();
+        ImGui::Text("Parkour Mode:");
+        ImGui::SameLine();
+        ImGui::TextColored(m_ParkourModeOn ? activeColor : inactiveColor,
+                           m_ParkourModeOn ? "ON" : "OFF");
+        if (m_ParkourModeOn)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(frees the disabled actions' keys below)");
+        }
+        ImGui::Text("  Toggle key: %s", KeyCodeLabel(m_ParkourModeKey).c_str());
+        if (m_WaitingForParkourKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key or pad button to bind..."); }
+        if (ImGui::Button(m_WaitingForParkourKey ? "Cancel Rebind##ParkourMode" : "Rebind##ParkourMode"))
+        {
+            m_WaitingForParkourKey = !m_WaitingForParkourKey;
+            if (m_WaitingForParkourKey)
+            {
+                m_WaitingForKey = false;
+                m_WaitingForSnapKey = false;
+                for (ParkourActionOverride& override : m_Overrides)
+                    override.waitingForKey = false;
+            }
+        }
+        if (ImGui::TreeNode("Actions disabled while Parkour Mode is on"))
+        {
+            ImGui::TextWrapped(
+                "While Parkour Mode is active these ActionKeyCode entries are forced unpressed, "
+                "so their physical keys are free for override bindings. Your keybindings are "
+                "never modified, and everything returns to normal when the mode is switched off.");
+            bool maskChanged = false;
+            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+            {
+                if (!*ActionKeyName(actionIdx))
+                    continue;
+                bool disabled = (m_DisabledActionMask & (1u << actionIdx)) != 0;
+                if (ImGui::Checkbox(ActionKeyName(actionIdx), &disabled))
+                {
+                    m_DisabledActionMask = disabled
+                        ? (m_DisabledActionMask | (1u << actionIdx))
+                        : (m_DisabledActionMask & ~(1u << actionIdx));
+                    maskChanged = true;
+                }
+            }
+            if (ImGui::Button("Restore defaults (LMB/RMB/Crouch)"))
+            {
+                m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10);
+                maskChanged = true;
+            }
+            if (maskChanged)
+                SaveSettings();
+            ImGui::TreePop();
+        }
     }
 
     ImGui::Separator();
@@ -701,6 +1145,7 @@ void FreeJumpPlugin::OnImGuiRender()
             newOverride.waitingForKey = true; // start in bind mode
             m_WaitingForKey = false;
             m_WaitingForSnapKey = false;
+            m_WaitingForParkourKey = false;
             for (ParkourActionOverride& override : m_Overrides)
                 override.waitingForKey = false;
             m_Overrides.push_back(newOverride);
@@ -714,7 +1159,7 @@ void FreeJumpPlugin::OnImGuiRender()
             {
                 auto& ov = m_Overrides[idx];
                 ImGui::PushID(idx);
-                bool active = ov.enable && (ov.toggleMode ? ov.toggleState : (GetAsyncKeyState(ov.keyCode) & 0x8000) != 0);
+                bool active = ov.enable && (ov.toggleMode ? ov.toggleState : IsKeyHeld(ov.keyCode));
                 ImGui::TextColored(active ? holdColor : inactiveColor, "[%s]",
                                    active ? "ACTIVE" : (ov.enable ? "ENABLED" : "DISABLED"));
                 ImGui::SameLine();
@@ -723,7 +1168,7 @@ void FreeJumpPlugin::OnImGuiRender()
                     if (ImGui::Checkbox("Enable", &ov.enable))
                         SaveSettings();
                     ImGui::SameLine();
-                    ImGui::Text("Key: 0x%02X", ov.keyCode);
+                    ImGui::Text("Key: %s", KeyCodeLabel(ov.keyCode).c_str());
                     ImGui::SameLine();
                     if (ImGui::Button(ov.waitingForKey ? "Cancel" : "Rebind"))
                     {
@@ -735,9 +1180,10 @@ void FreeJumpPlugin::OnImGuiRender()
                         {
                             m_WaitingForKey = false;
                             m_WaitingForSnapKey = false;
+                            m_WaitingForParkourKey = false;
                         }
                     }
-                    if (ov.waitingForKey) ImGui::TextColored(rebindColor, "Input key to bind...");
+                    if (ov.waitingForKey) ImGui::TextColored(rebindColor, "Input key or pad button to bind...");
 
                     bool holdMode = !ov.toggleMode;
                     if (ImGui::RadioButton("Hold (press and hold)", holdMode))
@@ -831,7 +1277,7 @@ void FreeJumpPlugin::OnImGuiRender()
 AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions)
 {
     // Free Jump
-    if (GetAsyncKeyState(m_ToggleKey) & 0x8000)
+    if (IsKeyHeld(m_ToggleKey))
     {
         actions.size = 0;
         return nullptr;
@@ -875,7 +1321,7 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
     for (auto& ov : m_Overrides)
     {
         if (!ov.enable) continue;
-        bool active = ov.toggleMode ? ov.toggleState : (GetAsyncKeyState(ov.keyCode) & 0x8000) != 0;
+        bool active = ov.toggleMode ? ov.toggleState : IsKeyHeld(ov.keyCode);
         if (!active) continue;
         actives.push_back({&ov});
     }
