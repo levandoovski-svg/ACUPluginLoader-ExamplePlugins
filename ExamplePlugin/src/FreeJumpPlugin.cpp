@@ -193,7 +193,10 @@ namespace
         };
         if (actionIdx < 0 || actionIdx >= kActionKeyCount)
             return "";
-        return names[actionIdx];
+        // Slots beyond the initializer list are nullptr; dereferencing them
+        // crashed the disabled-actions UI the moment its tree was opened.
+        const char* name = names[actionIdx];
+        return name ? name : "";
     }
 
     const char* PadCodeName(int bindableKeyCode)
@@ -237,6 +240,29 @@ namespace
         if (mouseName)
             label << " (" << mouseName << ")";
         return label.str();
+    }
+
+    // LMB/RMB (and the other mouse buttons) are bindable. While the loader
+    // ImGui menu is open and the cursor is over ImGui, mouse-button input
+    // belongs to the UI, so a mouse-button binding must neither toggle a mode
+    // nor trigger a hold from menu clicks. Keyboard/pad codes are never
+    // blocked by this.
+    bool MouseBindWouldHitUi(int bindableKeyCode)
+    {
+        switch (bindableKeyCode)
+        {
+        case VK_LBUTTON:
+        case VK_RBUTTON:
+        case VK_MBUTTON:
+        case VK_XBUTTON1:
+        case VK_XBUTTON2:
+            break;
+        default:
+            return false;
+        }
+        if (!ImGui::GetCurrentContext())
+            return false;
+        return ImGui::GetIO().WantCaptureMouse;
     }
 
     std::vector<std::string_view> Split(std::string_view text, char delimiter)
@@ -844,6 +870,13 @@ void FreeJumpPlugin::OnUpdate()
 
     UpdateKeyState(m_ToggleKey);
     UpdateKeyState(m_SnapDirectionKey);
+    // Without this refresh, m_KeyPressedThisFrame[m_ParkourModeKey] kept its
+    // last value from whenever a rebind-wait last ran (it is only cleared by
+    // UpdateKeyState). After the first rebind it stayed true forever, so
+    // WasKeyPressed fired on every frame and Parkour Mode flipped ON/OFF each
+    // frame — rewriting the INI and installing/removing the suppression hook
+    // at frame rate.
+    UpdateKeyState(m_ParkourModeKey);
     for (const ParkourActionOverride& override : m_Overrides)
         UpdateKeyState(override.keyCode);
 
@@ -851,19 +884,38 @@ void FreeJumpPlugin::OnUpdate()
         m_Overrides.begin(),
         m_Overrides.end(),
         [](const ParkourActionOverride& override) { return override.waitingForKey; });
-    if (m_WaitingForKey || m_WaitingForSnapKey || m_WaitingForParkourKey || waitingForOverrideKey)
+    const bool anyRebindWaiting = m_WaitingForKey || m_WaitingForSnapKey
+        || m_WaitingForParkourKey || waitingForOverrideKey;
+    if (anyRebindWaiting)
         UpdateAllKeyStates();
+
+    // A rebind is always started by clicking a UI button, i.e. with a mouse
+    // button. The starting click itself must not be captured as the new
+    // binding: while a rebind is pending, LMB/RMB are only accepted after both
+    // were seen released once since the rebind started.
+    if (anyRebindWaiting && !m_AnyRebindWaitingLastFrame)
+        m_MouseButtonsSettledSinceRebindStart = false;
+    m_AnyRebindWaitingLastFrame = anyRebindWaiting;
+    if (!m_MouseButtonsSettledSinceRebindStart
+        && !IsKeyHeld(VK_LBUTTON)
+        && !IsKeyHeld(VK_RBUTTON))
+    {
+        m_MouseButtonsSettledSinceRebindStart = true;
+    }
 
     const auto captureKey = [this](int& destinationKey) -> bool
     {
         for (int vkCode = kKeyboardKeyMin; vkCode <= kKeyboardKeyMax; ++vkCode)
         {
-            // The left/right mouse buttons belong to the loader UI and would
-            // otherwise be captured by the click that starts a rebind. The
-            // middle and extra mouse buttons, and all gamepad buttons, are
-            // bindable.
-            if (vkCode == VK_LBUTTON || vkCode == VK_RBUTTON)
+            // LMB/RMB are bindable like any other key. Skip them until the
+            // mouse buttons settled (see above) so the click that opened the
+            // rebind is never captured by accident. The middle and extra
+            // mouse buttons, and all gamepad buttons, are always bindable.
+            if ((vkCode == VK_LBUTTON || vkCode == VK_RBUTTON)
+                && !m_MouseButtonsSettledSinceRebindStart)
+            {
                 continue;
+            }
             if (WasKeyPressed(vkCode))
             {
                 destinationKey = vkCode;
@@ -924,13 +976,15 @@ void FreeJumpPlugin::OnUpdate()
         }
     }
 
-    if (WasKeyPressed(m_ParkourModeKey) && m_ParkourModeKey != m_JustCapturedKey)
+    if (WasKeyPressed(m_ParkourModeKey) && m_ParkourModeKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(m_ParkourModeKey))
     {
         m_ParkourModeOn = !m_ParkourModeOn;
         SaveSettings();
     }
 
-    if (WasKeyPressed(m_SnapDirectionKey) && m_SnapDirectionKey != m_JustCapturedKey)
+    if (WasKeyPressed(m_SnapDirectionKey) && m_SnapDirectionKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(m_SnapDirectionKey))
     {
         m_SnapDirectionMode = !m_SnapDirectionMode;
         SaveSettings();
@@ -940,7 +994,8 @@ void FreeJumpPlugin::OnUpdate()
     {
         if (!override.enable || !override.toggleMode)
             continue;
-        if (WasKeyPressed(override.keyCode) && override.keyCode != m_JustCapturedKey)
+        if (WasKeyPressed(override.keyCode) && override.keyCode != m_JustCapturedKey
+            && !MouseBindWouldHitUi(override.keyCode))
         {
             override.toggleState = !override.toggleState;
             SaveSettings();
@@ -954,11 +1009,13 @@ void FreeJumpPlugin::OnUpdate()
     }
 
     const bool freeJumpHeld = m_ToggleKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(m_ToggleKey)
         && IsKeyHeld(m_ToggleKey);
     bool anyOverrideActive = false;
     for (const ParkourActionOverride& override : m_Overrides)
     {
         const bool overrideKeyHeld = override.keyCode != m_JustCapturedKey
+            && !MouseBindWouldHitUi(override.keyCode)
             && IsKeyHeld(override.keyCode);
         if (override.enable
             && (override.toggleMode
@@ -1277,7 +1334,7 @@ void FreeJumpPlugin::OnImGuiRender()
 AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions)
 {
     // Free Jump
-    if (IsKeyHeld(m_ToggleKey))
+    if (!MouseBindWouldHitUi(m_ToggleKey) && IsKeyHeld(m_ToggleKey))
     {
         actions.size = 0;
         return nullptr;
@@ -1321,7 +1378,8 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
     for (auto& ov : m_Overrides)
     {
         if (!ov.enable) continue;
-        bool active = ov.toggleMode ? ov.toggleState : IsKeyHeld(ov.keyCode);
+        bool active = ov.toggleMode ? ov.toggleState
+            : (!MouseBindWouldHitUi(ov.keyCode) && IsKeyHeld(ov.keyCode));
         if (!active) continue;
         actives.push_back({&ov});
     }

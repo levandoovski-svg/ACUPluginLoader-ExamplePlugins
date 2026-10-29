@@ -331,8 +331,8 @@ GPH_Creation::GPH_Creation()
     // OverrideCreationDiscard_fnp (keep-alive + 53->52 conversion).
     // NOTE: like the sort&select start, these are function-start replacements;
     // do not let two plugins replace the same address simultaneously.
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D1CF0, CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement);
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D1E50, CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement);
+    PresetScript_ReplaceFunctionAtItsStart(0x1401D1CF0, (void*)&CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement);
+    PresetScript_ReplaceFunctionAtItsStart(0x1401D1E50, (void*)&CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement);
 }
 
 GPH_SortAndSelect::GPH_SortAndSelect()
@@ -342,7 +342,7 @@ GPH_SortAndSelect::GPH_SortAndSelect()
     // constant scan of ACUFixes.dll and ACU_ParkourPatches.dll (both working
     // on this install hook this exact address). A function-start replacement
     // needs no stolen-byte relocation, unlike the previous mid-function hook.
-    PresetScript_ReplaceFunctionAtItsStart(0x140133B00, SortAndSelectBestMatchingAction_FullReplacement);
+    PresetScript_ReplaceFunctionAtItsStart(0x140133B00, (void*)&SortAndSelectBestMatchingAction_FullReplacement);
 }
 
 // ── SharedHookActivator ──────────────────────────────────────────────────────

@@ -147,8 +147,6 @@ static constexpr uint64 k_ClimbFacadeTesterFancyVTable_Baseclass = 0x1439FA1A0;
 // build mismatches.
 static constexpr uint8_t k_ExpectedBytes_CreationSite[12] = {
     0xE9, 0xEB, 0xAE, 0x90, 0xFF, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; // JMP 0x13FA40120 (Denuvo VM thunk) + game NOP padding
-static constexpr uint8_t k_ExpectedBytes_RangeSetterSite[10] = {
-    0xC7, 0x81, 0xF8, 0x01, 0x00, 0x00, 0xCD, 0xCC, 0x4C, 0x3D };             // MOV dword ptr [RCX+0x1F8], 0.05f
 static constexpr uint8_t k_ExpectedBytes_WallingCycleSite[7] = {
     0xE9, 0x50, 0x29, 0xFD, 0xFD, 0x90, 0x90 };                               // JMP 0x13F871120 (Denuvo VM thunk)
 static constexpr uint8_t k_ExpectedBytes_FailedWallrunCycleSite[7] = {
@@ -261,87 +259,119 @@ static void WidenType52Ranges(AvailableParkourAction& action)
     WidenMin(action.expectedCurveRangeMin, g_RangeExpectedCurveMin);
 }
 
-// ── Hook 2 callback: inside the type-52 range-setter ──────────────────────────
-// Site 0x1401AF3B6 (10 bytes: `MOV dword ptr [RCX+0x1F8], 0x3D4CCCCD`) is on the
-// convergence path of all ParkourMode branches of 0x1401AF2E0. RCX still holds
-// the action there (it is never reassigned in that function). The stolen bytes
-// re-execute after the callback, then control resumes at 0x1401AF3C0.
-// 0x1401AF2E0 is referenced by exactly one fancy-table slot
-// (0x143A70C60 = 0x143A6FFD0 + 0x64*0x20 + 0x10), so this only ever sees type-52
-// actions.
-static void WhenType52RangesSet_Widen(AllRegisters* params)
-{
-    if (!g_ExpandRanges) return;
-    auto* action = (AvailableParkourAction*)params->rcx_;
-    if (!action) return;
-    WidenType52Ranges(*action);
-    g_WidenCount++;
-}
+// ── Hook 2 (REMOVED): type-54 range-setter mid-function hook ───────────────
+// The old hook at 0x1401AF3B6 sat INSIDE 0x1401AF2E0, which is type-54's
+// range-setter (slot 0x143A70C60 = 0x143A6FFD0 + 0x64*0x20 + 0x10) -- NOT type
+// 52's (type 52's is 0x14019AA50, slot 0x143A52F80). It was therefore polluting
+// wallrunUpToHang actions and never touched wallrunUpFromGroundFailed_mb.
+// Its purpose (widen the ranges before the fit test consumes them) is now
+// fulfilled inside Type52FitTestStub below: the swapped 0x4A stub runs after
+// 0x64 wrote the vanilla ranges and before 0x4A's verdict consumes them.
 
-// ── Hook 3: fit-test override via fancy-table slot swap ─────────────────────
-// The type-52 runtime fancy table (0x143A6FFD0) holds its per-type fit test at
-// fancyVirtuals[0x4A].fn == 0x143A70920 (vanilla value 0x1401B0340, the
-// geometry/quick-check gate). Dump-verified facts:
-//   * 0x143A70920 is the ONLY qword in .data/.rdata holding 0x1401B0340, and
-//     the table is installed only by the type-52 construction paths
-//     (0x1401BC730 / 0x1401BC850) -> swapping this slot affects
-//     wallrunUpFromGroundFailed_mb exclusively;
-//   * the slot is static data: creation copies the table POINTER into the
-//     object, it never rewrites the table's contents.
-// While installed, the slot points at a forwarding stub that returns true
-// (skip the wall-context gate) when g_SkipFitTest is set, else forwards to the
-// vanilla test. This is the same "swap a game vtable entry per config" pattern
-// the reverse-engineered ACU_ParkourPatches.dll uses.
-// NOTE: a mid-function hook at the TEST/JZ after the per-type call was rejected
-// deliberately: AutoAssemblerKinda copies stolen bytes verbatim (relative
-// branches would break) and code hooks need at least 5 stolen bytes.
-static constexpr uintptr_t k_Type52FitTestSlot_Address = 0x143A70920;
-static void* const k_Type52FitTestOriginal = (void*)0x1401B0340;
-static void* s_OriginalType52FitTestFn = nullptr;
+// ── Hook 3: fit-test override via fancy-table slot swaps (dump-corrected) ──
+// The verdict for "does this wall qualify" is the fancy-0x4A call inside
+// InitialTestIfActionFits (0x1401B4900). Two slot addresses must be covered:
+//   * 0x143A52C40 -- type-52 RUNTIME table (0x143A522F0) 0x4A, vanilla
+//     0x14019B6F0. Private to type 52.
+//   * 0x143A42280 -- TRANSIENT base table (0x143A41930) 0x4A, vanilla
+//     0x1401B5700. SHARED by 22 tables, so while this slot is swapped the stub
+//     must widen ONLY actions the null-safe type read positively identified as
+//     type 52 (runtime table) and otherwise forward untouched.
+// Both slots are static data: creation copies the table POINTER into the
+// action, it never rewrites the table's contents.
+// The previous implementation patched 0x143A70920, which is type-54's 0x4A
+// (vanilla 0x1401B0340) -- wrong table, wrong vanilla value, wrong effect.
+struct Type52FitTestSlot
+{
+    uintptr_t address;
+    void* vanilla;
+    void* saved;
+};
+static Type52FitTestSlot s_Type52FitTestSlots[2] = {
+    { k_Type52FitTestSlot_Runtime,   (void*)0x14019B6F0, nullptr },
+    { k_Type52FitTestSlot_Transient, (void*)0x1401B5700, nullptr },
+};
 
 static bool __fastcall Type52FitTestStub(
     AvailableParkourAction* action, void* a2, void* a3, void* a4,
     uint32 a5, uint64 a6, uint64 a7, uint64 a8)
 {
-    if (g_SkipFitTest)
+    // Which original to forward to is decided by the action's own table --
+    // exact and robust, no caller context needed.
+    void* original = (void*)0x1401B5700; // shared transient-table 0x4A
+    bool isType52 = false;
+    if (action)
     {
+        const uint64 table = (uint64)action->fancyVTable;
+        if (table == k_Type52FancyVTable_Runtime)
+        {
+            original = (void*)0x14019B6F0;   // type-52 runtime-table 0x4A
+            isType52 = true;
+        }
+        else if (table == k_Type52FancyVTable_TransientBase)
+        {
+            // 0x45 is NULL on this table, so the action cannot be identified
+            // further here -- treat as type-52-candidate (matches the null-safe
+            // read used everywhere else in this plugin).
+            isType52 = true;
+        }
+    }
+
+    if (g_SkipFitTest && isType52)
+    {
+        // Widen the acceptance ranges here: 0x64 has already run (its vanilla
+        // values are in place), 0x4A's verdict is about to consume them, and
+        // CalculateFitness later uses them too. Only loosens.
+        WidenType52Ranges(*action);
+        g_WidenCount++;
         g_FitOverrideCount++;
         return true;
     }
+
     using Fn = bool(__fastcall*)(AvailableParkourAction*, void*, void*, void*, uint32, uint64, uint64, uint64);
-    return reinterpret_cast<Fn>(s_OriginalType52FitTestFn)(action, a2, a3, a4, a5, a6, a7, a8);
+    return reinterpret_cast<Fn>(original)(action, a2, a3, a4, a5, a6, a7, a8);
 }
 
 static bool SwapType52FitTestFn(bool install)
 {
-    void** slot = reinterpret_cast<void**>(k_Type52FitTestSlot_Address);
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect))
-        return false;
-    bool ok = false;
-    if (install)
+    bool allOk = true;
+    for (auto& s : s_Type52FitTestSlots)
     {
-        // Fail-safe rule: only swap when the slot still holds the vanilla fn.
-        // If anything else already swapped it, refuse instead of stacking.
-        if (*slot == k_Type52FitTestOriginal)
+        void** slot = reinterpret_cast<void**>(s.address);
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect))
         {
-            s_OriginalType52FitTestFn = k_Type52FitTestOriginal;
-            *slot = (void*)&Type52FitTestStub;
-            ok = true;
+            allOk = false;
+            continue;
         }
-    }
-    else
-    {
-        // Restore only if the slot still holds OUR stub — never clobber a
-        // patch someone else may have installed after us.
-        if (*slot == (void*)&Type52FitTestStub)
+        if (install)
         {
-            *slot = s_OriginalType52FitTestFn ? s_OriginalType52FitTestFn : k_Type52FitTestOriginal;
-            ok = true;
+            // Fail-safe rule: only swap when the slot still holds the vanilla
+            // fn recorded from the dump. If anything else already swapped it,
+            // refuse instead of stacking.
+            if (*slot == s.vanilla)
+            {
+                s.saved = s.vanilla;
+                *slot = (void*)&Type52FitTestStub;
+            }
+            else if (*slot != (void*)&Type52FitTestStub)
+            {
+                allOk = false; // site already patched by someone else
+            }
         }
+        else
+        {
+            // Restore only if the slot still holds OUR stub -- never clobber a
+            // patch someone else may have installed after us.
+            if (*slot == (void*)&Type52FitTestStub)
+            {
+                *slot = s.saved ? s.saved : s.vanilla;
+            }
+            s.saved = nullptr;
+        }
+        VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
     }
-    VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
-    return ok;
+    return allOk;
 }
 
 // ── Hook 4 callbacks: cycle-start tester vtable swap (optional) ───────────────
@@ -467,13 +497,6 @@ GPH_FailedWallrunCreator::GPH_FailedWallrunCreator()
 {
     PresetScript_CCodeInTheMiddle(0x140135230, 12,
         DuringClimbFacadeScan_CreateFailedWallrun,
-        AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
-}
-
-GPH_Type52RangeWidener::GPH_Type52RangeWidener()
-{
-    PresetScript_CCodeInTheMiddle(0x1401AF3B6, 10,
-        WhenType52RangesSet_Widen,
         AutoAssemblerCodeHolder_Base::RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
 }
 
@@ -614,7 +637,6 @@ FailedWallRunPlugin::~FailedWallRunPlugin()
         m_GphActive = false;
     }
     if (m_CreatorHookActive) { m_FailedWallrunCreator.Deactivate(); m_CreatorHookActive = false; }
-    if (m_WidenerHookActive) { m_RangeWidener.Deactivate(); m_WidenerHookActive = false; }
     if (m_FitTestHookActive) { SwapType52FitTestFn(false); m_FitTestHookActive = false; }
     if (m_VTableSwapHookActive) { m_VTableSwapHook.Deactivate(); m_VTableSwapHookActive = false; }
 }
@@ -832,38 +854,20 @@ void FailedWallRunPlugin::OnUpdate()
         }
     }
 
-    if (singleStage && m_WidenerHookActive)
-    {
-        m_RangeWidener.Deactivate();
-        m_WidenerHookActive = false;
-    } else if (!m_SingleStageMode) {
-        if (shouldBeActive && m_RangeWidenerEnabled && !m_WidenerHookActive)
-        {
-            m_WidenerSiteOk = SiteBytesMatch(0x1401AF3B6, k_ExpectedBytes_RangeSetterSite, sizeof(k_ExpectedBytes_RangeSetterSite));
-            if (m_WidenerSiteOk)
-            {
-                m_RangeWidener.Activate();
-                m_WidenerHookActive = true;
-            }
-        }
-        else if ((!shouldBeActive || !m_RangeWidenerEnabled) && m_WidenerHookActive)
-        {
-            m_RangeWidener.Deactivate();
-            m_WidenerHookActive = false;
-        }
-    }
-
+    // The fit-test slot swap covers BOTH the widening (g_ExpandRanges, applied
+    // inside the stub after 0x64 wrote the vanilla ranges) and the verdict
+    // override (g_SkipFitTest), so it activates when either feature wants it.
     if (singleStage && m_FitTestHookActive)
     {
         SwapType52FitTestFn(false);
         m_FitTestHookActive = false;
     } else if (!m_SingleStageMode) {
-        if (shouldBeActive && m_SkipFitTestEnabled && !m_FitTestHookActive)
+        if (shouldBeActive && (m_SkipFitTestEnabled || m_RangeWidenerEnabled) && !m_FitTestHookActive)
         {
             m_FitTestSlotOk = SwapType52FitTestFn(true);
             m_FitTestHookActive = m_FitTestSlotOk;
         }
-        else if ((!shouldBeActive || !m_SkipFitTestEnabled) && m_FitTestHookActive)
+        else if ((!shouldBeActive || (!m_SkipFitTestEnabled && !m_RangeWidenerEnabled)) && m_FitTestHookActive)
         {
             SwapType52FitTestFn(false);
             m_FitTestHookActive = false;
@@ -1017,15 +1021,16 @@ void FailedWallRunPlugin::OnImGuiRender()
                 ImGui::Indent();
 
                 bool widener = m_RangeWidenerEnabled;
-                if (ImGui::Checkbox("Widen acceptance ranges (during creation)", &widener))
+                if (ImGui::Checkbox("Widen acceptance ranges (at fit-test time)", &widener))
                 {
                     m_RangeWidenerEnabled = widener;
                     SaveSettings();
                 }
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Hooks the type-52 SetExpectedDistanceRangesAccordingToParkourMode\n"
-                                      "(0x1401AF2E0) so the widened ranges are in place BEFORE the\n"
-                                      "fit test runs. Only ever loosens vanilla ranges.");
+                    ImGui::SetTooltip("Applied from inside the swapped type-52 fit-test slot,\n"
+                                      "strictly after the game wrote its vanilla ranges (fancy 0x64)\n"
+                                      "and before the per-type test consumes them. Only ever loosens\n"
+                                      "vanilla ranges. Requires the fit-test slot swap to be active.");
 
                 bool skipFit = m_SkipFitTestEnabled;
                 if (ImGui::Checkbox("Override wall-context fit test", &skipFit))
@@ -1099,21 +1104,19 @@ void FailedWallRunPlugin::OnImGuiRender()
                 if (s_Type52FancyVTable == 0)
                     ImGui::TextColored(ImVec4(1, 1, 0, 1),
                         "  (capturing type-52 vtable... approach any wall once)");
-                ImGui::Text("  Hooks: creation %s | widener %s | fit-override %s | vtable-swap %s",
+                ImGui::Text("  Hooks: creation %s | fit-override %s | vtable-swap %s",
                     m_CreatorHookActive ? "ON" : "off",
-                    m_WidenerHookActive ? "ON" : "off",
                     m_FitTestHookActive ? "ON" : "off",
                     m_VTableSwapHookActive ? "ON" : "off");
-                bool sitesOk = m_CreatorSiteOk && m_WidenerSiteOk && m_FitTestSlotOk && m_SwapSitesOk;
+                bool sitesOk = m_CreatorSiteOk && m_FitTestSlotOk && m_SwapSitesOk;
                 ImGui::Text("  Site checks (vanilla bytes): %s",
                     sitesOk ? "OK" : "MISMATCH — a hook site was modified by something else;"
                                       " affected layer refused to install");
                 if (!sitesOk)
                 {
                     ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f),
-                        "    creation:%s widener:%s fit-slot:%s swap:%s",
+                        "    creation:%s fit-slot:%s swap:%s",
                         m_CreatorSiteOk ? "ok" : "MODIFIED",
-                        m_WidenerSiteOk ? "ok" : "MODIFIED",
                         m_FitTestSlotOk ? "ok" : "MODIFIED",
                         m_SwapSitesOk ? "ok" : "MODIFIED");
                 }

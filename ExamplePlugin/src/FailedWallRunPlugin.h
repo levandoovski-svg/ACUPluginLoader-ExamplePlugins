@@ -17,40 +17,28 @@ struct GPH_FailedWallrunCreator : AutoAssemblerCodeHolder_Base
     GPH_FailedWallrunCreator();
 };
 
-// ── Hook 2: range widener ─────────────────────────────────────────────────────
-// Runs INSIDE wallrunUpFromGroundFailed_mb's
-// SetExpectedDistanceRangesAccordingToParkourMode (fancy idx 0x64 == 0x1401AF2E0),
-// i.e. AFTER the game has written its vanilla acceptance ranges and BEFORE the
-// per-type geometry test (fancy idx 0x4A) and CalculateFitness consume them.
-// This is the same "patch the ranges during creation" pattern ACU_ParkourPatches
-// uses for wallEjectToHang (its hooks at 0x140140E44 / 0x140140DCA).
-//
-// Fix for the old plugin's ordering bug: ranges used to be widened only AFTER
-// CreateParkourActionForParkourPointIfFits had already run InitialTestIfActionFits
-// and destroyed the action on non-qualifying walls.
-struct GPH_Type52RangeWidener : AutoAssemblerCodeHolder_Base
-{
-    GPH_Type52RangeWidener();
-};
+// ── Hook 2 (REMOVED): range widener as a code hook ───────────────────────────
+// The old hook sat INSIDE 0x1401AF2E0, which binary analysis proved is type-54's
+// (wallrunUpToHang) range-setter -- NOT type 52's (0x14019AA50, slot 0x143A52F80).
+// It polluted wallrunUpToHang and never touched type 52. Widening now happens
+// inside the fit-test stub (Hook 3): the swapped 0x4A slot runs strictly after
+// 0x64 wrote the vanilla ranges and before the per-type verdict consumes them,
+// so the ordering guarantee holds with no mid-function code hook.
 
 // ── Hook 3: per-type fit-test override (fancy-table slot swap) ────────────────
-// The type-52 "does this wall qualify" verdict is produced by
-//   InitialTestIfActionFits (0x1401B4900, fancy idx 0x4B)
-//     -> per-type test fancy idx 0x4A (0x1401B0340)
-//          -> 0x1401B5700 = 5 per-context quick-checks (parkour mode, wall slope,
-//             mesh, ...) = the actual "wall context" gate.
-// While the feature is active, the fn pointer in the type-52 runtime fancy table
-// (0x143A6FFD0) at fancyVirtuals[0x4A].fn == 0x143A70920 is swapped from the
-// vanilla test to a forwarding stub that returns true. Dump-verified facts:
-//   * the slot is the ONLY qword in .data/.rdata holding 0x1401B0340, and the
-//     table is installed only by the type-52 construction paths (0x1401BC730 /
-//     0x1401BC850) -> the swap affects wallrunUpFromGroundFailed_mb exclusively;
-//   * this is the same "swap a game vtable entry per config" pattern the
-//     reverse-engineered ACU_ParkourPatches.dll uses;
-//   * a mid-function hook at the TEST/JZ was rejected deliberately:
-//     AutoAssemblerKinda copies stolen bytes verbatim (relative branches would
-//     break) and code hooks need at least 5 stolen bytes.
-// (Implemented as a plain function-pointer swap in FailedWallRunPlugin.cpp —
+// The "does this wall qualify" verdict is the fancy-0x4A call inside
+// InitialTestIfActionFits (0x1401B4900). Two slot addresses are swapped:
+//   * 0x143A52C40 -- type-52 RUNTIME table (0x143A522F0, dump-verified: its
+//     0x45 accessor returns 0x34 = 52) 0x4A, vanilla 0x14019B6F0;
+//   * 0x143A42280 -- TRANSIENT base table (0x143A41930) 0x4A, vanilla
+//     0x1401B5700. SHARED by 22 tables, so the stub widens/overrides ONLY
+//     actions whose table it recognizes, forwarding everything else untouched.
+// The swapped stub (a) widens the action's acceptance ranges (only loosens;
+// runs after 0x64 wrote vanilla ranges, before the verdict/CalculateFitness
+// consume them) and (b) optionally returns true, skipping the wall-context gate.
+// The previous implementation patched 0x143A70920, which is type-54's 0x4A
+// (vanilla 0x1401B0340) -- wrong table, wrong vanilla value, wrong effect.
+// (Implemented as plain function-pointer swaps in FailedWallRunPlugin.cpp --
 // no AutoAssembler hook needed.)
 
 // ── Hook 4 (optional): cycle-start tester vtable swap ─────────────────────────
@@ -100,17 +88,14 @@ private:
     static constexpr uint32 kGeneralStateRTCPIdx = 237;
 
     AutoAssembleWrapper<GPH_FailedWallrunCreator> m_FailedWallrunCreator;
-    AutoAssembleWrapper<GPH_Type52RangeWidener> m_RangeWidener;
     AutoAssembleWrapper<GPH_CycleStartVTableSwap> m_VTableSwapHook;
 
     bool m_CreatorHookActive = false;
-    bool m_WidenerHookActive = false;
     bool m_FitTestHookActive = false;
     bool m_VTableSwapHookActive = false;
 
     // Vanilla-byte verification results (fail-closed guards; shown in the UI).
     bool m_CreatorSiteOk = true;
-    bool m_WidenerSiteOk = true;
     bool m_FitTestSlotOk = true;
     bool m_SwapSitesOk = true;
 

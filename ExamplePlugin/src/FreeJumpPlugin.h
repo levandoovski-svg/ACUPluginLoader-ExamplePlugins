@@ -128,6 +128,14 @@ private:
     std::array<bool, kMaxBindableKey + 1> m_KeyStateUpdatedThisFrame{};
     int m_JustCapturedKey = 0;
 
+    // Rebind-capture guard for mouse-button bindings: a rebind is started by a
+    // UI click, and that click must not be captured as the new binding. While
+    // a rebind is pending, LMB/RMB are only accepted after both were seen
+    // released once (FreeJumpPlugin.cpp OnUpdate). Keyboard/pad captures are
+    // unaffected.
+    bool m_AnyRebindWaitingLastFrame = false;
+    bool m_MouseButtonsSettledSinceRebindStart = true;
+
     // Gamepad (XInput) state. m_PadDown* are indexed by ParkourPadCode.
     std::array<bool, PadCode_COUNT> m_PadDown{};
     std::array<bool, PadCode_COUNT> m_PadPreviousDown{};

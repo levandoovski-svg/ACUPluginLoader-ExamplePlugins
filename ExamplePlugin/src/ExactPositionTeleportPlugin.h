@@ -4,6 +4,39 @@
 #include <cstdint>
 #include <string>
 
+// Bindable XInput codes use a separate range so existing keyboard/mouse INI
+// values remain unchanged.
+enum ExactTeleportPadCode
+{
+    ExactTeleportPad_DPadUp = 0,
+    ExactTeleportPad_DPadDown,
+    ExactTeleportPad_DPadLeft,
+    ExactTeleportPad_DPadRight,
+    ExactTeleportPad_Start,
+    ExactTeleportPad_Back,
+    ExactTeleportPad_L3,
+    ExactTeleportPad_R3,
+    ExactTeleportPad_LB,
+    ExactTeleportPad_RB,
+    ExactTeleportPad_A,
+    ExactTeleportPad_B,
+    ExactTeleportPad_X,
+    ExactTeleportPad_Y,
+    ExactTeleportPad_LeftTrigger,
+    ExactTeleportPad_RightTrigger,
+    ExactTeleportPad_LeftStickUp,
+    ExactTeleportPad_LeftStickDown,
+    ExactTeleportPad_LeftStickLeft,
+    ExactTeleportPad_LeftStickRight,
+    ExactTeleportPad_RightStickUp,
+    ExactTeleportPad_RightStickDown,
+    ExactTeleportPad_RightStickLeft,
+    ExactTeleportPad_RightStickRight,
+    ExactTeleportPad_COUNT
+};
+constexpr int kExactTeleportPadKeyBase = 0x1000;
+constexpr int kExactTeleportMaxBindableKey = kExactTeleportPadKeyBase + ExactTeleportPad_COUNT - 1;
+
 // Exact-position teleport / force-freefall test plugin.
 //
 // A rising press of the configured force key:
@@ -50,6 +83,13 @@ private:
     void ServiceHeldBreakfall();
     void ProcessPendingBreakfall();
     void ReleaseForce();
+    void UpdatePadStates();
+    void UpdateKeyState(int bindableKeyCode);
+    void UpdateAllKeyStates();
+    bool WasKeyPressed(int bindableKeyCode) const;
+    bool IsForceKeyDown() const;
+    static bool IsValidBindableKey(int bindableKeyCode);
+    static bool IsPadCode(int bindableKeyCode);
 
     void LoadSettings();
     void SaveSettings();
@@ -61,9 +101,15 @@ private:
     std::string GetLogPath() const;
 
     // key / general
-    int  m_ForceKey = 'T';                 // Windows virtual-key code
+    int  m_ForceKey = 'T';                 // virtual key or 0x1000+ XInput code
     bool m_WaitingForKey = false;
-    std::array<bool, 256> m_CaptureKeyWasDown {};
+    std::array<bool, kExactTeleportMaxBindableKey + 1> m_PreviousKeyDown {};
+    std::array<bool, kExactTeleportMaxBindableKey + 1> m_KeyPressedThisFrame {};
+    std::array<bool, kExactTeleportMaxBindableKey + 1> m_KeyStateUpdatedThisFrame {};
+    std::array<bool, ExactTeleportPad_COUNT> m_PadDown {};
+    int m_ActivePadSlot = -1;
+    bool m_PadDllLoaded = false;
+    int m_JustCapturedKey = 0;
 
     // Master toggle ("Enable CatchLedge"): when off the plugin never touches
     // the game - no teleport, no reset, no breakfall requests.
