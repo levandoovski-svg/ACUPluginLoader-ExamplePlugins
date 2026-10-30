@@ -522,6 +522,9 @@ namespace
         auto* inputContainer = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_));
         if (!inputContainer)
             return;
+        // Cache for VerifySuppressionIntegrity: the shared zeroing helper is the
+        // one place all three keyStates sites run with a proven-valid rbx.
+        owner->NoteInputContainer(inputContainer);
 
         uint8_t* keyStatesThisFrame = inputContainer + 0x30; // InputContainer::keyStates_thisFrame
         for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
@@ -1170,6 +1173,41 @@ void WidenAcceptanceRanges(AvailableParkourAction& action)
 
 // ── INI persistence ───────────────────────────────────────────────────
 
+// ── Parkour Mode: input-integrity verification ────────────────────────
+// The suppression sites must leave every freed byte zero by the time the
+// game's conversion/parkour passes consume them. Rather than trusting that
+// every write path stays hooked forever, the verifier re-reads the freed
+// bytes from the cached InputContainerBig each frame. Any nonzero freed
+// byte is a LEAK — ground truth that some input path this build does not
+// hook wrote it — so the UI shows it and (opt-in) the whole-pad detach
+// engages as a last resort, releasing itself again after a long clean
+// streak. Keyboard/mouse leaks cannot be helped by detaching the pad; they
+// are still surfaced so the build can be re-examined.
+//
+// Guarded read: the cached pointer was valid the moment a hook cached it,
+// but the game may free it later (menu transitions, save loads); the read
+// must not kill the game.
+// Returns 0xFFFFFFFF when the read faulted (container no longer valid).
+static uint32_t ReadFreedKeyStatesGuarded(const void* container, uint32_t disabledMask)
+{
+    __try
+    {
+        const uint8_t* keyStatesThisFrame =
+            static_cast<const uint8_t*>(container) + 0x30; // InputContainer::keyStates_thisFrame
+        uint32_t leakedMask = 0;
+        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+        {
+            if ((disabledMask & (1u << actionIdx)) && keyStatesThisFrame[actionIdx] != 0)
+                leakedMask |= (1u << actionIdx);
+        }
+        return leakedMask;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0xFFFFFFFFu;
+    }
+}
+
 static std::string GetIniPath()
 {
     char documents[MAX_PATH]{};
@@ -1242,6 +1280,12 @@ void FreeJumpPlugin::LoadSettings()
             bool enabled = false;
             if (TryParseBool(value, enabled))
                 m_BlockPadWhileParkour = enabled;
+        }
+        else if (TryGetValue(trimmedLine, "AutoFallbackOnLeak=", value))
+        {
+            bool enabled = false;
+            if (TryParseBool(value, enabled))
+                m_AutoFallbackOnLeak = enabled;
         }
         // Legacy `BlockPadWhileParkour=` is deliberately NOT read: in 0.11 it
         // defaulted to 1 and was the primary (whole-pad) mechanism. Honouring a
@@ -1355,6 +1399,7 @@ void FreeJumpPlugin::SaveSettings()
     file << "ParkourModeKeyPad=" << std::hex << m_ParkourModeKeyPad << std::dec << "\n";
     file << "ParkourModeOn=" << (m_ParkourModeOn ? 1 : 0) << "\n";
     file << "DetachPadFallback=" << (m_BlockPadWhileParkour ? 1 : 0) << "\n";
+    file << "AutoFallbackOnLeak=" << (m_AutoFallbackOnLeak ? 1 : 0) << "\n";
     file << "ParkourDisabledActions=";
     {
         bool firstAction = true;
@@ -1525,6 +1570,9 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
             g_SuppressHitsPadPoll = 0;
             for (int16_t& padCode : g_PadCodeForAction)
                 padCode = -1;
+            m_LeakStreak = 0;
+            m_CleanFrameStreak = 0;
+            m_LastLeakMask = 0;
         }
 
         // Three independent sites. One that another plugin already patched is
@@ -1643,6 +1691,60 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         }
         m_ParkourHookRefused = false;
         ApplyOverrideFallback(false);
+    }
+}
+
+void FreeJumpPlugin::VerifySuppressionIntegrity()
+{
+    m_LastLeakMask = 0;
+    if (!m_ParkourModeOn || m_DisabledActionMask == 0 || !m_CachedInputContainer)
+    {
+        m_LeakStreak = 0;
+        m_CleanFrameStreak = 0;
+        return;
+    }
+
+    const uint32_t readResult =
+        ReadFreedKeyStatesGuarded(m_CachedInputContainer, m_DisabledActionMask);
+    if (readResult == 0xFFFFFFFFu)
+    {
+        // The cached container went invalid between frames. Drop it and wait
+        // for the hooks to cache a fresh one rather than trusting old memory.
+        m_CachedInputContainer = nullptr;
+        m_LeakStreak = 0;
+        m_CleanFrameStreak = 0;
+        return;
+    }
+    m_LastLeakMask = readResult;
+
+    if (m_LastLeakMask)
+    {
+        ++m_LeakStreak;
+        ++m_LeakTotalFrames;
+        m_CleanFrameStreak = 0;
+        // Opt-in last resort: freeze the whole pad (sticks included) so the
+        // overrides keep working through the plugin's own polling. Only while
+        // a pad is actually connected — a keyboard leak is not helped by
+        // detaching the pad.
+        if (m_AutoFallbackOnLeak && !m_PadBlockHookActive
+            && m_ActivePadSlot >= 0 && m_LeakStreak >= 30)
+        {
+            GetParkourModePadBlockHook().Activate();
+            m_PadBlockHookActive = true;
+        }
+    }
+    else
+    {
+        m_LeakStreak = 0;
+        ++m_CleanFrameStreak;
+        // Recovery: the leak stopped, so do not keep the character pinned
+        // forever. ~3s at 60fps.
+        if (m_PadBlockHookActive && m_AutoFallbackOnLeak && m_CleanFrameStreak >= 180)
+        {
+            GetParkourModePadBlockHook().Deactivate();
+            m_PadBlockHookActive = false;
+            m_CleanFrameStreak = 0;
+        }
     }
 }
 
@@ -1894,6 +1996,11 @@ void FreeJumpPlugin::OnUpdate()
     m_KeyStateUpdatedThisFrame.fill(false);
     m_JustCapturedKey = 0;
     UpdatePadStates();
+
+    // Parkour Mode's freed bytes are the honest measure of whether the
+    // suppression actually stuck this frame; the verifier counts leaks and
+    // can auto-escalate to the pad detach (see VerifySuppressionIntegrity).
+    VerifySuppressionIntegrity();
 
     // Every binding exists in two profiles (keyboard/mouse + controller).
     // Both profiles' states are refreshed every frame so that switching
@@ -2312,6 +2419,64 @@ void FreeJumpPlugin::OnImGuiRender()
             (unsigned)g_SuppressHitsPadKeymap,
             (unsigned)g_SuppressHitsMapper, (unsigned)g_SuppressHitsPadSnapshot,
             (unsigned)m_DisabledActionMask);
+        // Live verification: re-reads the cached InputContainerBig's freed
+        // bytes each frame and reports any nonzero freed byte. This is the
+        // line that proves suppression works — hit counters only prove a
+        // site RAN; a clean integrity line proves the result held.
+        if (!m_CachedInputContainer)
+        {
+            ImGui::TextDisabled("Input integrity: waiting for a suppression site to fire (no telemetry yet)");
+        }
+        else if (m_LastLeakMask == 0)
+        {
+            ImGui::TextColored(activeColor, "Input integrity: clean");
+            ImGui::SameLine();
+            ImGui::TextDisabled("(freed bytes verified zero for %u frame(s); %u leak frame(s) this session)",
+                (unsigned)m_CleanFrameStreak, (unsigned)m_LeakTotalFrames);
+        }
+        else
+        {
+            std::string leakedButtons;
+            bool padLeak = false, keyboardLeak = false;
+            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+            {
+                if (!(m_LastLeakMask & (1u << actionIdx)))
+                    continue;
+                if (ResolvePadCodeForAction(this, actionIdx) >= 0)
+                    padLeak = true;
+                else
+                    keyboardLeak = true;
+                if (!leakedButtons.empty())
+                    leakedButtons += ", ";
+                leakedButtons += ActionKeyName(actionIdx);
+            }
+            ImGui::TextColored(ImVec4(1.0f, 0.20f, 0.20f, 1.00f),
+                "INPUT LEAK (%u frame(s) in a row, %u total): %s — the game still reads a freed byte",
+                (unsigned)m_LeakStreak, (unsigned)m_LeakTotalFrames, leakedButtons.c_str());
+            ImGui::TextDisabled(
+                "%s An unhooked input path is writing it. Check that no other plugin patches nearby "
+                "input sites; if it persists in a vanilla build, a fresh dump of this build is needed "
+                "to locate the new writer and close it.",
+                padLeak && keyboardLeak ? "Leaked on BOTH the controller and the keyboard."
+                    : padLeak ? "Leaked via the controller."
+                    : keyboardLeak ? "Leaked via the keyboard/mouse (detaching the pad cannot fix this)."
+                    : "");
+        }
+        bool autoFallback = m_AutoFallbackOnLeak;
+        if (ImGui::Checkbox("Auto-engage detach fallback when a leak persists (~0.5s)", &autoFallback))
+        {
+            m_AutoFallbackOnLeak = autoFallback;
+            SaveSettings();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Opt-in safety net: when the verification above sees freed bytes stay nonzero for ~30 "
+                "frames while a controller is connected, the whole-pad detach engages automatically "
+                "so the overrides keep working, and it releases itself after ~3 seconds of clean "
+                "frames. Off by default because the detach also freezes stick movement.");
+        if (m_PadBlockHookActive && m_AutoFallbackOnLeak)
+            ImGui::TextColored(inactiveColor,
+                "Auto fallback: pad detach currently ENGAGED (auto-releases after clean frames)");
         // Which physical pad button each disabled action hides, as resolved from
         // the game's own controller bindings. This is the line to read when a
         // button still reaches the game: if a ticked action is missing here, it

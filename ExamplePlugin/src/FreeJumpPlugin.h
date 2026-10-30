@@ -94,6 +94,10 @@ public:
 
     // Read by the parkour-mode suppression callback (FreeJumpPlugin.cpp).
     uint32_t GetDisabledActionMask() const { return m_DisabledActionMask; }
+    // Cached by the suppression-site callbacks each frame (the InputContainerBig
+    // they ran on), so VerifySuppressionIntegrity can re-read the freed keys
+    // later in the frame and detect a resurrected byte.
+    void NoteInputContainer(void* container) { m_CachedInputContainer = container; }
 private:
     void UpdateKeyState(int bindableKeyCode);
     void UpdateAllKeyStates();
@@ -183,6 +187,20 @@ private:
     bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
     bool m_OverrideFallbackRefused = false;
+
+    // ── Input-integrity verification (see FreeJumpPlugin.cpp) ─────────────
+    // Each frame Parkour Mode is on with a nonzero mask, the freed bytes are
+    // re-read from the cached InputContainerBig; any nonzero freed byte is a
+    // leak — proof some input path this build does not hook wrote it. The UI
+    // surfaces it, and (opt-in) a sustained leak auto-engages the pad-detach
+    // fallback, releasing itself again after a long clean streak.
+    void VerifySuppressionIntegrity();
+    void* m_CachedInputContainer = nullptr;
+    uint32_t m_LastLeakMask = 0;       // bits still nonzero on the last check
+    uint32_t m_LeakStreak = 0;         // consecutive frames with a leak
+    uint32_t m_LeakTotalFrames = 0;    // session total leaky frames
+    uint32_t m_CleanFrameStreak = 0;   // consecutive clean frames (auto-recovery)
+    bool m_AutoFallbackOnLeak = false; // opt-in: freeze the pad if leaks persist
 
     // Reliable Win32 rising-edge state. The low bit of GetAsyncKeyState is
     // only "pressed since the previous call" and is not reliable for this.
