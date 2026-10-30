@@ -742,7 +742,7 @@ namespace
         ParkourModePadPollHook()
         {
             PresetScript_CCodeInTheMiddle(
-                0x142728A1F, 6,
+                0x142728A1F, 5,
                 SanitizePadPollSnapshot,
                 RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
                 true);
@@ -1111,8 +1111,8 @@ namespace
     {
         // Vanilla: movzx edi,dil ; test eax,eax  (0x142728A1F, 6 bytes).
         const uint8_t* site = reinterpret_cast<const uint8_t*>(0x142728A1F);
-        return !(site[0] == 0x40 && site[1] == 0x0F && site[2] == 0xB6 && site[3] == 0xFF
-            && site[4] == 0x85 && site[5] == 0xC0);
+        return !(site[0] == 0x40 && site[1] == 0x0F && site[2] == 0xB6
+            && site[3] == 0xFF && site[4] == 0x85);
     }
 
     bool IsMapperSuppressSitePatched()
@@ -1472,6 +1472,11 @@ void FreeJumpPlugin::OnBeforeActivate()
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 5.0f;
     m_Callbacks.m_Name = "FreeJumpPlugin";
+
+    // Per-action controller-button bindings for Parkour Mode: default to 0
+    // (unbound) so the INI is clean; the Bind buttons in the checkbox area
+    // populate them at play-time.
+    for (int i = 0; i < 0x20; ++i) m_ActionPadBindings[i] = 0;
 
     if (m_ParkourModeOn && m_DisabledActionMask)
         ApplyParkourMode(true);
@@ -2251,6 +2256,30 @@ void FreeJumpPlugin::OnImGuiRender()
             }
         }
 
+        // Wall-to-Hang: dive key (keyboard/mouse profile + controller profile).
+        // The user binds the physical controller button, not the in-game action.
+        ImGui::SameLine();
+        ImGui::TextColored(m_WallToHangEnabled ? activeColor : inactiveColor,
+                           m_WallToHangEnabled ? "ON" : "OFF");
+        ImGui::Text("  Hotkey: %s",
+            KeyCodeLabel(m_UseControllerBindings ? m_DiveHotkeyPad : m_DiveHotkey).c_str());
+        if (ImGui::Button(m_WaitingForDiveKey ? "Cancel" : "Rebind Dive"))
+        {
+            m_WaitingForDiveKey = !m_WaitingForDiveKey;
+            if (m_WaitingForDiveKey)
+            {
+                m_WaitingForKey = false;
+                m_WaitingForParkourKey = false;
+                m_WaitingPadBindAction = -1;
+                for (ParkourActionOverride& override : m_Overrides)
+                    override.waitingForKey = false;
+            }
+            else
+                SaveSettings();
+        }
+        if (m_WaitingForDiveKey)
+            ImGui::TextColored(rebindColor, "Press any controller button or keyboard key to bind...");
+
         ImGui::Separator();
         ImGui::Text("Parkour Mode:");
         ImGui::SameLine();
@@ -2406,6 +2435,7 @@ void FreeJumpPlugin::OnImGuiRender()
             // actions show a Bind button.
             for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
             {
+                ImGui::PushID(actionIdx);
                 if (!(m_DisabledActionMask & (1u << actionIdx)) || !*ActionKeyName(actionIdx))
                     continue;
                 ImGui::Text("%s: ", ActionKeyName(actionIdx));
@@ -2433,6 +2463,7 @@ void FreeJumpPlugin::OnImGuiRender()
             }
             if (m_WaitingPadBindAction >= 0)
                 ImGui::TextColored(rebindColor, "Press a controller button (X=2, Y=3, LB=5, RB=4) ...");
+            ImGui::PopID();
             ImGui::TreePop();
         }
     }
