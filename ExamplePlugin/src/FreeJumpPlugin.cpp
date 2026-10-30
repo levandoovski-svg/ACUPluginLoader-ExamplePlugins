@@ -742,7 +742,7 @@ namespace
         ParkourModePadPollHook()
         {
             PresetScript_CCodeInTheMiddle(
-                0x142728A1F, 5,
+                0x142728A1F, 6,
                 SanitizePadPollSnapshot,
                 RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
                 true);
@@ -1112,7 +1112,7 @@ namespace
         // Vanilla: movzx edi,dil ; test eax,eax  (0x142728A1F, 6 bytes).
         const uint8_t* site = reinterpret_cast<const uint8_t*>(0x142728A1F);
         return !(site[0] == 0x40 && site[1] == 0x0F && site[2] == 0xB6
-            && site[3] == 0xFF && site[4] == 0x85);
+            && site[3] == 0xFF && site[4] == 0x85 && site[5] == 0xC0);
     }
 
     bool IsMapperSuppressSitePatched()
