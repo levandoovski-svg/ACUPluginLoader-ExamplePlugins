@@ -124,15 +124,22 @@ private:
     int  m_ParkourModeKeyPad = VK_F7;
     bool m_ParkourModeOn     = false;
     bool m_WaitingForParkourKey = false;
-    // Detach the game's DirectInput/HID pad while Parkour Mode is on; the
-    // plugin's own XInput polling keeps working, so override triggers bound to
-    // pad buttons still fire. Turn off to leave the gamepad attached (then
-    // Parkour Mode only frees keyboard/mouse-bound actions).
-    bool m_BlockPadWhileParkour = true;
+    // Fallback detach of the game's DirectInput/HID pad while Parkour Mode is
+    // on. Off by default: it also disables the sticks, and the per-site
+    // suppression below already frees pad buttons one by one. The plugin's own
+    // XInput polling always keeps working, so override triggers bound to pad
+    // buttons still fire either way.
+    bool m_BlockPadWhileParkour = false;
     bool m_PadBlockHookActive = false;
     uint32_t m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10); // LMB, RMB, Crouch
-    bool m_ParkourHookRefused = false;
-    bool m_ParkourHookActive = false;
+    // Parkour-mode suppression sites, installed independently of each other:
+    //   0x14273BC7B keyboard/mouse
+    //   0x14273BEC5 gamepad, device-id-9 keymap fill
+    //   0x14273A726 gamepad, per-device-type mapper
+    bool m_KbmSuppressActive = false;
+    bool m_PadKeymapSuppressActive = false;
+    bool m_MapperSuppressActive = false;
+    bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
     bool m_OverrideFallbackRefused = false;
 
@@ -162,7 +169,8 @@ private:
     std::vector<ParkourActionOverride> m_Overrides;
 
     // Parkour mode suppression hooks (active only while the mode is enabled):
-    // KBM keymap stage and the pad-device detach (see FreeJumpPlugin.cpp).
+    // the KBM keymap stage, both gamepad keyStates writers, and the optional
+    // pad-device detach (see FreeJumpPlugin.cpp).
     void ApplyParkourMode(bool enable);
     // Override fallback used while another plugin owns the sort&select site.
     void ApplyOverrideFallback(bool enable);

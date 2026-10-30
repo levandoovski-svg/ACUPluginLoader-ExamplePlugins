@@ -206,6 +206,25 @@ Checks primaryCallbackReceivers for any of 12 combat Enter addresses: Combat (0x
 
 ---
 
+## Session 15 — Parkour Mode on gamepads: suppression moved AFTER the pad writers, three independent sites (2026-10-30)
+
+| Item | Detail |
+|------|--------|
+| Symptom | Parkour Mode freed keyboard/mouse bindings but controller-bound actions still fired with the mode ON, across Sessions 12–14. |
+| Root cause 1 (ordering) | The mask was applied once, at the keyboard/mouse site `0x14273BC7B`, i.e. **before** both gamepad writers of `keyStates_thisFrame` (`+0x30`). The device-9 pad keymap fill (`0x14273B390`, called at `0x14273BEBD`) rewrites all 32 entries, and the per-device-type mapper (`0x142739E40`, entered by `jmp` at `0x14273BE68` for every other device id — where DS4Windows' virtual pad lands) writes pad buttons directly. Either way the cleared bytes were resurrected a few hundred instructions later; no amount of correctness at the KBM site could ever suppress a pad button. |
+| Root cause 2 (the only pad seam was all-or-nothing) | Session 14's answer was to kill the game's pad poll `0x1427289A0` (`xor eax,eax; ret`). That also kills the sticks, so the character cannot move while the mode is on — unusable in play, and it was ON by default. |
+| Root cause 3 (coupled install) | All sweep hooks shared one holder plus `m_ParkourHookActive`/`m_ParkourHookRefused`, `ApplyParkourMode(true)` only ran while `!m_ParkourHookActive`, and `g_ParkourModeInstance` was assigned only in the KBM branch. One refused or mismatched site therefore disabled the rest, a refusal was never retried, and the callbacks could no-op while hooks were installed. |
+| Fix (sites) | Three independent `PresetScript_CCodeInTheMiddle` hooks, each with its own holder, its own vanilla-byte predicate and its own `m_*SuppressActive` flag: KBM `0x14273BC7B` (6 stolen bytes, unchanged), **pad keymap `0x14273BEC5`** (7 bytes = `lea rdx,[rbx+0x864]`, immediately after the pad fill `0x14273B390` and before `0x14273C4C0` plus the bool→float pass at `0x14273BED7`), **pad mapper `0x14273A726`** (8 bytes = `mov r14,[rsp+0x148]`, after the mapper's last `keyStates` write and before its own bool→float pass at `0x14273A736`; the mapper writes nothing to `+0x30..` after this point — checked through its `ret` at `0x14273A873`). Zeroing before each conversion pass also zeroes the analog mirrors a pad drives through its triggers (`+0x274/+0x29C/+0x2A8`), so RT-aim and analog attack stop too. |
+| Fix (install policy) | `g_ParkourModeInstance` is published before any hook is installed, so a site that installs while the KBM site is refused still works. Sites install independently: a site taken by another plugin costs only its own device and is reported per site, and the retry loop keeps `m_ParkourHookRefused` from freezing the other two. |
+| Fix (fallback demoted) | `ParkourModePadBlockHook` (whole-pad detach) is kept only as a diagnostic fallback, **off by default**, with its INI key renamed `BlockPadWhileParkour=` → `DetachPadFallback=` so a Session-14 file (`=1`) cannot silently re-enable the stick-freezing behaviour. The legacy key is parsed and ignored. |
+| Evidence | Stolen bytes are whole, position-independent instructions read from the 1.5.0 dump (`MODLOG/scripts/ACU_dumped.bin`); the cave restores `rsp` to its vanilla value before re-executing them (`mov rsp,[rsp+0x248]; pop rax; popfq; ret` in `PresetScript_CCodeInTheMiddle`), which is what makes the `[rsp+0x148]` steal safe; `rbx` is the `InputContainerBig*` at all three sites and is used again immediately after each site, so the interposed C call cannot have clobbered it. |
+| UI | Per-site status line (`KBM on/taken/off | pad keymap … | pad mapper …`) and per-site hit counters since the mode was turned on. All-zero pad counters while pressing pad buttons is the one signal that this build routes gamepad input somewhere else — the only case where the detach fallback is worth using. |
+| Validation | `clang++ -fsyntax-only -std=c++20` (llvm-mingw, Release\|x64 include paths): `FreeJumpPlugin.cpp` 0 errors / 3 pre-existing header warnings (`-Winvalid-offsetof` ×2, `#pragma` in vmath.h), `main.cpp` 0 errors. Plugin version → 0.12.0.0. |
+| Build/runtime status | ❌ NOT compiled with MSVC v142, NOT runtime-verified. Push → GitHub Actions `build.yml` → `ExamplePlugin.dll`. |
+| Manual acceptance | 1) Parkour Mode ON with a controller: pad attack/aim/crouch must do nothing while movement and parkour keep working (no stick freeze). 2) The pad hit counters must advance when pad buttons are pressed; if they stay 0, report both counters and the active device instead of enabling the fallback. 3) Toggle OFF: every pad button returns. 4) No-pad session: KBM behaviour identical to earlier sessions. 5) An existing `FreeJumpPlugin.ini` loads unchanged and gains `DetachPadFallback=0`. 6) Pad-bound override triggers still fire (the plugin's own XInput polling is independent). |
+
+---
+
 ## Session 14 — Gamepad Parkour Mode (pad detach), rebind-profile inversion, editable override names, ACUFixes-helper coexistence (2026-10-29)
 
 | Item | Detail |
