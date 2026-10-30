@@ -1,0 +1,55 @@
+name: Build AnimationLoopFixPlugin
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - "AnimationLoopFixPlugin/**"
+      - "CommonLibACU/**"
+      - ".github/workflows/build-animationloopfix.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable Long Paths
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Checkout plugin repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        path: 's'
+        submodules: 'recursive'
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Checkout ACUFixes repo
+      uses: actions/checkout@v4
+      with:
+        repository: NameTaken3125/ACUFixes
+        fetch-depth: 0
+        path: 'ACUFixes'
+
+    - name: Clean build artifacts
+      shell: pwsh
+      run: |
+        $buildDir = "${{ github.workspace }}\s\AnimationLoopFixPlugin\build"
+        if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build AnimationLoopFixPlugin
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\AnimationLoopFixPlugin\AnimationLoopFixPlugin.vcxproj" /p:Configuration=Release /p:Platform=x64 /m
+
+    - name: Upload DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: AnimationLoopFixPlugin
+        path: |
+          s/AnimationLoopFixPlugin/build/x64/Release/plugins/AnimationLoopFixPlugin.dll

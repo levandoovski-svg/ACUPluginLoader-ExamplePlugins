@@ -353,8 +353,12 @@ namespace
     // (Common_PluginSide ACU_InputUtils.cpp). Both the scancode-level
     // (K_LSHIFT = 42 / K_RSHIFT = 54) and the action-level (Sprint = 0xC)
     // entries are cleared so neither the raw nor the derived input path
-    // sees Shift held. Re-applied every frame while the condition holds;
-    // stopped as soon as the state ends or Shift is physically released.
+    // sees Shift held. The scancode-level write is keyboard-only (ACU's
+    // BindableKeyCode space has no pad codes), but the gamepad Right Trigger
+    // sprint reaches the game through the same ActionKeyCode::Sprint action
+    // entry, so the action-level clear covers both input paths. Re-applied
+    // every frame while the condition holds; stopped as soon as the state
+    // ends or Shift / the right trigger is physically released.
     bool NegateShiftForGame()
     {
         __try
@@ -633,7 +637,8 @@ namespace
              << "// of constant use, zero crashes); breakfall natively with E in freefall.\n"
              << "BreakfallAfterTeleport=0\n"
              << "// While the player is mid-jump (InSafeJumpOrLoweringToHang), make the\n"
-             << "// game see Shift as released so sprint cannot fight the forced\n"
+             << "// game see Shift (or the gamepad Right Trigger, the controller\n"
+             << "// sprint equivalent) as released so sprint cannot fight the forced\n"
              << "// freefall (prevents jittering / walking-in-air).\n"
              << "NegateShiftInSafeJump=1\n"
              << "// Keep re-issuing the breakfall request for as long as ForceKey is held.\n"
@@ -1539,8 +1544,11 @@ void ExactPositionTeleportPlugin::ServiceShiftNegation()
     }
 
     // Cheap physical check first; the state-tree walk only runs while Shift
-    // is actually held down.
-    if (!IsShiftHeld())
+    // (or the gamepad's sprint equivalent, the Right Trigger) is actually
+    // held. ACU's BindableKeyCode space covers keyboard/mouse codes only, so
+    // the trigger's physical state comes from this plugin's own XInput poll
+    // (m_PadDown), which UpdatePadStates() just refreshed in OnUpdate().
+    if (!IsShiftHeld() && !m_PadDown[ExactTeleportPad_RightTrigger])
     {
         m_ShiftNegationActive = false;
         return;
@@ -1773,7 +1781,7 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
         m_LastStateWallrunUp ? "WallrunUp" : "");
     ImGui::Text("Last transform applied: %s", m_LastTransformApplied ? "yes" : "no");
     ImGui::Text("Last HSTE reset dispatched: %s", m_LastResetDispatched ? "yes" : "no");
-    ImGui::Text("Shift negation (mid-jump): %s", m_ShiftNegationActive ? "ACTIVE" : (m_NegateShiftInSafeJump ? "idle" : "off"));
+    ImGui::Text("Shift / pad RT negation (mid-jump): %s", m_ShiftNegationActive ? "ACTIVE" : (m_NegateShiftInSafeJump ? "idle" : "off"));
     ImGui::Text("Held breakfall requests: %d", m_HoldRequestCount);
     ImGui::Text("Last breakfall request: %s",
         m_LastBreakfallRequested ? "dispatched" : (m_PendingBreakfall ? "pending" : "no"));

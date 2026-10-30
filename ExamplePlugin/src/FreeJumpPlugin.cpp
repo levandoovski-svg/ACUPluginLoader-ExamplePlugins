@@ -33,6 +33,12 @@ DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcal
 // gamepad-site callback (its rel32 call is stolen, not re-executed).
 DEFINE_GAME_FUNCTION(PadActionAxisAndVectorUpdate, 0x14273C4C0, void, __fastcall, (void* inputContainerBig, void* padStateBuffer, void* padKeymap));
 
+// Radial-deadzone/normalization helper for the input vectors (takes the
+// InputContainerBig* in rcx; only parameter it reads). Called at the tail of
+// the gamepad hard-mapper right before its bool→float conversion — reproduced
+// by Parkour Mode's third suppression callback.
+DEFINE_GAME_FUNCTION(InputVectorDeadzoneApply, 0x142735E20, void, __fastcall, (void* inputContainerBig, void* a2, void* a3, void* a4));
+
 namespace
 {
     constexpr int kMaxOverrideCount = 4096;
@@ -374,9 +380,9 @@ namespace
     // runtime dump; chains behind the ACUFixes-0.9.3 mousewheel-cycle hook at
     // 0x14273BC75, whose trampoline returns exactly to 0x14273BC7B.
     //
-    // Site 2 (gamepad), 0x14273BED2: the chain continues into a pad-specific
-    // stage (entered at 0x14273BE10, which only proceeds when the active
-    // input device is the gamepad: cmp dword ptr [InputContainerBig+0x830],9).
+    // Site 2 (gamepad keymap stage), 0x14273BED2: the chain continues into a
+    // pad-specific stage (entered at 0x14273BE10, which only proceeds when the
+    // active input device id is 9: cmp dword ptr [InputContainerBig+0x830],9).
     // There FUN_14273BE6D polls the pad into InputContainerBig+0x864 and
     // FUN_14273b390 re-fills ALL 32 keyStates_thisFrame entries from the pad
     // keymap (rdi) — AFTER site 1 — so pad presses would resurrect suppressed
@@ -388,10 +394,26 @@ namespace
     // (rcx=InputContainerBig*, rdx=+0x864 pad state, r8=pad keymap — all set
     // by the preceding instructions) and THEN clears the disabled entries, so
     // the following conversion (and therefore fltIsPressed_* and every
-    // downstream consumer) sees zeros. When the gamepad is not the active
-    // device the pad stage is skipped entirely and site 2 never executes.
-    // Both sites' vanilla bytes are asserted before install (dump:
-    // MODLOG/scripts/pad_input_out.txt, pad_chain_out.txt).
+    // downstream consumer) sees zeros.
+    //
+    // Site 3 (gamepad hard-mapped stage), 0x14273A721: the game does NOT use
+    // the pad keymap for most gamepads. For every device id other than 9 the
+    // chain jumps from 0x14273BE68 into a hard-coded per-device-type mapper
+    // (0x142739E40..0x14273A736) whose switch over the active device id
+    // (cases 0-7, 10, 0xB — DirectInput/HID device layer; the game imports no
+    // XInputGetState at all, so DS4Windows pads arrive here too) writes pad
+    // buttons DIRECTLY into keyStates[0..15] (+0x30..+0x3F) and the sticks
+    // into the wasd/camera vectors — again AFTER site 1. Site 3 sits at that
+    // mapper's tail: the whole rel32 `call FUN_142735e20` (vanilla bytes
+    // E8 FA B6 FF FF, radial-deadzone helper taking the container in rcx —
+    // its only read parameter), immediately before the mapper's own
+    // bool→float conversion. The callback reproduces the call from the saved
+    // rcx and then clears the disabled entries. The mapper is skipped for
+    // keyboard/mouse devices ([container+0x340] gate) and when the device
+    // poll fails, so site 3 only executes while a gamepad drives input.
+    // Dump evidence: MODLOG/scripts/pad_input_out.txt, pad_chain_out.txt,
+    // pad_chain2_out.txt, pad_poll_out.txt, helper_out.txt. All three sites'
+    // vanilla bytes are asserted before install.
     FreeJumpPlugin* g_ParkourModeInstance = nullptr;
 
     void ZeroDisabledActionKeyStates(AllRegisters* params)
@@ -435,6 +457,23 @@ namespace
         ZeroDisabledActionKeyStates(params);
     }
 
+    void SuppressDisabledActionKeysAfterHardmappedPad(AllRegisters* params)
+    {
+        // Reproduce the stolen `call InputVectorDeadzoneApply` (container in
+        // rcx; the extra saved registers are passed for exactness although the
+        // helper only reads rcx), then clear the disabled entries so the
+        // mapper's bool→float conversion at 0x14273A736 sees zeros. Code
+        // resuming at 0x14273A726 reloads R14/RSI from the stack and rebinds
+        // RAX/RCX/EDX before use, so register clobbers do not leak.
+        InputVectorDeadzoneApply(
+            reinterpret_cast<void*>(static_cast<uintptr_t>(params->rcx_)),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(params->rdx_)),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(params->r8_)),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(params->r9_)));
+
+        ZeroDisabledActionKeyStates(params);
+    }
+
     struct ParkourModeSuppressHook : AutoAssemblerCodeHolder_Base
     {
         ParkourModeSuppressHook()
@@ -447,6 +486,11 @@ namespace
             PresetScript_CCodeInTheMiddle(
                 0x14273BED2, 5,
                 SuppressDisabledActionKeysAfterPadFill,
+                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
+                false);
+            PresetScript_CCodeInTheMiddle(
+                0x14273A721, 5,
+                SuppressDisabledActionKeysAfterHardmappedPad,
                 RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
                 false);
         }
@@ -474,7 +518,50 @@ namespace
         {
             return true;
         }
+        // Site 3 vanilla bytes: call FUN_142735e20 (E8 FA B6 FF FF).
+        const uint8_t* site3 = reinterpret_cast<const uint8_t*>(0x14273A721);
+        if (site3[0] != 0xE8 || site3[1] != 0xFA || site3[2] != 0xB6
+            || site3[3] != 0xFF || site3[4] != 0xFF)
+        {
+            return true;
+        }
         return false;
+    }
+
+    // ── Acceptance-range widening (ported from FailedWallRunPlugin) ──────
+    // Only-loosen semantics (never narrows vanilla) with the dump-proven
+    // permissive superset FailedWallRunPlugin uses. Widening runs in the GPH
+    // ChooseBeforeFiltering hook — after the game created the candidate
+    // actions and wrote their vanilla ranges, before the game's fitness and
+    // filtering passes consume them. Limitation (inherited from the
+    // FailedWallRun investigation): actions that vanilla's CREATION-time fit
+    // test already refused never appear in the candidate list, so they cannot
+    // be widened here — for type 52 specifically, FailedWallRunPlugin's own
+    // creation hooks remain the stronger tool.
+    constexpr float kRangeHeightDiffMin = -3.0f;
+    constexpr float kRangeHeightDiffMax = 12.0f;   // vanilla type-52 max is 5.0 — stay a superset
+    constexpr float kRangeHorizDiffMin = -3.0f;
+    constexpr float kRangeHorizDiffMax = 3.0f;
+    constexpr float kRangeDistMin = 0.0f;
+    constexpr float kRangeDistMax = 15.0f;         // vanilla type-52 max is 12.0 — stay a superset
+    constexpr float kRangeCurveMax = 2.0f;
+    constexpr float kRangeCurveMin = -4.0f;
+    constexpr float kRangeExpectedCurveMin = -2.0f;
+
+    void WidenMin(float& cur, float req) { if (req < cur) cur = req; }
+    void WidenMax(float& cur, float req) { if (req > cur) cur = req; }
+
+    void WidenAcceptanceRanges(AvailableParkourAction& action)
+    {
+        WidenMin(action.heightDifferenceMin, kRangeHeightDiffMin);
+        WidenMax(action.heightDifferenceMax, kRangeHeightDiffMax);
+        WidenMin(action.horizontalDifferenceMin, kRangeHorizDiffMin);
+        WidenMax(action.horizontalDifferenceMax, kRangeHorizDiffMax);
+        WidenMin(action.distanceMin, kRangeDistMin);
+        WidenMax(action.distanceMax, kRangeDistMax);
+        WidenMax(action.curveAllowedRangeMax, kRangeCurveMax);
+        WidenMin(action.curveAllowedRangeMin, kRangeCurveMin);
+        WidenMin(action.expectedCurveRangeMin, kRangeExpectedCurveMin);
     }
 }
 
@@ -867,17 +954,27 @@ void FreeJumpPlugin::OnUpdate()
     m_JustCapturedKey = 0;
     UpdatePadStates();
 
+    // Every binding exists in two profiles (keyboard/mouse + controller).
+    // Both profiles' states are refreshed every frame so that switching
+    // profiles mid-session can never leave a stale rising edge behind (the
+    // stale-edge class of bug that once made Parkour Mode flip every frame).
     UpdateKeyState(m_ToggleKey);
+    UpdateKeyState(m_ToggleKeyPad);
     UpdateKeyState(m_SnapDirectionKey);
+    UpdateKeyState(m_SnapDirectionKeyPad);
     // Without this refresh, m_KeyPressedThisFrame[m_ParkourModeKey] kept its
     // last value from whenever a rebind-wait last ran (it is only cleared by
     // UpdateKeyState). After the first rebind it stayed true forever, so
     // WasKeyPressed fired on every frame and Parkour Mode flipped ON/OFF each
-    // frame — rewriting the INI and installing/removing the suppression hook
+    // frame — rewriting the INI and installing/removing the suppression hooks
     // at frame rate.
     UpdateKeyState(m_ParkourModeKey);
+    UpdateKeyState(m_ParkourModeKeyPad);
     for (const ParkourActionOverride& override : m_Overrides)
+    {
         UpdateKeyState(override.keyCode);
+        UpdateKeyState(override.padKeyCode);
+    }
 
     const bool waitingForOverrideKey = std::any_of(
         m_Overrides.begin(),
@@ -934,27 +1031,27 @@ void FreeJumpPlugin::OnUpdate()
 
     if (m_WaitingForKey)
     {
-        if (captureKey(m_ToggleKey))
+        if (captureKey(ActiveToggleKey()))
         {
-            m_JustCapturedKey = m_ToggleKey;
+            m_JustCapturedKey = ActiveToggleKey();
             m_WaitingForKey = false;
             SaveSettings();
         }
     }
     else if (m_WaitingForSnapKey)
     {
-        if (captureKey(m_SnapDirectionKey))
+        if (captureKey(ActiveSnapDirectionKey()))
         {
-            m_JustCapturedKey = m_SnapDirectionKey;
+            m_JustCapturedKey = ActiveSnapDirectionKey();
             m_WaitingForSnapKey = false;
             SaveSettings();
         }
     }
     else if (m_WaitingForParkourKey)
     {
-        if (captureKey(m_ParkourModeKey))
+        if (captureKey(ActiveParkourModeKey()))
         {
-            m_JustCapturedKey = m_ParkourModeKey;
+            m_JustCapturedKey = ActiveParkourModeKey();
             m_WaitingForParkourKey = false;
             SaveSettings();
         }
@@ -975,15 +1072,17 @@ void FreeJumpPlugin::OnUpdate()
         }
     }
 
-    if (WasKeyPressed(m_ParkourModeKey) && m_ParkourModeKey != m_JustCapturedKey
-        && !MouseBindWouldHitUi(m_ParkourModeKey))
+    const int effectiveParkourKey = EffectiveParkourModeKey();
+    if (WasKeyPressed(effectiveParkourKey) && effectiveParkourKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(effectiveParkourKey))
     {
         m_ParkourModeOn = !m_ParkourModeOn;
         SaveSettings();
     }
 
-    if (WasKeyPressed(m_SnapDirectionKey) && m_SnapDirectionKey != m_JustCapturedKey
-        && !MouseBindWouldHitUi(m_SnapDirectionKey))
+    const int effectiveSnapKey = EffectiveSnapDirectionKey();
+    if (WasKeyPressed(effectiveSnapKey) && effectiveSnapKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(effectiveSnapKey))
     {
         m_SnapDirectionMode = !m_SnapDirectionMode;
         SaveSettings();
@@ -993,23 +1092,26 @@ void FreeJumpPlugin::OnUpdate()
     {
         if (!override.enable || !override.toggleMode)
             continue;
-        if (WasKeyPressed(override.keyCode) && override.keyCode != m_JustCapturedKey
-            && !MouseBindWouldHitUi(override.keyCode))
+        const int effectiveOverrideKey = EffectiveOverrideKey(override);
+        if (WasKeyPressed(effectiveOverrideKey) && effectiveOverrideKey != m_JustCapturedKey
+            && !MouseBindWouldHitUi(effectiveOverrideKey))
         {
             override.toggleState = !override.toggleState;
             SaveSettings();
         }
     }
 
-    const bool freeJumpHeld = m_ToggleKey != m_JustCapturedKey
-        && !MouseBindWouldHitUi(m_ToggleKey)
-        && IsKeyHeld(m_ToggleKey);
+    const int effectiveToggleKey = EffectiveToggleKey();
+    const bool freeJumpHeld = effectiveToggleKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(effectiveToggleKey)
+        && IsKeyHeld(effectiveToggleKey);
     bool anyOverrideActive = false;
     for (const ParkourActionOverride& override : m_Overrides)
     {
-        const bool overrideKeyHeld = override.keyCode != m_JustCapturedKey
-            && !MouseBindWouldHitUi(override.keyCode)
-            && IsKeyHeld(override.keyCode);
+        const int effectiveOverrideKey = EffectiveOverrideKey(override);
+        const bool overrideKeyHeld = effectiveOverrideKey != m_JustCapturedKey
+            && !MouseBindWouldHitUi(effectiveOverrideKey)
+            && IsKeyHeld(effectiveOverrideKey);
         if (override.enable
             && (override.toggleMode
                 ? override.toggleState
@@ -1324,7 +1426,8 @@ void FreeJumpPlugin::OnImGuiRender()
 AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions)
 {
     // Free Jump
-    if (!MouseBindWouldHitUi(m_ToggleKey) && IsKeyHeld(m_ToggleKey))
+    const int effectiveToggleKey = EffectiveToggleKey();
+    if (!MouseBindWouldHitUi(effectiveToggleKey) && IsKeyHeld(effectiveToggleKey))
     {
         actions.size = 0;
         return nullptr;
@@ -1368,8 +1471,9 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
     for (auto& ov : m_Overrides)
     {
         if (!ov.enable) continue;
+        const int effectiveOverrideKey = EffectiveOverrideKey(ov);
         bool active = ov.toggleMode ? ov.toggleState
-            : (!MouseBindWouldHitUi(ov.keyCode) && IsKeyHeld(ov.keyCode));
+            : (!MouseBindWouldHitUi(effectiveOverrideKey) && IsKeyHeld(effectiveOverrideKey));
         if (!active) continue;
         actives.push_back({&ov});
     }
@@ -1398,6 +1502,28 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
                 if (std::find(allowedTypes.begin(), allowedTypes.end(),
                     GetTypeIntSafe(action)) == allowedTypes.end())
                     SmallArray_POD__RemoveGeneric(&actions, i, sizeof(AvailableParkourAction*));
+            }
+        }
+
+        // Per-override acceptance-range widening (only-loosen, FailedWallRun
+        // constants — see WidenAcceptanceRanges). Runs before the game's
+        // fitness/filtering passes consume the ranges.
+        for (const ActiveOverride& ao : actives)
+        {
+            if (!ao.ptr->expandRanges)
+                continue;
+            for (int i = 0; i < actions.size; ++i)
+            {
+                AvailableParkourAction* action = actions[i];
+                if (!action) continue;
+                const int actionType = GetTypeIntSafe(action);
+                if (actionType < 0
+                    || std::find(ao.ptr->actionTypes.begin(), ao.ptr->actionTypes.end(), actionType)
+                        == ao.ptr->actionTypes.end())
+                {
+                    continue;
+                }
+                WidenAcceptanceRanges(*action);
             }
         }
 

@@ -63,13 +63,15 @@ constexpr int kActionKeyCount = 0x20;
 
 struct ParkourActionOverride
 {
-    int keyCode = VK_F9;
+    int keyCode = VK_F9;             // keyboard/mouse-profile binding
+    int padKeyCode = 0;              // controller-profile binding (0 = unbound)
     std::vector<int> actionTypes = { 50 };
     float fitnessMultiplier = 9999.0f;
     bool removeOtherActions = true;
     bool enable = true;
     bool toggleMode = false;
     bool toggleState = false;
+    bool expandRanges = false;       // FailedWallRun-style only-loosen acceptance-range widening while active
     bool waitingForKey = false;
 };
 
@@ -102,16 +104,23 @@ private:
     bool m_HookActive = false;
     bool m_HookRefused = false;
 
-    // Basic features
+    // Basic features. Every binding exists twice — a keyboard/mouse slot and a
+    // controller slot — so the profile switch swaps between saved bindings
+    // without rebinding. The controller slot may be any bindable code
+    // (keyboard codes remain functional there too).
     int  m_ToggleKey         = VK_XBUTTON1;
+    int  m_ToggleKeyPad      = VK_XBUTTON1;
     bool m_WaitingForKey     = false;
     int  m_SnapDirectionKey  = VK_F8;
+    int  m_SnapDirectionKeyPad = VK_F8;
     bool m_WaitingForSnapKey = false;
     bool m_SnapDirectionMode = false;
+    bool m_UseControllerBindings = false;
 
     // Parkour mode: while active, the selected ActionKeyCode entries are forced
     // unpressed so their physical keys are free to trigger override bindings.
     int  m_ParkourModeKey    = VK_F7;
+    int  m_ParkourModeKeyPad = VK_F7;
     bool m_ParkourModeOn     = false;
     bool m_WaitingForParkourKey = false;
     uint32_t m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10); // LMB, RMB, Crouch
@@ -143,7 +152,22 @@ private:
     // Overrides
     std::vector<ParkourActionOverride> m_Overrides;
 
-    // Parkour mode suppression hooks (active only while the mode is enabled;
-    // one site on the keyboard/mouse keymap stage, one on the gamepad stage).
+    // Parkour mode suppression hooks (active only while the mode is enabled):
+    // KBM keymap stage, device-9 pad-keymap stage, and the gamepad
+    // hard-mapped stage (see FreeJumpPlugin.cpp).
     void ApplyParkourMode(bool enable);
+
+public:
+    // Binding-profile accessors. Both profiles' key states are refreshed every
+    // frame, so switching profiles never leaves a stale rising edge behind.
+    int& ActiveToggleKey() { return m_UseControllerBindings ? m_ToggleKeyPad : m_ToggleKey; }
+    int& ActiveSnapDirectionKey() { return m_UseControllerBindings ? m_SnapDirectionKeyPad : m_SnapDirectionKey; }
+    int& ActiveParkourModeKey() { return m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey; }
+    int EffectiveToggleKey() const { return m_UseControllerBindings ? m_ToggleKeyPad : m_ToggleKey; }
+    int EffectiveSnapDirectionKey() const { return m_UseControllerBindings ? m_SnapDirectionKeyPad : m_SnapDirectionKey; }
+    int EffectiveParkourModeKey() const { return m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey; }
+    int EffectiveOverrideKey(const ParkourActionOverride& override) const
+    {
+        return m_UseControllerBindings ? override.padKeyCode : override.keyCode;
+    }
 };
