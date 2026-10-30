@@ -63,6 +63,7 @@ constexpr int kActionKeyCount = 0x20;
 
 struct ParkourActionOverride
 {
+    std::string name;                // user-visible label, defaults per index
     int keyCode = VK_F9;             // keyboard/mouse-profile binding
     int padKeyCode = 0;              // controller-profile binding (0 = unbound)
     std::vector<int> actionTypes = { 50 };
@@ -123,9 +124,17 @@ private:
     int  m_ParkourModeKeyPad = VK_F7;
     bool m_ParkourModeOn     = false;
     bool m_WaitingForParkourKey = false;
+    // Detach the game's DirectInput/HID pad while Parkour Mode is on; the
+    // plugin's own XInput polling keeps working, so override triggers bound to
+    // pad buttons still fire. Turn off to leave the gamepad attached (then
+    // Parkour Mode only frees keyboard/mouse-bound actions).
+    bool m_BlockPadWhileParkour = true;
+    bool m_PadBlockHookActive = false;
     uint32_t m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10); // LMB, RMB, Crouch
     bool m_ParkourHookRefused = false;
     bool m_ParkourHookActive = false;
+    bool m_OverrideFallbackActive = false;
+    bool m_OverrideFallbackRefused = false;
 
     // Reliable Win32 rising-edge state. The low bit of GetAsyncKeyState is
     // only "pressed since the previous call" and is not reliable for this.
@@ -153,11 +162,16 @@ private:
     std::vector<ParkourActionOverride> m_Overrides;
 
     // Parkour mode suppression hooks (active only while the mode is enabled):
-    // KBM keymap stage, device-9 pad-keymap stage, and the gamepad
-    // hard-mapped stage (see FreeJumpPlugin.cpp).
+    // KBM keymap stage and the pad-device detach (see FreeJumpPlugin.cpp).
     void ApplyParkourMode(bool enable);
+    // Override fallback used while another plugin owns the sort&select site.
+    void ApplyOverrideFallback(bool enable);
 
 public:
+    // Fallback path used when another plugin owns the sort&select site, so the
+    // normal-path overrides still apply. Called from the FinalFilter1 cave.
+    bool ShouldFallbackBlockCandidate(AvailableParkourAction* action);
+
     // Binding-profile accessors. Both profiles' key states are refreshed every
     // frame, so switching profiles never leaves a stale rising edge behind.
     int& ActiveToggleKey() { return m_UseControllerBindings ? m_ToggleKeyPad : m_ToggleKey; }
