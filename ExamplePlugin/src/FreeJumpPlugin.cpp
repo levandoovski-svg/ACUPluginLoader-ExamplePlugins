@@ -443,6 +443,12 @@ namespace
     uint32_t g_SuppressHitsKbm = 0;
     uint32_t g_SuppressHitsPadKeymap = 0;
     uint32_t g_SuppressHitsMapper = 0;
+    uint32_t g_SuppressHitsPadSnapshot = 0;
+
+    // The pad button code the game's own controller bindings resolve each
+    // action to, as last read from the pad keymap. Surfaced in the UI so that
+    // "Attack" can be seen to mean, say, pad button 2 on this particular pad.
+    int16_t g_PadCodeForAction[kActionKeyCount] = {};
 
     void ZeroDisabledActionKeyStates(AllRegisters* params)
     {
@@ -461,6 +467,62 @@ namespace
         {
             if (disabledMask & (1u << actionIdx))
                 keyStatesThisFrame[actionIdx] = 0;
+        }
+    }
+
+    // ── Parkour Mode, gamepad: hide the physical button from the game ──────
+    // Zeroing keyStates stops an *action*; it does not stop the game from
+    // knowing that pad button 3 is down. The pad stage publishes this frame's
+    // snapshot into InputContainerBig+0x864 (0x110 bytes, the same buffer the
+    // keymap fill 0x14273B390 reads): button `code` is the byte at +0x30+code
+    // with bit 7 as the pressed flag. That buffer is the only pad view the rest
+    // of the frame gets, so clearing a button here means the game cannot detect
+    // it at all - no action, no press edge, no held-button bookkeeping - while
+    // the plugin's own XInput polling (a separate DLL reading the real device)
+    // still sees it and can fire parkour triggers bound to that button.
+    //
+    // WHICH button is decided by the game's own pad keymap, i.e. the player's
+    // in-game controller bindings: rdi at this site is that table, entry stride
+    // 0x214, entry type at +4, pad button code at +8 (exactly what the fill
+    // reads). So "Attack" hides whatever button is bound to attack on this pad
+    // instead of a hard-coded layout, and an action bound to a stick axis or a
+    // hat compare (entry type 2) is left to the keyStates sites.
+    void SanitizePadSnapshotForDisabledActions(AllRegisters* params)
+    {
+        ++g_SuppressHitsPadSnapshot;
+        FreeJumpPlugin* owner = g_ParkourModeInstance;
+        if (!owner)
+            return;
+        const uint32_t disabledMask = owner->GetDisabledActionMask();
+        if (!disabledMask)
+            return;
+        auto* inputContainer = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_));
+        const auto* padKeymap = reinterpret_cast<const uint8_t*>(
+            static_cast<uintptr_t>(params->rdi_));
+        if (!inputContainer || !padKeymap)
+            return;
+
+        uint8_t* padState = inputContainer + 0x864; // this frame's pad snapshot
+        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+        {
+            if (!(disabledMask & (1u << actionIdx)))
+                continue;
+            // Clear first: an action that resolves to no pad button (axis/hat
+            // binding, or not pad-bound at all) must read as unresolved rather
+            // than keep last frame's code - a stale value displayed the wrong
+            // button next to a ticked action.
+            g_PadCodeForAction[actionIdx] = -1;
+            const uint8_t* entry = padKeymap + static_cast<size_t>(actionIdx) * 0x214;
+            const int32_t entryType = *reinterpret_cast<const int32_t*>(entry + 4);
+            const int32_t padCode = *reinterpret_cast<const int32_t*>(entry + 8);
+            if (entryType != 1)   // 1 = digital pad button, 2 = axis/hat comparison
+                continue;
+            if (padCode < 0 || padCode > 0xDE) // buttons live at +0x30 inside 0x110 bytes
+                continue;
+            g_PadCodeForAction[actionIdx] = static_cast<int16_t>(padCode);
+            // Clear the whole byte, not just the pressed bit: a button the game
+            // can still see as "held" or as having an edge is still detectable.
+            padState[0x30 + padCode] = 0;
         }
     }
 
@@ -535,6 +597,30 @@ namespace
     AutoAssembleWrapper<ParkourModeMapperSuppressHook>& GetParkourModeMapperSuppressHook()
     {
         static AutoAssembleWrapper<ParkourModeMapperSuppressHook> s_hook;
+        return s_hook;
+    }
+
+    // Hides the disabled actions' pad buttons in the pad snapshot itself,
+    // before the game's keymap fill reads it (device-9 / keymap pad path).
+    // Vanilla 0x14273BEB3 is `lea rdx,[rbx+0x864]` - 7 whole bytes, and it runs
+    // after the poll at 0x14273BEA1 filled the snapshot and before the fill
+    // call at 0x14273BEC0 consumes it. rbx is InputContainerBig*, rdi the pad
+    // keymap; the site after the fill (0x14273BEC5) is a separate hook.
+    struct ParkourModePadSnapshotHook : AutoAssemblerCodeHolder_Base
+    {
+        ParkourModePadSnapshotHook()
+        {
+            PresetScript_CCodeInTheMiddle(
+                0x14273BEB3, 7,
+                SanitizePadSnapshotForDisabledActions,
+                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
+                true);
+        }
+    };
+
+    AutoAssembleWrapper<ParkourModePadSnapshotHook>& GetParkourModePadSnapshotHook()
+    {
+        static AutoAssembleWrapper<ParkourModePadSnapshotHook> s_hook;
         return s_hook;
     }
 
@@ -676,6 +762,14 @@ namespace
     {
         // Vanilla: lea rdx,[rbx+0x864]  (0x14273BEC5, 7 bytes).
         const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BEC5);
+        return !(site[0] == 0x48 && site[1] == 0x8D && site[2] == 0x93
+            && site[3] == 0x64 && site[4] == 0x08 && site[5] == 0x00 && site[6] == 0x00);
+    }
+
+    bool IsPadSnapshotSitePatched()
+    {
+        // Vanilla: lea rdx,[rbx+0x864]  (0x14273BEB3, 7 bytes).
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BEB3);
         return !(site[0] == 0x48 && site[1] == 0x8D && site[2] == 0x93
             && site[3] == 0x64 && site[4] == 0x08 && site[5] == 0x00 && site[6] == 0x00);
     }
@@ -1006,7 +1100,7 @@ void FreeJumpPlugin::OnBeforeActivate()
 void FreeJumpPlugin::OnBeforeDeactivate()
 {
     if (m_KbmSuppressActive || m_PadKeymapSuppressActive || m_MapperSuppressActive
-        || m_PadBlockHookActive)
+        || m_PadSnapshotSuppressActive || m_PadBlockHookActive)
         ApplyParkourMode(false);
     if (m_OverrideFallbackActive)
     {
@@ -1031,12 +1125,16 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         // someone else and only a pad site installs.
         g_ParkourModeInstance = this;
 
-        if (!m_KbmSuppressActive && !m_PadKeymapSuppressActive && !m_MapperSuppressActive)
+        if (!m_KbmSuppressActive && !m_PadKeymapSuppressActive && !m_MapperSuppressActive
+            && !m_PadSnapshotSuppressActive)
         {
             // Fresh activation: the counters then describe this ON period.
             g_SuppressHitsKbm = 0;
             g_SuppressHitsPadKeymap = 0;
             g_SuppressHitsMapper = 0;
+            g_SuppressHitsPadSnapshot = 0;
+            for (int16_t& padCode : g_PadCodeForAction)
+                padCode = -1;
         }
 
         // Three independent sites. One that another plugin already patched is
@@ -1073,6 +1171,19 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
                 m_MapperSuppressActive = true;
             }
         }
+        // Hides the buttons themselves. Independent of the three above: this is
+        // the site that makes the game unable to detect the button rather than
+        // just ignoring the action it drives.
+        if (!m_PadSnapshotSuppressActive)
+        {
+            if (IsPadSnapshotSitePatched())
+                anyRefused = true;
+            else
+            {
+                GetParkourModePadSnapshotHook().Activate();
+                m_PadSnapshotSuppressActive = true;
+            }
+        }
         m_ParkourHookRefused = anyRefused;
 
         // Optional fallback, off by default: detach the pad device. It covers
@@ -1107,6 +1218,11 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         {
             GetParkourModeMapperSuppressHook().Deactivate();
             m_MapperSuppressActive = false;
+        }
+        if (m_PadSnapshotSuppressActive)
+        {
+            GetParkourModePadSnapshotHook().Deactivate();
+            m_PadSnapshotSuppressActive = false;
         }
         if (g_ParkourModeInstance == this)
             g_ParkourModeInstance = nullptr;
@@ -1515,7 +1631,8 @@ void FreeJumpPlugin::OnUpdate()
 
     const bool wantParkourHook = m_ParkourModeOn && m_DisabledActionMask != 0;
     const bool anyParkourSuppressActive =
-        m_KbmSuppressActive || m_PadKeymapSuppressActive || m_MapperSuppressActive;
+        m_KbmSuppressActive || m_PadKeymapSuppressActive || m_MapperSuppressActive
+        || m_PadSnapshotSuppressActive;
     // Re-run while anything is still missing, so a site that was refused once
     // (plugin loaded later, or a transient mismatch) is retried instead of
     // staying refused for the whole session.
@@ -1712,20 +1829,48 @@ void FreeJumpPlugin::OnImGuiRender()
         }
         ImGui::Text("  Toggle key: %s",
             KeyCodeLabel(m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey).c_str());
-        // Live diagnostics: which of the three suppression sites is installed,
-        // and whether each one actually executes this session. If the pad sites
-        // show "on" but their hit count stays 0 while pad buttons are pressed,
-        // this build routes gamepad input somewhere else - only then is the
-        // detach fallback below worth using.
+        // Live diagnostics: which suppression sites are installed, and whether
+        // each one actually executes this session. "pad snapshot" is the one
+        // that makes the game unable to detect the button; the other two only
+        // clear the action state. If the pad sites show "on" but their hit
+        // count stays 0 while pad buttons are pressed, this build routes
+        // gamepad input somewhere else - only then is the detach fallback
+        // below worth using.
         ImGui::TextDisabled(
-            "Sites: KBM %s | pad keymap %s | pad mapper %s",
+            "Sites: KBM %s | pad keymap %s | pad mapper %s | pad snapshot %s",
             m_KbmSuppressActive ? "on" : (IsKbmSuppressSitePatched() ? "taken" : "off"),
             m_PadKeymapSuppressActive ? "on" : (IsPadKeymapSuppressSitePatched() ? "taken" : "off"),
-            m_MapperSuppressActive ? "on" : (IsMapperSuppressSitePatched() ? "taken" : "off"));
+            m_MapperSuppressActive ? "on" : (IsMapperSuppressSitePatched() ? "taken" : "off"),
+            m_PadSnapshotSuppressActive ? "on" : (IsPadSnapshotSitePatched() ? "taken" : "off"));
         ImGui::TextDisabled(
-            "Hits since ON: KBM %u | pad keymap %u | pad mapper %u   (disabled mask 0x%02X)",
+            "Hits since ON: KBM %u | pad keymap %u | pad mapper %u | pad snapshot %u   (disabled mask 0x%02X)",
             (unsigned)g_SuppressHitsKbm, (unsigned)g_SuppressHitsPadKeymap,
-            (unsigned)g_SuppressHitsMapper, (unsigned)m_DisabledActionMask);
+            (unsigned)g_SuppressHitsMapper, (unsigned)g_SuppressHitsPadSnapshot,
+            (unsigned)m_DisabledActionMask);
+        // Which physical pad button each disabled action hides, as resolved from
+        // the game's own controller bindings. This is the line to read when a
+        // button still reaches the game: if a ticked action is missing here, it
+        // is not bound to a pad button on this device.
+        if (m_PadSnapshotSuppressActive && g_SuppressHitsPadSnapshot)
+        {
+            std::string hiddenButtons;
+            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+            {
+                if (!(m_DisabledActionMask & (1u << actionIdx)))
+                    continue;
+                if (g_PadCodeForAction[actionIdx] < 0)
+                    continue;
+                if (!hiddenButtons.empty())
+                    hiddenButtons += ", ";
+                hiddenButtons += ActionKeyName(actionIdx);
+                hiddenButtons += " = pad button ";
+                hiddenButtons += std::to_string(g_PadCodeForAction[actionIdx]);
+            }
+            if (hiddenButtons.empty())
+                ImGui::TextDisabled("Pad buttons hidden: none resolved (no ticked action is pad-bound)");
+            else
+                ImGui::TextDisabled("Pad buttons hidden: %s", hiddenButtons.c_str());
+        }
         bool blockPad = m_BlockPadWhileParkour;
         if (ImGui::Checkbox("Fallback: detach the controller (also stops stick movement)", &blockPad))
         {
@@ -1760,6 +1905,14 @@ void FreeJumpPlugin::OnImGuiRender()
                 "(keyboard, mouse, and gamepad bindings), so their buttons are free for override "
                 "bindings. Your keybindings are never modified, and everything returns to normal "
                 "when the mode is switched off.");
+            ImGui::TextWrapped(
+                "On a controller, ticking an action also hides the button the game has it bound "
+                "to: the pad snapshot the game reads is cleared for that button, so the game "
+                "cannot detect it at all (no action, no press, no hold). The plugin still reads "
+                "the real pad, so a parkour trigger bound to that button works. Ticking Attack "
+                "therefore hides pad X, EagleVision hides pad Y, Aim hides LB and BombDrop hides "
+                "RB if those are your controller bindings - the line under the toggle shows what "
+                "each ticked action actually resolved to on your pad.");
             bool maskChanged = false;
             for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
             {
@@ -1779,6 +1932,24 @@ void FreeJumpPlugin::OnImGuiRender()
                 m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10);
                 maskChanged = true;
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Select controller actions (X / Y / LB / RB)"))
+            {
+                // The four native controller bindings: Attack = pad X,
+                // EagleVision = pad Y, Aim/quick-shot = LB, BombDrop = RB.
+                // Additive, so a click never silently re-enables something the
+                // player deliberately ticked off.
+                m_DisabledActionMask |= (1u << 1) | (1u << 2) | (1u << 11) | (1u << 13);
+                maskChanged = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Ticks Attack (pad X), EagleVision (pad Y), Aim (LB) and BombDrop (RB) - "
+                    "the four native controller bindings - and leaves everything else as it is. "
+                    "While Parkour Mode is on the game cannot detect those buttons at all; the "
+                    "plugin still reads them, so an override bound to X, Y, LB or RB still fires. "
+                    "When the pad snapshot site below reports 'on', the line under the toggle "
+                    "lists which pad button each ticked action resolved to.");
             if (maskChanged)
                 SaveSettings();
             ImGui::TreePop();

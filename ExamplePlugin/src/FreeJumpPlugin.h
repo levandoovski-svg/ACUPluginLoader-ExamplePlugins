@@ -133,12 +133,15 @@ private:
     bool m_PadBlockHookActive = false;
     uint32_t m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10); // LMB, RMB, Crouch
     // Parkour-mode suppression sites, installed independently of each other:
-    //   0x14273BC7B keyboard/mouse
-    //   0x14273BEC5 gamepad, device-id-9 keymap fill
-    //   0x14273A726 gamepad, per-device-type mapper
+    //   0x14273BC7B keyboard/mouse keyStates
+    //   0x14273BEC5 gamepad (keymap path), keyStates after the fill
+    //   0x14273A726 gamepad (mapper path), keyStates after the mapper
+    //   0x14273BEB3 gamepad (keymap path), the pad snapshot BEFORE the fill -
+    //                clears the button itself, so the game cannot detect it
     bool m_KbmSuppressActive = false;
     bool m_PadKeymapSuppressActive = false;
     bool m_MapperSuppressActive = false;
+    bool m_PadSnapshotSuppressActive = false;
     bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
     bool m_OverrideFallbackRefused = false;
