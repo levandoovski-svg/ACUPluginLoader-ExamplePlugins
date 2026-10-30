@@ -2271,53 +2271,31 @@ void FreeJumpPlugin::OnUpdate()
 
 void FreeJumpPlugin::OnImGuiRender()
 {
-    bool freeMode   = IsKeyHeld(m_ToggleKey);
+    // The indicator must use the same activation semantics as OnUpdate: the
+    // effective key of the ACTIVE profile, ignoring a key a rebind just
+    // captured, and never reporting a mouse binding as held while ImGui owns
+    // the cursor. The old IsKeyHeld(m_ToggleKey) always read the keyboard
+    // slot, so with controller bindings selected the ON/OFF tag froze.
+    const int freeJumpKey = EffectiveToggleKey();
+    const bool freeMode = freeJumpKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(freeJumpKey)
+        && IsKeyHeld(freeJumpKey);
     const ImVec4 activeColor(0.20f, 0.90f, 0.30f, 1.00f);
     const ImVec4 inactiveColor(1.00f, 0.55f, 0.10f, 1.00f);
     const ImVec4 holdColor(0.20f, 0.70f, 1.00f, 1.00f);
     const ImVec4 rebindColor(0.90f, 0.90f, 0.20f, 1.00f);
 
     ImGui::Text("FreeJumpPlugin");
-    if (m_HookRefused)
-    {
-        ImGui::TextWrapped(
-            "Parkour sort/select (0x140133B00) is owned by another plugin (for example ACUFixes' "
-            "Parkour Helpers, or ACU_ParkourPatches). The features below still work through a "
-            "compatibility hook on the game's own action filter, so both plugins stay enabled.");
-        if (m_OverrideFallbackRefused)
-        {
-            ImGui::TextWrapped(
-                "The compatibility hook site (0x1401D4DE0) is also patched by another plugin, so "
-                "overrides cannot be applied. Disable one of the conflicting plugins to restore "
-                "them.");
-        }
-        else if (m_OverrideFallbackActive)
-        {
-            ImGui::TextDisabled(
-                "Compatibility mode: Free Jump, Snap Direction, and every override work with "
-                "'Remove all other actions'; the per-override fitness multiplier is not applied "
-                "in this mode.");
-        }
-    }
+    if (m_HookRefused && m_OverrideFallbackRefused)
+        ImGui::TextColored(inactiveColor, "Overrides OFF: another plugin owns both the sort site and the compatibility hook.");
+    else if (m_HookRefused)
+        ImGui::TextDisabled("Compatibility mode: overrides active; per-override fitness multiplier not applied.");
     if (m_ParkourHookRefused)
-    {
-        ImGui::TextWrapped(
-            "One of Parkour Mode's input sites is owned by another plugin (keyboard/mouse "
-            "0x14273BC7B, gamepad keymap 0x14273BEC5, gamepad mapper 0x14273A726). The other "
-            "sites stay installed, so only that device's suppression is missing; the line "
-            "under the Parkour Mode toggle shows which sites are live.");
-    }
-    if (m_PadDllLoaded)
-    {
-        if (m_ActivePadSlot >= 0)
-            ImGui::Text("Gamepad: connected (slot %d)", m_ActivePadSlot);
-        else
-            ImGui::Text("Gamepad: none detected");
-    }
-    else
-    {
-        ImGui::TextDisabled("Gamepad: XInput unavailable on this system");
-    }
+        ImGui::TextColored(inactiveColor, "Parkour Mode: one input site is owned by another plugin; that device's suppression is missing.");
+    if (m_WallToHangSiteTaken)
+        ImGui::TextDisabled("Wall-to-Hang: already provided by another plugin.");
+    if (m_PadDllLoaded && m_ActivePadSlot >= 0)
+        ImGui::Text("Gamepad: connected (slot %d)", m_ActivePadSlot);
     if (ImGui::CollapsingHeader("Basic Features", ImGuiTreeNodeFlags_DefaultOpen))
     {
         // ── Binding profile ─────────────────────────────────────────────
@@ -2334,23 +2312,13 @@ void FreeJumpPlugin::OnImGuiRender()
             SaveSettings();
         }
         ImGui::SameLine();
-        if (m_UseControllerBindings)
-            ImGui::TextDisabled("(profiles: CONTROLLER — keyboard/mouse keys ignored)");
-        else
-            ImGui::TextDisabled("(profiles: KEYBOARD/MOUSE — controller keys ignored)");
-        ImGui::TextDisabled(
-            "Both device layouts are stored side by side; with this unchecked you rebind with "
-            "your keyboard/mouse, and with it checked you rebind with your controller. Everything "
-            "else in this menu behaves the same in either mode.");
+        ImGui::TextDisabled(m_UseControllerBindings ? "(profile: CONTROLLER)" : "(profile: KEYBOARD/MOUSE)");
 
         ImGui::Separator();
         ImGui::Text("Free Jump:");
         ImGui::SameLine();
         ImGui::TextColored(freeMode ? activeColor : inactiveColor, freeMode ? "ACTIVE (HOLD)" : "OFF");
-        if (m_UseControllerBindings)
-            ImGui::Text("  Bound key: %s", KeyCodeLabel(m_ToggleKeyPad).c_str());
-        else
-            ImGui::Text("  Bound key: %s", KeyCodeLabel(m_ToggleKey).c_str());
+        ImGui::Text("  Bound key: %s", KeyCodeLabel(EffectiveToggleKey()).c_str());
         if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForKey ? "Cancel Rebind" : "Rebind##FreeJump"))
         {
@@ -2368,8 +2336,7 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::SameLine();
         ImGui::TextColored(m_WallToHangEnabled ? activeColor : inactiveColor,
                            m_WallToHangEnabled ? "ON" : "OFF");
-        ImGui::Text("  Hotkey: %s",
-            KeyCodeLabel(m_UseControllerBindings ? m_DiveHotkeyPad : m_DiveHotkey).c_str());
+        ImGui::Text("  Hotkey: %s", KeyCodeLabel(EffectiveDiveHotkey()).c_str());
         if (ImGui::Button(m_WaitingForDiveKey ? "Cancel" : "Rebind Dive"))
         {
             m_WaitingForDiveKey = !m_WaitingForDiveKey;
@@ -2397,115 +2364,30 @@ void FreeJumpPlugin::OnImGuiRender()
             ImGui::SameLine();
             ImGui::TextDisabled("(frees the disabled actions' keys below)");
         }
-        ImGui::Text("  Toggle key: %s",
-            KeyCodeLabel(m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey).c_str());
-        // Live diagnostics: which suppression sites are installed, and whether
-        // each one actually executes this session. "pad snapshot" is the one
-        // that makes the game unable to detect the button; the other two only
-        // clear the action state. If the pad sites show "on" but their hit
-        // count stays 0 while pad buttons are pressed, this build routes
-        // gamepad input somewhere else - only then is the detach fallback
-        // below worth using.
-        ImGui::TextDisabled(
-            "Sites: KBM %s | pad poll %s | pad keymap %s | pad mapper %s | pad snapshot %s",
-            m_KbmSuppressActive ? "on" : (IsKbmSuppressSitePatched() ? "taken" : "off"),
-            m_PadPollSanitizeActive ? "on" : (IsPadPollSitePatched() ? "taken" : "off"),
-            m_PadKeymapSuppressActive ? "on" : (IsPadKeymapSuppressSitePatched() ? "taken" : "off"),
-            m_MapperSuppressActive ? "on" : (IsMapperSuppressSitePatched() ? "taken" : "off"),
-            m_PadSnapshotSuppressActive ? "on" : (IsPadSnapshotSitePatched() ? "taken" : "off"));
-        ImGui::TextDisabled(
-            "Hits since ON: KBM %u | pad poll %u | pad keymap %u | pad mapper %u | pad snapshot %u   (disabled mask 0x%02X)",
-            (unsigned)g_SuppressHitsKbm, (unsigned)g_SuppressHitsPadPoll,
-            (unsigned)g_SuppressHitsPadKeymap,
-            (unsigned)g_SuppressHitsMapper, (unsigned)g_SuppressHitsPadSnapshot,
-            (unsigned)m_DisabledActionMask);
-        // Live verification: re-reads the cached InputContainerBig's freed
-        // bytes each frame and reports any nonzero freed byte. This is the
-        // line that proves suppression works — hit counters only prove a
-        // site RAN; a clean integrity line proves the result held.
-        if (!m_CachedInputContainer)
-        {
-            ImGui::TextDisabled("Input integrity: waiting for a suppression site to fire (no telemetry yet)");
-        }
-        else if (m_LastLeakMask == 0)
-        {
-            ImGui::TextColored(activeColor, "Input integrity: clean");
-            ImGui::SameLine();
-            ImGui::TextDisabled("(freed bytes verified zero for %u frame(s); %u leak frame(s) this session)",
-                (unsigned)m_CleanFrameStreak, (unsigned)m_LeakTotalFrames);
-        }
-        else
+        ImGui::Text("  Toggle key: %s", KeyCodeLabel(EffectiveParkourModeKey()).c_str());
+        if (m_LastLeakMask)
         {
             std::string leakedButtons;
-            bool padLeak = false, keyboardLeak = false;
             for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
             {
                 if (!(m_LastLeakMask & (1u << actionIdx)))
                     continue;
-                if (ResolvePadCodeForAction(this, actionIdx) >= 0)
-                    padLeak = true;
-                else
-                    keyboardLeak = true;
                 if (!leakedButtons.empty())
                     leakedButtons += ", ";
                 leakedButtons += ActionKeyName(actionIdx);
             }
             ImGui::TextColored(ImVec4(1.0f, 0.20f, 0.20f, 1.00f),
-                "INPUT LEAK (%u frame(s) in a row, %u total): %s — the game still reads a freed byte",
-                (unsigned)m_LeakStreak, (unsigned)m_LeakTotalFrames, leakedButtons.c_str());
-            ImGui::TextDisabled(
-                "%s An unhooked input path is writing it. Check that no other plugin patches nearby "
-                "input sites; if it persists in a vanilla build, a fresh dump of this build is needed "
-                "to locate the new writer and close it.",
-                padLeak && keyboardLeak ? "Leaked on BOTH the controller and the keyboard."
-                    : padLeak ? "Leaked via the controller."
-                    : keyboardLeak ? "Leaked via the keyboard/mouse (detaching the pad cannot fix this)."
-                    : "");
+                "INPUT LEAK: %s (an unhooked input path is writing freed keys)",
+                leakedButtons.c_str());
         }
         bool autoFallback = m_AutoFallbackOnLeak;
-        if (ImGui::Checkbox("Auto-engage detach fallback when a leak persists (~0.5s)", &autoFallback))
+        if (ImGui::Checkbox("Auto-engage detach fallback on persistent leak", &autoFallback))
         {
             m_AutoFallbackOnLeak = autoFallback;
             SaveSettings();
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Opt-in safety net: when the verification above sees freed bytes stay nonzero for ~30 "
-                "frames while a controller is connected, the whole-pad detach engages automatically "
-                "so the overrides keep working, and it releases itself after ~3 seconds of clean "
-                "frames. Off by default because the detach also freezes stick movement.");
         if (m_PadBlockHookActive && m_AutoFallbackOnLeak)
-            ImGui::TextColored(inactiveColor,
-                "Auto fallback: pad detach currently ENGAGED (auto-releases after clean frames)");
-        // Which physical pad button each disabled action hides, as resolved from
-        // the game's own controller bindings. This is the line to read when a
-        // button still reaches the game: if a ticked action is missing here, it
-        // is not bound to a pad button on this device.
-        if ((m_PadSnapshotSuppressActive && g_SuppressHitsPadSnapshot)
-            || (m_PadPollSanitizeActive && g_SuppressHitsPadPoll))
-        {
-            std::string hiddenButtons;
-            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
-            {
-                if (!(m_DisabledActionMask & (1u << actionIdx)))
-                    continue;
-                const int padCode = ResolvePadCodeForAction(this, actionIdx);
-                if (padCode < 0)
-                    continue;
-                const bool fromKeymap = g_PadCodeForAction[actionIdx] >= 0;
-                if (!hiddenButtons.empty())
-                    hiddenButtons += ", ";
-                hiddenButtons += ActionKeyName(actionIdx);
-                hiddenButtons += " = pad button ";
-                hiddenButtons += std::to_string(padCode);
-                if (!fromKeymap)
-                    hiddenButtons += " (native layout)";
-            }
-            if (hiddenButtons.empty())
-                ImGui::TextDisabled("Pad buttons hidden: none resolved (no ticked action is pad-bound)");
-            else
-                ImGui::TextDisabled("Pad buttons hidden: %s", hiddenButtons.c_str());
-        }
+            ImGui::TextColored(inactiveColor, "Auto fallback: pad detach ENGAGED");
         bool blockPad = m_BlockPadWhileParkour;
         if (ImGui::Checkbox("Fallback: detach the controller (also stops stick movement)", &blockPad))
         {
@@ -2514,13 +2396,6 @@ void FreeJumpPlugin::OnImGuiRender()
             if (m_ParkourModeOn)
                 ApplyParkourMode(false), ApplyParkourMode(true);
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Off by default, and normally not needed: the two gamepad sites above free the "
-                "disabled actions per button while the sticks keep working. This option instead "
-                "returns 0 from the game's own pad poll, so the game ignores the whole controller "
-                "- buttons and sticks - and the character cannot move while Parkour Mode is on. "
-                "Only use it if the pad hit counters stay at 0 while you press pad buttons.");
         if (m_WaitingForParkourKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key or pad button to bind..."); }
         if (ImGui::Button(m_WaitingForParkourKey ? "Cancel Rebind##ParkourMode" : "Rebind##ParkourMode"))
         {
@@ -2534,19 +2409,6 @@ void FreeJumpPlugin::OnImGuiRender()
         }
         if (ImGui::TreeNode("Actions disabled while Parkour Mode is on"))
         {
-            ImGui::TextWrapped(
-                "While Parkour Mode is active these ActionKeyCode entries are forced unpressed "
-                "(keyboard, mouse, and gamepad bindings), so their buttons are free for override "
-                "bindings. Your keybindings are never modified, and everything returns to normal "
-                "when the mode is switched off.");
-            ImGui::TextWrapped(
-                "On a controller, ticking an action also hides the button the game has it bound "
-                "to: the pad snapshot the game reads is cleared for that button, so the game "
-                "cannot detect it at all (no action, no press, no hold). The plugin still reads "
-                "the real pad, so a parkour trigger bound to that button works. Ticking Attack "
-                "therefore hides pad X, EagleVision hides pad Y, Aim hides LB and BombDrop hides "
-                "RB if those are your controller bindings - the line under the toggle shows what "
-                "each ticked action actually resolved to on your pad.");
             bool maskChanged = false;
             for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
             {
@@ -2573,26 +2435,11 @@ void FreeJumpPlugin::OnImGuiRender()
             ImGui::SameLine();
             if (ImGui::Button("Select controller actions (X / Y / LB / RB)"))
             {
-                // The four native controller bindings: Attack = pad X,
-                // EagleVision = pad Y, Aim/quick-shot = LB, BombDrop = RB.
-                // Additive, so a click never silently re-enables something the
-                // player deliberately ticked off. Crouch stays in the mask, and
-                // on a controller it is driven by an analog trigger rather than
-                // a digital button, which is exactly what the keyStates sites
-                // (pad keymap / pad mapper) are for.
+                // Additive: never silently re-enable something the player
+                // deliberately ticked off.
                 m_DisabledActionMask |= (1u << 1) | (1u << 2) | (1u << 11) | (1u << 13);
                 maskChanged = true;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
-                    "Ticks Attack (pad X), EagleVision (pad Y), Aim (LB) and BombDrop (RB) - "
-                    "the four native controller bindings - and leaves everything else as it is. "
-                    "While Parkour Mode is on the game cannot detect those buttons at all; the "
-                    "plugin still reads them, so an override bound to X, Y, LB or RB still fires. "
-                    "Quickshot is Aim held while a target is locked, so it has no key of its own "
-                    "and is freed by the same tick. When the pad snapshot site below reports "
-                    "'on', the line under the toggle lists which pad button each ticked action "
-                    "resolved to.");
             if (maskChanged)
                 SaveSettings();
             // Bind a controller button directly to each disabled action (skip
@@ -2600,9 +2447,13 @@ void FreeJumpPlugin::OnImGuiRender()
             // actions show a Bind button.
             for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
             {
-                ImGui::PushID(actionIdx);
+                // Guard BEFORE the PushID: the old order pushed for every
+                // iteration and popped only one at the loop end, so every
+                // unticked/skipped action leaked an ID off the stack each
+                // frame — Dear ImGui's "missing PopID" imbalance assertion.
                 if (!(m_DisabledActionMask & (1u << actionIdx)) || !*ActionKeyName(actionIdx))
                     continue;
+                ImGui::PushID(actionIdx);
                 ImGui::Text("%s: ", ActionKeyName(actionIdx));
                 ImGui::SameLine();
                 const int boundPadCode = GetActionPadBinding(actionIdx);
@@ -2625,16 +2476,13 @@ void FreeJumpPlugin::OnImGuiRender()
                     }
                     SaveSettings();
                 }
+                ImGui::PopID();
             }
             if (m_WaitingPadBindAction >= 0)
                 ImGui::TextColored(rebindColor, "Press a controller button (X=2, Y=3, LB=5, RB=4) ...");
-            ImGui::PopID();
             ImGui::TreePop();
         }
     }
-
-    ImGui::Separator();
-    ImGui::Text("DS4Windows (DualSense via Steam Input / DS4Windows): this plugin reads the controller directly through XInput, so it works regardless of how DS4Windows remaps your physical buttons. The native layout used above (X=Attack/2, Y=EagleVision/3, LB=Aim/5, RB=BombDrop/4) is what the 1.5.0 gamepad mapper writes, which is exactly the DS4Windows virtual pad path. If you bind actions yourself via the Bind buttons above, the plugin hides whatever button you choose, not a hard-coded layout.");
 
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Parkour Action Overrides", ImGuiTreeNodeFlags_DefaultOpen))
@@ -2791,10 +2639,6 @@ void FreeJumpPlugin::OnImGuiRender()
                         SaveSettings();
                     if (ImGui::Checkbox("Expand acceptance range", &ov.expandRanges))
                         SaveSettings();
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip(
-                            "While this override is active, matching parkour actions are given a much "
-                            "more permissive acceptance range (only widened, never narrowed).");
                     if (ImGui::Button("Delete Override"))
                     {
                         m_Overrides.erase(m_Overrides.begin() + idx);

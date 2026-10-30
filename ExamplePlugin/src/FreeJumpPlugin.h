@@ -243,16 +243,25 @@ public:
 
     // Binding-profile accessors. Both profiles' key states are refreshed every
     // frame, so switching profiles never leaves a stale rising edge behind.
-    int& ActiveToggleKey() { return m_UseControllerBindings ? m_ToggleKeyPad : m_ToggleKey; }
-    int& ActiveParkourModeKey() { return m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey; }
-    int EffectiveToggleKey() const { return m_UseControllerBindings ? m_ToggleKeyPad : m_ToggleKey; }
-    int EffectiveParkourModeKey() const { return m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey; }
-    int EffectiveDiveHotkey() const { return m_UseControllerBindings ? m_DiveHotkeyPad : m_DiveHotkey; }
+    // Every accessor falls back to the keyboard/mouse slot when the controller
+    // slot is still unbound (stored 0 or otherwise invalid) — otherwise a
+    // fresh switch to controller bindings silently killed the feature (the
+    // dive-hotkey default is 0, so wall-to-hang never fired on controller).
+    static bool ValidBindCode(int code)
+    {
+        return (code >= kKeyboardKeyMin && code <= kKeyboardKeyMax)
+            || (code >= kPadKeyBase && code < kMaxBindableKey);
+    }
+    int& ActiveToggleKey() { return m_UseControllerBindings && ValidBindCode(m_ToggleKeyPad) ? m_ToggleKeyPad : m_ToggleKey; }
+    int& ActiveParkourModeKey() { return m_UseControllerBindings && ValidBindCode(m_ParkourModeKeyPad) ? m_ParkourModeKeyPad : m_ParkourModeKey; }
+    int EffectiveToggleKey() const { return m_UseControllerBindings && ValidBindCode(m_ToggleKeyPad) ? m_ToggleKeyPad : m_ToggleKey; }
+    int EffectiveParkourModeKey() const { return m_UseControllerBindings && ValidBindCode(m_ParkourModeKeyPad) ? m_ParkourModeKeyPad : m_ParkourModeKey; }
+    int EffectiveDiveHotkey() const { return m_UseControllerBindings && ValidBindCode(m_DiveHotkeyPad) ? m_DiveHotkeyPad : m_DiveHotkey; }
     // The pad button bound to an action for Parkour Mode, as a bindable code
     // (kPadKeyBase+ParkourPadCode), or 0 when unbound.
     int GetActionPadBinding(int actionIdx) const { return m_ActionPadBindings[actionIdx]; }
     int EffectiveOverrideKey(const ParkourActionOverride& override) const
     {
-        return m_UseControllerBindings ? override.padKeyCode : override.keyCode;
+        return m_UseControllerBindings && ValidBindCode(override.padKeyCode) ? override.padKeyCode : override.keyCode;
     }
 };
