@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-// NOTE: AvailableParkourAction::GetEnumParkourAction() is defined exactly once,
+// NOTE: AvailableParkourAction::GetEnumParkourAction() is defined exactly once,.
 // in GenericHooksInParkourFiltering.cpp (compiled in this project). Do NOT
 // redefine it here — duplicate definitions break the link.
 

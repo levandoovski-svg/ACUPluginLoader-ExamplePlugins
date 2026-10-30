@@ -17,7 +17,7 @@
 class AvailableParkourAction;
 enum class EnumParkourAction : int;
 
-// Bindable input codes.
+// Bindable input codes..
 // Keyboard/mouse codes are Win32 virtual-key codes (0x01..0xFE), which is what
 // the existing FreeJumpPlugin.ini files already store. Gamepad codes live in a
 // separate range above 0xFF so old INI values keep their meaning.
