@@ -131,17 +131,31 @@ private:
     // buttons still fire either way.
     bool m_BlockPadWhileParkour = false;
     bool m_PadBlockHookActive = false;
-    uint32_t m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10); // LMB, RMB, Crouch
+    // Defaults cover exactly the actions the controller's native buttons drive,
+    // so Parkour Mode frees X/Y/LB (and RT-crouch) with no extra setup:
+    //   Attack = pad X   (ActionKeyCode::LMB,        bit 1)
+    //   Aim    = pad LB   (ActionKeyCode::RMB,        bit 11)
+    //   Crouch = pad RT   (ActionKeyCode::Crouch,     bit 10)
+    //   EagleVision = pad Y (ActionKeyCode::EagleVision, bit 2)
+    // Quickshot is Aim held while a target is locked - it has no ActionKeyCode of
+    // its own, so blocking Aim blocks Quickshot. BombDrop (pad RB, bit 13) is
+    // left ON in-game by default and is added by the one-click preset button.
+    uint32_t m_DisabledActionMask = (1u << 1) | (1u << 11) | (1u << 10) | (1u << 2);
     // Parkour-mode suppression sites, installed independently of each other:
     //   0x14273BC7B keyboard/mouse keyStates
     //   0x14273BEC5 gamepad (keymap path), keyStates after the fill
     //   0x14273A726 gamepad (mapper path), keyStates after the mapper
     //   0x14273BEB3 gamepad (keymap path), the pad snapshot BEFORE the fill -
     //                clears the button itself, so the game cannot detect it
+    //   0x142728A1F the game's own pad poll, at the exact instruction after
+    //                GetDeviceState filled the snapshot. This single site covers
+    //                BOTH gamepad paths (device id 9 and the per-device mapper),
+    //                so it is the one that makes pad X/Y/LB/RB undetectable.
     bool m_KbmSuppressActive = false;
     bool m_PadKeymapSuppressActive = false;
     bool m_MapperSuppressActive = false;
     bool m_PadSnapshotSuppressActive = false;
+    bool m_PadPollSanitizeActive = false;
     bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
     bool m_OverrideFallbackRefused = false;
