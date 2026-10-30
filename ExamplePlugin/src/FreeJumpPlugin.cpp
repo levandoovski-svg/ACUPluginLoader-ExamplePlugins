@@ -295,8 +295,10 @@ namespace
 
     bool TryParseOverride(std::string_view data, int& index, ParkourActionOverride& parsedOverride)
     {
+        // 8 mandatory fields + optional 9th (pad key) and 10th (expand ranges),
+        // so pre-existing 8-field INI lines keep loading.
         const std::vector<std::string_view> fields = Split(data, ',');
-        if (fields.size() != 8)
+        if (fields.size() != 8 && fields.size() != 10)
             return false;
 
         int overrideIndex = 0;
@@ -335,14 +337,29 @@ namespace
             return false;
         }
 
+        // Newer files carry the controller-profile key and the range-widening
+        // flag. Older 8-field lines keep their keyboard key in both slots.
+        int padKeyCode = keyCode;
+        bool expandRanges = false;
+        if (fields.size() == 10)
+        {
+            if (!TryParseInteger(fields[8], 10, padKeyCode) || !IsValidBindableKey(padKeyCode)
+                || !TryParseBool(fields[9], expandRanges))
+            {
+                return false;
+            }
+        }
+
         index = overrideIndex;
         parsedOverride.keyCode = keyCode;
+        parsedOverride.padKeyCode = padKeyCode;
         parsedOverride.actionTypes = std::move(actionTypes);
         parsedOverride.fitnessMultiplier = fitnessMultiplier;
         parsedOverride.removeOtherActions = removeOtherActions;
         parsedOverride.enable = enabled;
         parsedOverride.toggleMode = toggleMode;
         parsedOverride.toggleState = toggleState;
+        parsedOverride.expandRanges = expandRanges;
         parsedOverride.waitingForKey = false;
         return true;
     }
@@ -604,17 +621,41 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_ToggleKey = keyCode;
         }
+        else if (TryGetValue(trimmedLine, "FreeJumpKeyPad=", value))
+        {
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
+                m_ToggleKeyPad = keyCode;
+        }
         else if (TryGetValue(trimmedLine, "SnapDirectionKey=", value))
         {
             int keyCode = 0;
             if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_SnapDirectionKey = keyCode;
         }
+        else if (TryGetValue(trimmedLine, "SnapDirectionKeyPad=", value))
+        {
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
+                m_SnapDirectionKeyPad = keyCode;
+        }
         else if (TryGetValue(trimmedLine, "ParkourModeKey=", value))
         {
             int keyCode = 0;
             if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_ParkourModeKey = keyCode;
+        }
+        else if (TryGetValue(trimmedLine, "ParkourModeKeyPad=", value))
+        {
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
+                m_ParkourModeKeyPad = keyCode;
+        }
+        else if (TryGetValue(trimmedLine, "UseControllerBindings=", value))
+        {
+            bool profile = false;
+            if (TryParseBool(value, profile))
+                m_UseControllerBindings = profile;
         }
         else if (TryGetValue(trimmedLine, "ParkourModeOn=", value))
         {
@@ -692,9 +733,13 @@ void FreeJumpPlugin::SaveSettings()
         return;
 
     file << "FreeJumpKey=" << std::hex << m_ToggleKey << std::dec << "\n";
+    file << "FreeJumpKeyPad=" << std::hex << m_ToggleKeyPad << std::dec << "\n";
     file << "SnapDirectionKey=" << std::hex << m_SnapDirectionKey << std::dec << "\n";
+    file << "SnapDirectionKeyPad=" << std::hex << m_SnapDirectionKeyPad << std::dec << "\n";
     file << "SnapDirectionMode=" << (m_SnapDirectionMode ? 1 : 0) << "\n";
+    file << "UseControllerBindings=" << (m_UseControllerBindings ? 1 : 0) << "\n";
     file << "ParkourModeKey=" << std::hex << m_ParkourModeKey << std::dec << "\n";
+    file << "ParkourModeKeyPad=" << std::hex << m_ParkourModeKeyPad << std::dec << "\n";
     file << "ParkourModeOn=" << (m_ParkourModeOn ? 1 : 0) << "\n";
     file << "ParkourDisabledActions=";
     {
@@ -726,7 +771,9 @@ void FreeJumpPlugin::SaveSettings()
              << "," << (override.removeOtherActions ? 1 : 0)
              << "," << (override.enable ? 1 : 0)
              << "," << (override.toggleMode ? 1 : 0)
-             << "," << (override.toggleState ? 1 : 0) << "\n";
+             << "," << (override.toggleState ? 1 : 0)
+             << "," << override.padKeyCode
+             << "," << (override.expandRanges ? 1 : 0) << "\n";
     }
 
     file.flush();
@@ -1192,10 +1239,37 @@ void FreeJumpPlugin::OnImGuiRender()
     }
     if (ImGui::CollapsingHeader("Basic Features", ImGuiTreeNodeFlags_DefaultOpen))
     {
+        // ── Binding profile ─────────────────────────────────────────────
+        // One switch swaps every feature and override between the pair of
+        // bindings the player set once for each device, so switching from
+        // keyboard/mouse to a controller never requires rebinding a single
+        // action. Both profiles are polled every frame regardless of which is
+        // active, so no stale key state can survive the switch.
+        bool controllerBindings = m_UseControllerBindings;
+        if (ImGui::Checkbox("Use controller bindings", &controllerBindings))
+        {
+            m_UseControllerBindings = controllerBindings;
+            m_JustCapturedKey = 0;
+            SaveSettings();
+        }
+        ImGui::SameLine();
+        if (m_UseControllerBindings)
+            ImGui::TextDisabled("(profiles: CONTROLLER — keyboard/mouse keys ignored)");
+        else
+            ImGui::TextDisabled("(profiles: KEYBOARD/MOUSE — controller keys ignored)");
+        ImGui::TextDisabled(
+            "Both device layouts are stored side by side; with this unchecked you rebind with "
+            "your keyboard/mouse, and with it checked you rebind with your controller. Everything "
+            "else in this menu behaves the same in either mode.");
+
+        ImGui::Separator();
         ImGui::Text("Free Jump:");
         ImGui::SameLine();
         ImGui::TextColored(freeMode ? activeColor : inactiveColor, freeMode ? "ACTIVE (HOLD)" : "OFF");
-        ImGui::Text("  Bound key: %s", KeyCodeLabel(m_ToggleKey).c_str());
+        if (m_UseControllerBindings)
+            ImGui::Text("  Bound key: %s", KeyCodeLabel(m_ToggleKeyPad).c_str());
+        else
+            ImGui::Text("  Bound key: %s", KeyCodeLabel(m_ToggleKey).c_str());
         if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForKey ? "Cancel Rebind" : "Rebind##FreeJump"))
         {
@@ -1214,7 +1288,8 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::SameLine();
         ImGui::TextColored(snapMode ? ImVec4(0.20f,0.60f,0.90f,1.0f) : ImVec4(0.70f,0.70f,0.70f,1.0f),
                            snapMode ? "ON" : "OFF");
-        ImGui::Text("  Toggle key: %s", KeyCodeLabel(m_SnapDirectionKey).c_str());
+        ImGui::Text("  Toggle key: %s",
+            KeyCodeLabel(m_UseControllerBindings ? m_SnapDirectionKeyPad : m_SnapDirectionKey).c_str());
         if (m_WaitingForSnapKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
         if (ImGui::Button(m_WaitingForSnapKey ? "Cancel Rebind" : "Rebind##Snap"))
         {
@@ -1238,7 +1313,8 @@ void FreeJumpPlugin::OnImGuiRender()
             ImGui::SameLine();
             ImGui::TextDisabled("(frees the disabled actions' keys below)");
         }
-        ImGui::Text("  Toggle key: %s", KeyCodeLabel(m_ParkourModeKey).c_str());
+        ImGui::Text("  Toggle key: %s",
+            KeyCodeLabel(m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey).c_str());
         if (m_WaitingForParkourKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key or pad button to bind..."); }
         if (ImGui::Button(m_WaitingForParkourKey ? "Cancel Rebind##ParkourMode" : "Rebind##ParkourMode"))
         {
@@ -1308,7 +1384,10 @@ void FreeJumpPlugin::OnImGuiRender()
             {
                 auto& ov = m_Overrides[idx];
                 ImGui::PushID(idx);
-                bool active = ov.enable && (ov.toggleMode ? ov.toggleState : IsKeyHeld(ov.keyCode));
+                const int effectiveKey = EffectiveOverrideKey(ov);
+                bool active = ov.enable && (ov.toggleMode ? ov.toggleState
+                    : (IsValidBindableKey(effectiveKey) && IsKeyHeld(effectiveKey)
+                        && !MouseBindWouldHitUi(effectiveKey)));
                 ImGui::TextColored(active ? holdColor : inactiveColor, "[%s]",
                                    active ? "ACTIVE" : (ov.enable ? "ENABLED" : "DISABLED"));
                 ImGui::SameLine();
@@ -1317,7 +1396,9 @@ void FreeJumpPlugin::OnImGuiRender()
                     if (ImGui::Checkbox("Enable", &ov.enable))
                         SaveSettings();
                     ImGui::SameLine();
-                    ImGui::Text("Key: %s", KeyCodeLabel(ov.keyCode).c_str());
+                    const int effectiveKey = EffectiveOverrideKey(ov);
+                    ImGui::Text("Key: %s%s", KeyCodeLabel(effectiveKey).c_str(),
+                                 IsValidBindableKey(effectiveKey) ? "" : " (unbound!)");
                     ImGui::SameLine();
                     if (ImGui::Button(ov.waitingForKey ? "Cancel" : "Rebind"))
                     {
@@ -1348,33 +1429,50 @@ void FreeJumpPlugin::OnImGuiRender()
                     }
 
                     {
-                        const char* kActionNames[] = {
-                            "wallEjectToHang (17)",
-                            "breakfall (18)",
-                            "fromHangToWall_side (26)",
-                            "hangToDropDown_safe (31)",
-                            "riseFromHang (32)",
-                            "jumpAndGrabFrontWall (35)",
-                            "offTheWall_fromWallToGroundReleaseOrEject (36)",
-                            "climbFacade_fromWallDescentSidewaysToGround_alsoSidehop (39)",
-                            "dive (40)",
-                            "swing_2F_SwingToSidewall_includingSpindescent (47)",
-                            "swing_30_fromSwingToFeet (48)",
-                            "swing_31_swingToSwing_mb (49)",
-                            "offTheWall_fromWallToWallEjectAndCatch (50)",
-                            "wallrunUpFromGroundFailed_mb (52)",
-                            "wallrunUpFromGround_mb (53)",
-                            "wallrunUpToHang (54)",
-                            "onWallNormalClimb (65)",
-                            "plainDismountFromWall_mb (69)",
-                            "fromWallToHang_down (70)",
-                            "fromWallToHang_side (71)",
-                            "fromWallingToHangDownAndTurnCornerOutside (72)",
-                            "fromWallToHang_up (77)",
-                            "fromHangToWall_down (78)",
-                            "backEject_4F (79)",
-                        };
-                        int kActionValues[] = { 17, 18, 26, 31, 32, 35, 36, 39, 40, 47, 48, 49, 50, 52, 53, 54, 65, 69, 70, 71, 72, 77, 78, 79 };
+        const char* kActionNames[] = {
+            "stumbleAtEdge_mb (1)", "slideUnder2 (2)", "stepDownSmallHeight_mb (3)", "leapBeamToVShape (4)",
+            "fromVshapeSmallStepDown (5)", "fromSlopeRiseToGround (6)", "stepDownWaistHeight_mb (8)",
+            "riseFromGroundToGround_smallDiff_alsoVault9 (9)", "passementFromBeam_A (10)",
+            "fromGroundVaultThroughVShape (11)", "passementFromBeam_C (12)", "passementD (13)",
+            "riseFromGroundToGround_smallDiff_alsoVault14 (14)", "jumpDownToGround_airtimeButSafe (15)",
+            "wallEjectToHang (17)", "breakfall (18)", "freefallLedgeLandOn (20)", "breakfall21 (21)",
+            "fromHangToWallUpSameDepth_mb (23)", "fromHangToWall_side (26)",
+            "fromHangToWallingUpAndTurnCornerOutside (27)", "hangTurnCornerInside (28)",
+            "hangTurnCornerOutside (29)", "hangToDropDown_safe (31)", "riseFromHang (32)",
+            "moveToSideWhileStillHanging (33)", "hangTurn_22 (34)", "jumpAndGrabFrontWall (35)",
+            "offTheWall_fromWallToGroundReleaseOrEject (36)", "fromGroundToLadder_up (37)",
+            "runOffGroundEdgeAndGrabSideWall (38)",
+            "climbFacade_fromWallDescentSidewaysToGround_alsoSidehop (39)", "dive (40)",
+            "leapOffBuildingIntoUncontrolledFall_mb (41)", "leapOfFaithIntoWaterViaParkourUp (42)",
+            "swing_2B (43)", "riseFromHangHP_mb (44)", "swingTurn_2D (45)", "swingToWalling_front (46)",
+            "swing_2F_SwingToSidewall_includingSpindescent (47)", "swing_30_fromSwingToFeet (48)",
+            "swing_31_swingToSwing_mb (49)", "offTheWall_fromWallToWallEjectAndCatch (50)",
+            "wallrunUpFromGroundFailed_mb (52)", "wallrunUpFromGround_mb (53)", "wallrunUpToHang (54)",
+            "fromSlopeRiseToWall (55)", "slideUnder56 (56)", "plainStepDownToHang (57)",
+            "fromSlopeSlideToHang (58)", "outOfWindowToHang_almostFellOutOfWindow (59)",
+            "stepDownFromBeamToWall_mb (60)", "fromGroundToLadder_down (61)",
+            "fromSlopeToWall_side_mb___UNABLE_TO_TRIGGER (62)",
+            "edgeDropBeforeFreeeFall_3F___UNABLE_TO_TRIGGER (63)",
+            "fromGroundTurnAroundAndGrabWallParkourDown (64)", "onWallNormalClimb (65)",
+            "climbCornerInside_onWallTurnCornerInner (67)", "onWallTurnCornerOuter (68)",
+            "plainDismountFromWall_mb (69)", "fromWallToHang_down (70)", "fromWallToHang_side (71)",
+            "fromWallingToHangDownAndTurnCornerOutside (72)", "climb_fromWallRiseToFeetOnLedge_49 (73)",
+            "riseToVShape (75)", "fromLadderToGround_up (76)", "fromWallToHang_up (77)",
+            "fromHangToWall_down (78)", "backEject_4F (79)", "onLadderUpDown (80)", "choke_mb (86)",
+            "fromWaterToWall (97)", "walkingOnBeamPassColumnAndContinue_R (100)",
+            "walkingOnBeamPassColumnAndContinue_L (101)", "walkThroughWindow_mb_106 (106)",
+            "flipOverWindowLedgeToWalling (107)", "enterWindow (108)", "leapOfFaith (112)",
+            "passementFromHayStack (114)", "startJumpOutOfWindow (115)",
+            "jumpOutOfWindowDescendToLedge_mb (116)", "jumpOutOfWindowToFeet (119)",
+            "jumpOutOfWindowToWalling (120)", "jumpOutOfWindowToHang (121)",
+            "defenestrateSprintOutOfWindow_122 (122)", "jumpIntoWindow (123)",
+        };
+        int kActionValues[] = {
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 21, 23, 26, 27, 28, 29, 31, 32, 33,
+            34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 52, 53, 54, 55, 56, 57, 58,
+            59, 60, 61, 62, 63, 64, 65, 67, 68, 69, 70, 71, 72, 73, 75, 76, 77, 78, 79, 80, 86, 97, 100, 101,
+            106, 107, 108, 112, 114, 115, 116, 119, 120, 121, 122, 123,
+        };
                         ImGui::Text("Action Types:");
                         for (int t = 0; t < (int)ov.actionTypes.size(); ++t)
                         {
@@ -1409,6 +1507,12 @@ void FreeJumpPlugin::OnImGuiRender()
                         SaveSettings();
                     if (ImGui::Checkbox("Remove all other actions", &ov.removeOtherActions))
                         SaveSettings();
+                    if (ImGui::Checkbox("Expand acceptance range", &ov.expandRanges))
+                        SaveSettings();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "While this override is active, matching parkour actions are given a much "
+                            "more permissive acceptance range (only widened, never narrowed).");
                     if (ImGui::Button("Delete Override"))
                     {
                         m_Overrides.erase(m_Overrides.begin() + idx);

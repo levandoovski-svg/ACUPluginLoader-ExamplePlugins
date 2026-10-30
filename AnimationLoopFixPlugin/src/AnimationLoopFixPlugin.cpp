@@ -196,13 +196,8 @@ void AnimationLoopFixPlugin::OnUpdate()
     }
     m_PrevKeyDown = keyDown;
 
-    if (!m_PluginEnabled)
-    {
-        return;
-    }
-
-    // Capture mode: write every clip node's handle and length to the log so
-    // the two handles can be found without guessing them.
+    // Capture mode has to work while the plugin is disabled - the handles are
+    // what you need before you can enable anything.
     static bool prevDumpDown = false;
     const bool dumpDown = (GetAsyncKeyState(m_DumpClipsKey) & 0x8000) != 0;
     if (dumpDown && !prevDumpDown)
@@ -210,6 +205,11 @@ void AnimationLoopFixPlugin::OnUpdate()
         DumpClipTable();
     }
     prevDumpDown = dumpDown;
+
+    if (!m_PluginEnabled)
+    {
+        return;
+    }
 
     // Experimental option B. Off by default: automatic end-of-clip detection
     // would need a verified runtime signal that this codebase does not have
