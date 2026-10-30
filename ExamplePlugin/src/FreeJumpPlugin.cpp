@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "FreeJumpPlugin.h"
 #include "ACU/ACUPlayerCameraComponent.h"
+#include "ACU/Parkour_WhileOnWallSystem.h"
+#include "ACU/Memory/ACUAllocs.h"
 #include "ParkourDebugging/AvailableParkourAction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
 #include "ParkourDebugging/FancyVFunctionDescription.h"
@@ -477,11 +479,33 @@ namespace
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
     };
 
-    // Resolved pad button for an action while the mask is applied: the game's
-    // own binding when the keymap path has seen it, the native layout above
-    // otherwise. Returns -1 only when nothing is known at all.
-    int ResolvePadCodeForAction(int actionIdx)
+    // Resolved pad button for an action while the mask is applied, as a GAME
+    // SNAPSHOT slot (byte +0x30+slot in the poll's 0x110-byte state):
+    //   1. the player's own binding (Parkour Mode's per-action pad binding) -
+    //      authoritative, converted from the plugin's ParkourPadCode to the
+    //      game's slot via the dump-proven device-6 layout;
+    //   2. the game's own controller binding, as last resolved from the pad
+    //      keymap (only populated on the device-9 keymap path);
+    //   3. the built-in native layout for the default actions.
+    // Returns -1 only when nothing is known at all.
+    int ResolvePadCodeForAction(const FreeJumpPlugin* owner, int actionIdx)
     {
+        // Plugin ParkourPadCode -> game snapshot slot. Dump-proven from the
+        // device-6 (XInput-style) mapper case: slot 0=A, 1=B, 2=X, 3=Y,
+        // 4=RB, 5=LB, 6=Start/Options, 7=Back/Share. Other pad controls
+        // (triggers, sticks, dpad) have no proven slot and are not hidden.
+        switch (owner->GetActionPadBinding(actionIdx) - kPadKeyBase)
+        {
+            case PadCode_A:     return 0;
+            case PadCode_B:     return 1;
+            case PadCode_X:     return 2;
+            case PadCode_Y:     return 3;
+            case PadCode_RB:    return 4;
+            case PadCode_LB:    return 5;
+            case PadCode_START: return 6;
+            case PadCode_BACK:  return 7;
+            default: break;
+        }
         if (g_PadCodeForAction[actionIdx] >= 0)
             return g_PadCodeForAction[actionIdx];
         return kDefaultPadCodeForAction[actionIdx];
@@ -599,7 +623,7 @@ namespace
         {
             if (!(disabledMask & (1u << actionIdx)))
                 continue;
-            const int padCode = ResolvePadCodeForAction(actionIdx);
+            const int padCode = ResolvePadCodeForAction(owner, actionIdx);
             if (padCode < 0)
                 continue;
             // Clear the whole byte, not just bit 7, so the button is not merely
@@ -775,6 +799,208 @@ namespace
         static AutoAssembleWrapper<ParkourModePadBlockHook> s_hook;
         return s_hook;
     }
+
+    // ── Wall-to-Hang (ported from ACUFixes-0.9.3 Parkour Helpers) ────────
+    // While the dive hotkey is held, this makes the game create and select
+    // wall-eject-to-hang moves. Seven hooks, all from the 0.9.3 source that is
+    // validated against ACU 1.5.0:
+    //   0x140135230 (12B) ClimbFacade scan also creates wallEjectToHang
+    //   0x140137A84 (11B) BackEject scan also creates wallEjectToHang
+    //   0x141A4D7CB (7B)  starting a walling cycle swaps the climbFacade
+    //                     tester's fancy vtable to the baseclass that has
+    //                     sidehop-to-swing (0x1439FA1A0)
+    //   0x141A1BA0C (7B)  same for the failed-wallrun cycle
+    //   0x140140E44 (10B) widen eject-to-hang ranges (returns to 0x140140EDB)
+    //   0x140140DCA (10B) widen eject-to-hang ranges for ParkourUp
+    //                     (returns to 0x140140FED)
+    //   0x1401AD835 (7B)  flip the RTCP TargetAngle so backeject-to-hang picks
+    //                     the backeject animation, not the sideeject one
+    // The runtime dump shows all seven sites E9-patched when ACU_ParkourPatches
+    // (which ships the same helpers) is installed, so installation refuses
+    // cleanly per site and the UI says the feature is already provided.
+    FreeJumpPlugin* g_WallToHangInstance = nullptr;
+    class ParkourAction_Commonbase;
+
+    DEFINE_GAME_FUNCTION(CreateParkourActionForParkourPointIfFits, 0x1401D1CF0, char, __fastcall,
+        (EnumParkourAction a1, uint64 a2, __m128* a3, __m128* p_movementVecWorld_mb, float a5,
+         int a6, char a7, uint64 a8, uint64 a9, uint64 p_currentLedge_mb,
+         ParkourAction_Commonbase** p_newAction_out, float a12, float p_epsilon_mb));
+
+    bool IsWallToHangSiteTaken(uintptr_t site)
+    {
+        // The only reliable signature we have for these sites: when another
+        // plugin owns them, the first byte is the E9 of its jmp cave.
+        return *reinterpret_cast<const uint8_t*>(site) == 0xE9;
+    }
+
+    void WhenScanClimbFacade_AlsoWallToHang(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_WallToHangInstance;
+        if (!owner || !owner->ShouldForceWallToHang())
+            return;
+        bool isCreated = CreateParkourActionForParkourPointIfFits(
+            EnumParkourAction::wallEjectToHang
+            , params->rdx_
+            , (__m128*)params->rdi_
+            , (__m128*)params->r9_
+            , params->XMM6.f0
+            , (int&)params->r13_
+            , *(char*)(params->GetRSP() + 0x100)
+            , *(uint64*)(*(uint64*)params->r12_ + (int&)params->r15_)
+            , *(uint64*)(params->rbp_ + 0x118)
+            , *(uint64*)(params->rbp_ + 0x120)
+            , (ParkourAction_Commonbase**)(params->GetRSP() + 0x108)
+            , *(float*)(params->rbp_ + 0x104)
+            , *(float*)(params->rbp_ + 0x108));
+        if (isCreated)
+        {
+            ACU::Memory::SmallArrayAppend(*(SmallArray<ParkourAction_Commonbase*>*)params->rbx_,
+                *(ParkourAction_Commonbase**)(params->GetRSP() + 0x108));
+        }
+    }
+
+    void WhenScanBackEject_AlsoWallToHang(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_WallToHangInstance;
+        if (!owner || !owner->ShouldForceWallToHang())
+            return;
+        bool isCreated = CreateParkourActionForParkourPointIfFits(
+            EnumParkourAction::wallEjectToHang
+            , *(uint64*)(params->GetRSP() + 0xE8)
+            , (__m128*)params->rsi_
+            , (__m128*)(params->rdi_ + 0x20)
+            , params->XMM6.f0
+            , (int&)params->r13_
+            , *(char*)(params->GetRSP() + 0x110)
+            , *(uint64*)(*(uint64*)params->r14_ + (int&)params->r12_)
+            , *(uint64*)(params->rdi_ + 0x118)
+            , *(uint64*)(params->rdi_ + 0x120)
+            , (ParkourAction_Commonbase**)(params->GetRSP() + 0x70)
+            , *(float*)(params->rdi_ + 0x104)
+            , *(float*)(params->rdi_ + 0x108));
+        if (isCreated)
+        {
+            ACU::Memory::SmallArrayAppend(*(SmallArray<ParkourAction_Commonbase*>*)params->rbx_,
+                *(ParkourAction_Commonbase**)(params->GetRSP() + 0x70));
+        }
+    }
+
+    // The two fancy vtables of the climbFacade tester, from the 0.9.3 source.
+    constexpr uint64 kClimbFacadeFVTable_default = 0x1439E08D0;
+    constexpr uint64 kClimbFacadeFVTable_sidehopToSwing = 0x1439FA1A0;
+
+    void WhenStartingWallingCycle_SwapFVTable(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_WallToHangInstance;
+        auto* hsWalling = (WhileOnWallSystem*)params->rbx_;
+        if (!hsWalling || !hsWalling->climbFacade)
+            return;
+        uint64& climbFacadeFancyVTable = *(uint64*)((uint64)hsWalling->climbFacade + 8);
+        climbFacadeFancyVTable = (owner && owner->ShouldForceWallToHang())
+            ? kClimbFacadeFVTable_sidehopToSwing
+            : kClimbFacadeFVTable_default;
+    }
+
+    void WhenStartingFailedWallrun_SwapFVTable(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_WallToHangInstance;
+        uint64 hsFailedWallrun = params->rsi_;
+        uint64 climbFacadeTester = *(uint64*)(hsFailedWallrun + 0x1D0);
+        if (!climbFacadeTester)
+            return;
+        uint64& climbFacadeFancyVTable = *(uint64*)(climbFacadeTester + 8);
+        climbFacadeFancyVTable = (owner && owner->ShouldForceWallToHang())
+            ? kClimbFacadeFVTable_sidehopToSwing
+            : kClimbFacadeFVTable_default;
+    }
+
+    void WidenEjectToHangRanges(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_WallToHangInstance;
+        if (!owner || !owner->ShouldForceWallToHang())
+            return;
+        auto& action = *(AvailableParkourAction*)params->rdx_;
+        action.heightDifferenceMin = -3;
+        action.heightDifferenceMax = 1;
+        action.expectedHeightDiff_mb = -2;
+        action.expectedVerticalSpeed_mb = 9;
+        action.expectedHorizontalSpeed = 4;
+        action.expectedVerticalDefaultDisplace = -1;
+        action.expectedDurationMaxExtension_mb = 1.1f;
+        action.curveAllowedRangeMax = 2;
+        action.curveAllowedRangeMin = -4;
+        action.flt_228 = 1;
+        action.expectedCurveRangeMin = -2;
+        action.vec240.y = 1.7600001f;
+        action.vec240.z = action.expectedVerticalSpeed_mb * 0.44000003f - 1.8972802f;
+    }
+
+    void WidenEjectToHangRanges_ParkourUp(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_WallToHangInstance;
+        if (!owner || !owner->ShouldForceWallToHang())
+            return;
+        auto& action = *(AvailableParkourAction*)params->rdx_;
+        action.heightDifferenceMin = -12;
+        action.heightDifferenceMax = 1.5f;
+        action.expectedHeightDiff_mb = 1.5f;
+        action.expectedVerticalSpeed_mb = 11;
+        action.expectedHorizontalSpeed = 4;
+        action.expectedVerticalDefaultDisplace = -1;
+        action.expectedDurationMin_mb = 0.7f;
+        action.expectedDurationMaxExtension_mb = 1.8f;
+        action.curveAllowedRangeMax = 2;
+        action.curveAllowedRangeMin = -4;
+        action.flt_228 = 1;
+        action.expectedCurveRangeMin = -2;
+        action.vec240.y = 2.8799999f;
+        action.vec240.z = action.expectedVerticalSpeed_mb * 0.71999997f - 5.0803199f;
+    }
+
+    void FixRTCPTargetAngle_BackEjectToHang(AllRegisters* params)
+    {
+        FreeJumpPlugin* owner = g_WallToHangInstance;
+        if (!owner || !owner->ShouldForceWallToHang())
+            return;
+        auto& action = *(AvailableParkourAction*)params->rbx_;
+        if (action.GetEnumParkourAction() != EnumParkourAction::wallEjectToHang)
+            return;
+        float& calculatedRTCPTargetAngle = (float&)params->XMM0.f0;
+        if (calculatedRTCPTargetAngle >= -180.0f && calculatedRTCPTargetAngle < -155.0f)
+            calculatedRTCPTargetAngle = -calculatedRTCPTargetAngle;
+    }
+
+    struct WallToHangHooks : AutoAssemblerCodeHolder_Base
+    {
+        WallToHangHooks()
+        {
+            PresetScript_CCodeInTheMiddle(0x140135230, 12,
+                WhenScanClimbFacade_AlsoWallToHang, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+            PresetScript_CCodeInTheMiddle(0x140137A84, 11,
+                WhenScanBackEject_AlsoWallToHang, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+            PresetScript_CCodeInTheMiddle(0x141A4D7CB, 7,
+                WhenStartingWallingCycle_SwapFVTable, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+            PresetScript_CCodeInTheMiddle(0x141A1BA0C, 7,
+                WhenStartingFailedWallrun_SwapFVTable, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+            PresetScript_CCodeInTheMiddle(0x140140E44, 10,
+                WidenEjectToHangRanges, 0x140140EDB, false);
+            PresetScript_CCodeInTheMiddle(0x140140DCA, 10,
+                WidenEjectToHangRanges_ParkourUp, 0x140140FED, false);
+            PresetScript_CCodeInTheMiddle(0x1401AD835, 7,
+                FixRTCPTargetAngle_BackEjectToHang, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+        }
+    };
+
+    AutoAssembleWrapper<WallToHangHooks>& GetWallToHangHooks()
+    {
+        static AutoAssembleWrapper<WallToHangHooks> s_hook;
+        return s_hook;
+    }
+
+    constexpr uintptr_t kWallToHangSites[] = {
+        0x140135230, 0x140137A84, 0x141A4D7CB, 0x141A1BA0C,
+        0x140140E44, 0x140140DCA, 0x1401AD835,
+    };
 
     // C-linkage entry so its address can be written into the fallback cave
     // without depending on how this TU mangles its local class members.
@@ -987,18 +1213,6 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_ToggleKeyPad = keyCode;
         }
-        else if (TryGetValue(trimmedLine, "SnapDirectionKey=", value))
-        {
-            int keyCode = 0;
-            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
-                m_SnapDirectionKey = keyCode;
-        }
-        else if (TryGetValue(trimmedLine, "SnapDirectionKeyPad=", value))
-        {
-            int keyCode = 0;
-            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
-                m_SnapDirectionKeyPad = keyCode;
-        }
         else if (TryGetValue(trimmedLine, "ParkourModeKey=", value))
         {
             int keyCode = 0;
@@ -1048,11 +1262,42 @@ void FreeJumpPlugin::LoadSettings()
             }
             m_DisabledActionMask = mask;
         }
-        else if (TryGetValue(trimmedLine, "SnapDirectionMode=", value))
+        else if (TryGetValue(trimmedLine, "ParkourPadBindings=", value))
+        {
+            // Pairs of "actionIdx:bindableCode" (bindableCode = kPadKeyBase +
+            // ParkourPadCode). Unknown/malformed pairs are skipped.
+            for (const std::string_view pairToken : Split(value, '|'))
+            {
+                const size_t colon = pairToken.find(':');
+                if (colon == std::string_view::npos)
+                    continue;
+                int actionIdx = 0, boundCode = 0;
+                if (TryParseInteger(pairToken.substr(0, colon), 10, actionIdx)
+                    && TryParseInteger(pairToken.substr(colon + 1), 10, boundCode)
+                    && actionIdx >= 0 && actionIdx < kActionKeyCount
+                    && boundCode >= kPadKeyBase && boundCode < kMaxBindableKey)
+                {
+                    m_ActionPadBindings[actionIdx] = boundCode;
+                }
+            }
+        }
+        else if (TryGetValue(trimmedLine, "WallToHangEnabled=", value))
         {
             bool enabled = false;
             if (TryParseBool(value, enabled))
-                m_SnapDirectionMode = enabled;
+                m_WallToHangEnabled = enabled;
+        }
+        else if (TryGetValue(trimmedLine, "DiveHotkey=", value))
+        {
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
+                m_DiveHotkey = keyCode;
+        }
+        else if (TryGetValue(trimmedLine, "DiveHotkeyPad=", value))
+        {
+            int keyCode = 0;
+            if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
+                m_DiveHotkeyPad = keyCode;
         }
         else if (TryGetValue(trimmedLine, "NumOverrides=", value))
         {
@@ -1105,9 +1350,6 @@ void FreeJumpPlugin::SaveSettings()
 
     file << "FreeJumpKey=" << std::hex << m_ToggleKey << std::dec << "\n";
     file << "FreeJumpKeyPad=" << std::hex << m_ToggleKeyPad << std::dec << "\n";
-    file << "SnapDirectionKey=" << std::hex << m_SnapDirectionKey << std::dec << "\n";
-    file << "SnapDirectionKeyPad=" << std::hex << m_SnapDirectionKeyPad << std::dec << "\n";
-    file << "SnapDirectionMode=" << (m_SnapDirectionMode ? 1 : 0) << "\n";
     file << "UseControllerBindings=" << (m_UseControllerBindings ? 1 : 0) << "\n";
     file << "ParkourModeKey=" << std::hex << m_ParkourModeKey << std::dec << "\n";
     file << "ParkourModeKeyPad=" << std::hex << m_ParkourModeKeyPad << std::dec << "\n";
@@ -1127,6 +1369,26 @@ void FreeJumpPlugin::SaveSettings()
         }
     }
     file << "\n";
+    // Per-action controller-button bindings for Parkour Mode ("action:code"
+    // pairs). Only actions the player actually bound are written.
+    file << "ParkourPadBindings=";
+    {
+        bool firstBinding = true;
+        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+        {
+            const int boundCode = m_ActionPadBindings[actionIdx];
+            if (boundCode < kPadKeyBase)
+                continue;
+            if (!firstBinding)
+                file << "|";
+            file << actionIdx << ":" << boundCode;
+            firstBinding = false;
+        }
+    }
+    file << "\n";
+    file << "WallToHangEnabled=" << (m_WallToHangEnabled ? 1 : 0) << "\n";
+    file << "DiveHotkey=" << std::hex << m_DiveHotkey << std::dec << "\n";
+    file << "DiveHotkeyPad=" << std::hex << m_DiveHotkeyPad << std::dec << "\n";
     file << "NumOverrides=" << m_Overrides.size() << "\n";
     file << std::setprecision(std::numeric_limits<float>::max_digits10);
     for (size_t i = 0; i < m_Overrides.size(); ++i)
@@ -1203,13 +1465,18 @@ void FreeJumpPlugin::OnBeforeActivate()
     {
         return static_cast<FreeJumpPlugin*>(userData)->ChooseBeforeFiltering(actions);
     };
-    m_Callbacks.ChooseAfterSorting_fnp = nullptr;
+    m_Callbacks.ChooseAfterSorting_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame) -> AvailableParkourAction*
+    {
+        return static_cast<FreeJumpPlugin*>(userData)->ChooseAfterSorting(actions, selectedByGame);
+    };
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 5.0f;
     m_Callbacks.m_Name = "FreeJumpPlugin";
 
     if (m_ParkourModeOn && m_DisabledActionMask)
         ApplyParkourMode(true);
+    if (m_WallToHangEnabled)
+        ApplyWallToHang(true);
 }
 
 void FreeJumpPlugin::OnBeforeDeactivate()
@@ -1217,6 +1484,8 @@ void FreeJumpPlugin::OnBeforeDeactivate()
     if (m_KbmSuppressActive || m_PadKeymapSuppressActive || m_MapperSuppressActive
         || m_PadSnapshotSuppressActive || m_PadPollSanitizeActive || m_PadBlockHookActive)
         ApplyParkourMode(false);
+    if (m_WallToHangHooksActive)
+        ApplyWallToHang(false);
     if (m_OverrideFallbackActive)
     {
         GetParkourOverrideFallbackHook().Deactivate();
@@ -1372,6 +1641,77 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
     }
 }
 
+void FreeJumpPlugin::ApplyWallToHang(bool enable)
+{
+    if (enable)
+    {
+        g_WallToHangInstance = this;
+        // All-or-nothing: a partial install (e.g. creation hooks without the
+        // vtable swaps) would create candidates the game then discards, which
+        // looks like "the feature half-works". When ACU_ParkourPatches or
+        // ACUFixes provides the same helpers, every site is E9-patched, we
+        // install nothing, and the feature still works through that plugin.
+        for (uintptr_t site : kWallToHangSites)
+        {
+            if (IsWallToHangSiteTaken(site))
+            {
+                m_WallToHangSiteTaken = true;
+                m_WallToHangHooksActive = false;
+                return;
+            }
+        }
+        m_WallToHangSiteTaken = false;
+        GetWallToHangHooks().Activate();
+        m_WallToHangHooksActive = true;
+    }
+    else
+    {
+        if (m_WallToHangHooksActive)
+        {
+            GetWallToHangHooks().Deactivate();
+            m_WallToHangHooksActive = false;
+        }
+        if (g_WallToHangInstance == this)
+            g_WallToHangInstance = nullptr;
+    }
+}
+
+bool FreeJumpPlugin::ShouldForceWallToHang() const
+{
+    if (!m_WallToHangEnabled)
+        return false;
+    const int effectiveDiveKey = EffectiveDiveHotkey();
+    return IsValidBindableKey(effectiveDiveKey)
+        && effectiveDiveKey != m_JustCapturedKey
+        && !MouseBindWouldHitUi(effectiveDiveKey)
+        && IsKeyHeld(effectiveDiveKey);
+}
+
+AvailableParkourAction* FreeJumpPlugin::ChooseAfterSorting(
+    SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
+{
+    // Ported from ACUFixes' dive-move selection: while the dive hotkey is held,
+    // the first available dive-family move wins over the game's own pick.
+    // Return nullptr to leave the game's verdict untouched.
+    if (!ShouldForceWallToHang())
+        return nullptr;
+    for (int i = 0; i < actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action)
+            continue;
+        const int actionType = GetTypeIntSafe(action);
+        if (actionType == (int)EnumParkourAction::dive
+            || actionType == (int)EnumParkourAction::swing_31_swingToSwing_mb
+            || actionType == (int)EnumParkourAction::jumpOutOfWindowToHang
+            || actionType == (int)EnumParkourAction::wallEjectToHang)
+        {
+            return action;
+        }
+    }
+    return nullptr;
+}
+
 void FreeJumpPlugin::ApplyOverrideFallback(bool enable)
 {
     if (enable != m_OverrideFallbackActive)
@@ -1403,35 +1743,6 @@ bool FreeJumpPlugin::ShouldFallbackBlockCandidate(AvailableParkourAction* action
         return true;
 
     const int actionType = GetTypeIntSafe(action);
-
-    // Snap Direction: candidates pointing away from the held input are removed
-    // instead of having their fitness zeroed (mirrors ChooseBeforeFiltering).
-    if (m_SnapDirectionMode)
-    {
-        const Vector2f camForward = GetCameraFlatForward();
-        const float camYaw = atan2f(camForward.x, camForward.y);
-        float inputX = 0.0f, inputY = 0.0f;
-        if (GetAsyncKeyState(0x57) & 0x8000) inputY += 1.0f;
-        if (GetAsyncKeyState(0x53) & 0x8000) inputY -= 1.0f;
-        if (GetAsyncKeyState(0x41) & 0x8000) inputX -= 1.0f;
-        if (GetAsyncKeyState(0x44) & 0x8000) inputX += 1.0f;
-        Vector2f inputDir(inputX, inputY);
-        const float len = sqrtf(inputDir.x * inputDir.x + inputDir.y * inputDir.y);
-        if (len > 0.001f)
-        {
-            inputDir.x /= len;
-            inputDir.y /= len;
-            Rotate2D(inputDir.x, inputDir.y, camYaw);
-            Vector4f* dirPtr = (Vector4f*)((uintptr_t)action + 0x70);
-            const float dLen = sqrtf(dirPtr->x * dirPtr->x + dirPtr->y * dirPtr->y);
-            if (dLen >= 0.001f)
-            {
-                const float dot = (dirPtr->x / dLen) * inputDir.x + (dirPtr->y / dLen) * inputDir.y;
-                if (dot < 0.0f)
-                    return true;
-            }
-        }
-    }
 
     // Active overrides.
     for (const ParkourActionOverride& ov : m_Overrides)
@@ -1585,8 +1896,6 @@ void FreeJumpPlugin::OnUpdate()
     // stale-edge class of bug that once made Parkour Mode flip every frame).
     UpdateKeyState(m_ToggleKey);
     UpdateKeyState(m_ToggleKeyPad);
-    UpdateKeyState(m_SnapDirectionKey);
-    UpdateKeyState(m_SnapDirectionKeyPad);
     // Without this refresh, m_KeyPressedThisFrame[m_ParkourModeKey] kept its
     // last value from whenever a rebind-wait last ran (it is only cleared by
     // UpdateKeyState). After the first rebind it stayed true forever, so
@@ -1595,6 +1904,8 @@ void FreeJumpPlugin::OnUpdate()
     // at frame rate.
     UpdateKeyState(m_ParkourModeKey);
     UpdateKeyState(m_ParkourModeKeyPad);
+    UpdateKeyState(m_DiveHotkey);
+    UpdateKeyState(m_DiveHotkeyPad);
     for (const ParkourActionOverride& override : m_Overrides)
     {
         UpdateKeyState(override.keyCode);
@@ -1605,8 +1916,9 @@ void FreeJumpPlugin::OnUpdate()
         m_Overrides.begin(),
         m_Overrides.end(),
         [](const ParkourActionOverride& override) { return override.waitingForKey; });
-    const bool anyRebindWaiting = m_WaitingForKey || m_WaitingForSnapKey
-        || m_WaitingForParkourKey || waitingForOverrideKey;
+    const bool anyRebindWaiting = m_WaitingForKey || m_WaitingForDiveKey
+        || m_WaitingForParkourKey || waitingForOverrideKey
+        || m_WaitingPadBindAction >= 0;
     if (anyRebindWaiting)
         UpdateAllKeyStates();
 
@@ -1682,13 +1994,20 @@ void FreeJumpPlugin::OnUpdate()
             SaveSettings();
         }
     }
-    else if (m_WaitingForSnapKey)
+    else if (m_WaitingPadBindAction >= 0)
     {
-        if (routeFeatureKey(m_SnapDirectionKey, m_SnapDirectionKeyPad))
+        // Parkour Mode per-action pad binding: only pad presses are accepted.
+        // The rebind is started by a UI click, so no mouse-settling logic is
+        // needed here.
+        for (int padCode = 0; padCode < PadCode_COUNT; ++padCode)
         {
-            m_JustCapturedKey = m_UseControllerBindings ? m_SnapDirectionKeyPad : m_SnapDirectionKey;
-            m_WaitingForSnapKey = false;
+            if (!WasKeyPressed(kPadKeyBase + padCode))
+                continue;
+            m_ActionPadBindings[m_WaitingPadBindAction] = kPadKeyBase + padCode;
+            m_JustCapturedKey = kPadKeyBase + padCode;
+            m_WaitingPadBindAction = -1;
             SaveSettings();
+            break;
         }
     }
     else if (m_WaitingForParkourKey)
@@ -1697,6 +2016,15 @@ void FreeJumpPlugin::OnUpdate()
         {
             m_JustCapturedKey = m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey;
             m_WaitingForParkourKey = false;
+            SaveSettings();
+        }
+    }
+    else if (m_WaitingForDiveKey)
+    {
+        if (routeFeatureKey(m_DiveHotkey, m_DiveHotkeyPad))
+        {
+            m_JustCapturedKey = m_UseControllerBindings ? m_DiveHotkeyPad : m_DiveHotkey;
+            m_WaitingForDiveKey = false;
             SaveSettings();
         }
     }
@@ -1721,14 +2049,6 @@ void FreeJumpPlugin::OnUpdate()
         && !MouseBindWouldHitUi(effectiveParkourKey))
     {
         m_ParkourModeOn = !m_ParkourModeOn;
-        SaveSettings();
-    }
-
-    const int effectiveSnapKey = EffectiveSnapDirectionKey();
-    if (WasKeyPressed(effectiveSnapKey) && effectiveSnapKey != m_JustCapturedKey
-        && !MouseBindWouldHitUi(effectiveSnapKey))
-    {
-        m_SnapDirectionMode = !m_SnapDirectionMode;
         SaveSettings();
     }
 
@@ -1784,7 +2104,7 @@ void FreeJumpPlugin::OnUpdate()
         ApplyParkourMode(false);
     }
 
-    const bool needHook = freeJumpHeld || anyOverrideActive || m_SnapDirectionMode;
+    const bool needHook = freeJumpHeld || anyOverrideActive || (m_WallToHangEnabled && IsKeyHeld(EffectiveDiveHotkey()));
 
     // Normal path: our own sort&select replacement runs our ChooseBeforeFiltering
     // callback. When another plugin (ACUFixes' Parkour Helpers, e.g. dive and
@@ -1840,7 +2160,6 @@ void FreeJumpPlugin::OnUpdate()
 void FreeJumpPlugin::OnImGuiRender()
 {
     bool freeMode   = IsKeyHeld(m_ToggleKey);
-    bool snapMode   = m_SnapDirectionMode;
     const ImVec4 activeColor(0.20f, 0.90f, 0.30f, 1.00f);
     const ImVec4 inactiveColor(1.00f, 0.55f, 0.10f, 1.00f);
     const ImVec4 holdColor(0.20f, 0.70f, 1.00f, 1.00f);
@@ -1926,27 +2245,6 @@ void FreeJumpPlugin::OnImGuiRender()
             m_WaitingForKey = !m_WaitingForKey;
             if (m_WaitingForKey)
             {
-                m_WaitingForSnapKey = false;
-                m_WaitingForParkourKey = false;
-                for (ParkourActionOverride& override : m_Overrides)
-                    override.waitingForKey = false;
-            }
-        }
-
-        ImGui::Separator();
-        ImGui::Text("Snap Direction:");
-        ImGui::SameLine();
-        ImGui::TextColored(snapMode ? ImVec4(0.20f,0.60f,0.90f,1.0f) : ImVec4(0.70f,0.70f,0.70f,1.0f),
-                           snapMode ? "ON" : "OFF");
-        ImGui::Text("  Toggle key: %s",
-            KeyCodeLabel(m_UseControllerBindings ? m_SnapDirectionKeyPad : m_SnapDirectionKey).c_str());
-        if (m_WaitingForSnapKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key to bind..."); }
-        if (ImGui::Button(m_WaitingForSnapKey ? "Cancel Rebind" : "Rebind##Snap"))
-        {
-            m_WaitingForSnapKey = !m_WaitingForSnapKey;
-            if (m_WaitingForSnapKey)
-            {
-                m_WaitingForKey = false;
                 m_WaitingForParkourKey = false;
                 for (ParkourActionOverride& override : m_Overrides)
                     override.waitingForKey = false;
@@ -1997,7 +2295,7 @@ void FreeJumpPlugin::OnImGuiRender()
             {
                 if (!(m_DisabledActionMask & (1u << actionIdx)))
                     continue;
-                const int padCode = ResolvePadCodeForAction(actionIdx);
+                const int padCode = ResolvePadCodeForAction(this, actionIdx);
                 if (padCode < 0)
                     continue;
                 const bool fromKeymap = g_PadCodeForAction[actionIdx] >= 0;
@@ -2036,7 +2334,6 @@ void FreeJumpPlugin::OnImGuiRender()
             if (m_WaitingForParkourKey)
             {
                 m_WaitingForKey = false;
-                m_WaitingForSnapKey = false;
                 for (ParkourActionOverride& override : m_Overrides)
                     override.waitingForKey = false;
             }
@@ -2104,9 +2401,44 @@ void FreeJumpPlugin::OnImGuiRender()
                     "resolved to.");
             if (maskChanged)
                 SaveSettings();
+            // Bind a controller button directly to each disabled action (skip
+            // the checkbox and bind straight to the action). Only the ticked
+            // actions show a Bind button.
+            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+            {
+                if (!(m_DisabledActionMask & (1u << actionIdx)) || !*ActionKeyName(actionIdx))
+                    continue;
+                ImGui::Text("%s: ", ActionKeyName(actionIdx));
+                ImGui::SameLine();
+                const int boundPadCode = GetActionPadBinding(actionIdx);
+                if (boundPadCode >= kPadKeyBase)
+                    ImGui::TextColored(holdColor, "button %d", boundPadCode - kPadKeyBase);
+                else
+                    ImGui::TextDisabled("(none)");
+                ImGui::SameLine();
+                const bool isBindingThis = (m_WaitingPadBindAction == actionIdx);
+                if (ImGui::Button(isBindingThis ? "Done" : "Bind"))
+                {
+                    m_WaitingPadBindAction = isBindingThis ? -1 : actionIdx;
+                    if (!isBindingThis)
+                    {
+                        // When binding starts, cancel any other rebind so the
+                        // captured button can't be mistaken for something else.
+                        m_WaitingForKey = false;
+                        m_WaitingForParkourKey = false;
+                        m_WaitingForDiveKey = false;
+                    }
+                    SaveSettings();
+                }
+            }
+            if (m_WaitingPadBindAction >= 0)
+                ImGui::TextColored(rebindColor, "Press a controller button (X=2, Y=3, LB=5, RB=4) ...");
             ImGui::TreePop();
         }
     }
+
+    ImGui::Separator();
+    ImGui::Text("DS4Windows (DualSense via Steam Input / DS4Windows): this plugin reads the controller directly through XInput, so it works regardless of how DS4Windows remaps your physical buttons. The native layout used above (X=Attack/2, Y=EagleVision/3, LB=Aim/5, RB=BombDrop/4) is what the 1.5.0 gamepad mapper writes, which is exactly the DS4Windows virtual pad path. If you bind actions yourself via the Bind buttons above, the plugin hides whatever button you choose, not a hard-coded layout.");
 
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Parkour Action Overrides", ImGuiTreeNodeFlags_DefaultOpen))
@@ -2118,8 +2450,8 @@ void FreeJumpPlugin::OnImGuiRender()
             newOverride.keyCode = VK_F9; // sensible default, user rebinds after
             newOverride.waitingForKey = true; // start in bind mode
             m_WaitingForKey = false;
-            m_WaitingForSnapKey = false;
             m_WaitingForParkourKey = false;
+            m_WaitingPadBindAction = -1;
             for (ParkourActionOverride& override : m_Overrides)
                 override.waitingForKey = false;
             m_Overrides.push_back(newOverride);
@@ -2147,26 +2479,6 @@ void FreeJumpPlugin::OnImGuiRender()
                     : ov.name;
                 if (ImGui::CollapsingHeader(displayName.c_str()))
                 {
-                    // Editable name (inline, right after the status label).
-                    // The buffer is per-render so a never-edited name still shows
-                    // the current value, and Enter commits the edit.
-                    {
-                        ImGui::SetNextItemWidth(220.0f);
-                        static std::string nameBuffer;
-                        nameBuffer = ov.name;
-                        if (ImGui::InputText("##OverrideName", nameBuffer.data(), nameBuffer.size() + 1,
-                                ImGuiInputTextFlags_EnterReturnsTrue))
-                        {
-                            std::string edited(nameBuffer.c_str());
-                            std::replace(edited.begin(), edited.end(), ',', ';');
-                            if (ov.name != edited)
-                            {
-                                ov.name = edited;
-                                SaveSettings();
-                            }
-                        }
-                        ImGui::SameLine();
-                    }
                     if (ImGui::Checkbox("Enable", &ov.enable))
                         SaveSettings();
                     ImGui::SameLine();
@@ -2183,8 +2495,8 @@ void FreeJumpPlugin::OnImGuiRender()
                         if (startWaiting)
                         {
                             m_WaitingForKey = false;
-                            m_WaitingForSnapKey = false;
                             m_WaitingForParkourKey = false;
+                            m_WaitingPadBindAction = -1;
                         }
                     }
                     if (ov.waitingForKey) ImGui::TextColored(rebindColor, "Input key or pad button to bind...");
@@ -2309,38 +2621,6 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
     {
         actions.size = 0;
         return nullptr;
-    }
-
-    // Snap Direction
-    if (m_SnapDirectionMode)
-    {
-        Vector2f camForward = GetCameraFlatForward();
-        float camYaw = atan2f(camForward.x, camForward.y);
-        float inputX = 0.0f, inputY = 0.0f;
-        if (GetAsyncKeyState(0x57) & 0x8000) inputY += 1.0f;
-        if (GetAsyncKeyState(0x53) & 0x8000) inputY -= 1.0f;
-        if (GetAsyncKeyState(0x41) & 0x8000) inputX -= 1.0f;
-        if (GetAsyncKeyState(0x44) & 0x8000) inputX += 1.0f;
-        Vector2f inputDir(inputX, inputY);
-        float len = sqrtf(inputDir.x * inputDir.x + inputDir.y * inputDir.y);
-        if (len > 0.001f)
-        {
-            inputDir.x /= len;
-            inputDir.y /= len;
-            Rotate2D(inputDir.x, inputDir.y, camYaw);
-            for (int i = 0; i < actions.size; ++i)
-            {
-                AvailableParkourAction* action = actions[i];
-                if (!action) continue;
-                Vector4f* dirPtr = (Vector4f*)((uintptr_t)action + 0x70);
-                float dx = dirPtr->x, dy = dirPtr->y;
-                float dLen = sqrtf(dx*dx + dy*dy);
-                if (dLen < 0.001f) continue;
-                float dot = (dx / dLen) * inputDir.x + (dy / dLen) * inputDir.y;
-                if (dot < 0.0f)
-                    *(float*)((uintptr_t)action + 0x204) = 0.0f;
-            }
-        }
     }
 
     // Custom overrides — collect all active override entries

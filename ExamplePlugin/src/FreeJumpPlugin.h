@@ -85,6 +85,12 @@ public:
     void OnImGuiRender();
 
     AvailableParkourAction* ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions);
+    AvailableParkourAction* ChooseAfterSorting(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame);
+
+    // Read by the wall-to-hang hooks: true while the feature is enabled and
+    // the dive hotkey is held (and that hold is not a UI click or a fresh
+    // rebind capture).
+    bool ShouldForceWallToHang() const;
 
     // Read by the parkour-mode suppression callback (FreeJumpPlugin.cpp).
     uint32_t GetDisabledActionMask() const { return m_DisabledActionMask; }
@@ -112,18 +118,36 @@ private:
     int  m_ToggleKey         = VK_XBUTTON1;
     int  m_ToggleKeyPad      = VK_XBUTTON1;
     bool m_WaitingForKey     = false;
-    int  m_SnapDirectionKey  = VK_F8;
-    int  m_SnapDirectionKeyPad = VK_F8;
-    bool m_WaitingForSnapKey = false;
-    bool m_SnapDirectionMode = false;
     bool m_UseControllerBindings = false;
 
-    // Parkour mode: while active, the selected ActionKeyCode entries are forced
+    // Parkour Mode: while active, the selected ActionKeyCode entries are forced
     // unpressed so their physical keys are free to trigger override bindings.
     int  m_ParkourModeKey    = VK_F7;
     int  m_ParkourModeKeyPad = VK_F7;
     bool m_ParkourModeOn     = false;
     bool m_WaitingForParkourKey = false;
+
+    // Per-action controller-button bindings for Parkour Mode. Index by
+    // ActionKeyCode; value is a bindable code (kPadKeyBase+ParkourPadCode) or 0
+    // when the player has not bound one. When set, it is authoritative over
+    // both the game's own keymap and the built-in native-layout defaults, so
+    // the player decides which controller button is freed for which action.
+    std::array<int, 0x20> m_ActionPadBindings{};
+    int m_WaitingPadBindAction = -1;   // UI rebind target, -1 = none
+
+    // Wall-to-Hang (ported from ACUFixes-0.9.3 Parkour Helpers / dive helper).
+    // While the dive hotkey is held, wall-eject-to-hang candidates are created
+    // by hooking the ClimbFacade/BackEject scanners, the climbFacade tester's
+    // fancy vtable is swapped to the sidehop-to-swing variant, the eject-to-hang
+    // acceptance ranges are widened, the backeject RTCP angle is fixed, and the
+    // dive/toHang move takes selection priority.
+    bool m_WallToHangEnabled = true;
+    int  m_DiveHotkey        = VK_XBUTTON2;
+    int  m_DiveHotkeyPad     = 0;
+    bool m_WaitingForDiveKey = false;
+    bool m_WallToHangHooksActive = false;
+    bool m_WallToHangSiteTaken   = false;   // a site is E9-patched by another plugin
+    bool m_WallToHangGphRefused  = false;   // sort&select owned by another plugin
     // Fallback detach of the game's DirectInput/HID pad while Parkour Mode is
     // on. Off by default: it also disables the sticks, and the per-site
     // suppression below already frees pad buttons one by one. The plugin's own
@@ -189,6 +213,8 @@ private:
     // the KBM keymap stage, both gamepad keyStates writers, and the optional
     // pad-device detach (see FreeJumpPlugin.cpp).
     void ApplyParkourMode(bool enable);
+    // Wall-to-Hang site hooks (see FreeJumpPlugin.cpp).
+    void ApplyWallToHang(bool enable);
     // Override fallback used while another plugin owns the sort&select site.
     void ApplyOverrideFallback(bool enable);
 
@@ -200,11 +226,13 @@ public:
     // Binding-profile accessors. Both profiles' key states are refreshed every
     // frame, so switching profiles never leaves a stale rising edge behind.
     int& ActiveToggleKey() { return m_UseControllerBindings ? m_ToggleKeyPad : m_ToggleKey; }
-    int& ActiveSnapDirectionKey() { return m_UseControllerBindings ? m_SnapDirectionKeyPad : m_SnapDirectionKey; }
     int& ActiveParkourModeKey() { return m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey; }
     int EffectiveToggleKey() const { return m_UseControllerBindings ? m_ToggleKeyPad : m_ToggleKey; }
-    int EffectiveSnapDirectionKey() const { return m_UseControllerBindings ? m_SnapDirectionKeyPad : m_SnapDirectionKey; }
     int EffectiveParkourModeKey() const { return m_UseControllerBindings ? m_ParkourModeKeyPad : m_ParkourModeKey; }
+    int EffectiveDiveHotkey() const { return m_UseControllerBindings ? m_DiveHotkeyPad : m_DiveHotkey; }
+    // The pad button bound to an action for Parkour Mode, as a bindable code
+    // (kPadKeyBase+ParkourPadCode), or 0 when unbound.
+    int GetActionPadBinding(int actionIdx) const { return m_ActionPadBindings[actionIdx]; }
     int EffectiveOverrideKey(const ParkourActionOverride& override) const
     {
         return m_UseControllerBindings ? override.padKeyCode : override.keyCode;
