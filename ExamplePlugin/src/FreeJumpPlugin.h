@@ -57,6 +57,19 @@ enum ParkourPadCode
 constexpr int kPadKeyBase = 0x1000;
 constexpr int kMaxBindableKey = kPadKeyBase + PadCode_COUNT;
 
+// A blocked entry may also name a raw GAME PAD SLOT directly
+// (`kPadSlotBase + slot`, slot being the index in the game's own 0x110-byte
+// DirectInput pad state, digital buttons at +0x30). This is what makes the
+// blocked list usable with a controller the plugin itself cannot identify:
+// the entry is measured from what the GAME reports, so it needs no XInput and
+// no assumption about how the pad presents itself. Codes in this range are
+// valid blocked-list entries only - they are deliberately NOT bindable for the
+// other features (Free Jump, overrides, ...), which are bound to physical
+// buttons by the player.
+constexpr int kPadSlotBase = 0x2000;
+constexpr int kMaxPadSlot = 0xDF;   // 0x110-byte state minus the axes/POV at +0x20
+constexpr int kMaxBlockedKey = kPadSlotBase + kMaxPadSlot;
+
 // The game maps raw keyboard/mouse input to 32 ActionKeyCode entries per frame
 // (ActionKeyCode::ACTION_SET_SIZE == 0x20 in Enum_ActionKeyCode.h).
 constexpr int kActionKeyCount = 0x20;
@@ -113,11 +126,18 @@ public:
     // button occupies at the moment the player assigns it.
     void NoteGamePadState(const uint8_t* padState);   // the 0x110-byte DirectInput state
     void LearnPadSlotWhileWaiting();
+    void LearnPadSlotsFromHeldButtons();
+    int GetRisingGamePadSlot() const;
     int GetLearnedPadSlot(int bindablePadCode) const;
+    std::vector<int> GetLearnedPadSlots(int blockedKeyCode) const;
     void RememberLearnedPadSlot(int bindablePadCode, int gameSlot);
+    bool RememberBlockedKey(int blockedKeyCode);
     // True while the player is assigning a blocked button, which is when the
     // pad seams have to run even with nothing to block (see LearnPadSlotWhileWaiting).
     bool IsBlockedKeyCapturePending() const { return m_WaitingForBlockedKey; }
+    // Installs the observation seams with nothing to block, i.e. the
+    // diagnostics switch above.
+    bool IsWatchingGamePadInput() const { return m_WatchGamePadInput; }
 private:
     void UpdateKeyState(int bindableKeyCode);
     void UpdateAllKeyStates();
@@ -152,14 +172,22 @@ private:
     bool m_WaitingForParkourKey = false;
 
     // Parkour Mode: the physical buttons the game must not see while the mode is
-    // ON. Bindable codes: keyboard/mouse Win32 virtual keys (0x01..0xFE, mouse
-    // buttons included) and controller codes (kPadKeyBase+ParkourPadCode).
+    // ON. Keyboard/mouse Win32 virtual keys (0x01..0xFE, mouse buttons
+    // included), controller codes (kPadKeyBase+ParkourPadCode) and - for a
+    // controller the plugin itself cannot identify, e.g. a raw DualSense with no
+    // XInput to read - raw game pad slots (kPadSlotBase+slot), which are
+    // measured from what the game itself reports.
     // Persisted as decimal codes separated by `|` in `ParkourBlockedKeys=`.
     // Defaults are the physical keys the game binds attack/aim/crouch to by
     // default (left and right mouse button + Left Ctrl), so a fresh install
     // behaves like the old pre-selected checkbox set without any setup.
     std::vector<int> m_UserBlockedKeys{ VK_LBUTTON, VK_RBUTTON, VK_LCONTROL };
     bool m_WaitingForBlockedKey = false;   // UI rebind target, false = none
+    // Optional diagnostics-only observation of the game's pad input, so the
+    // player can see what the game's own device layer reports for a controller
+    // even when nothing is blocked. Off by default: the observation seams are
+    // hooks, and this codebase only installs them when the feature runs.
+    bool m_WatchGamePadInput = false;
 
     // Parkour Mode controller-slot learning. Slot -1 means the built-in table
     // is all we have; a measured value always wins. Kept per controller code,

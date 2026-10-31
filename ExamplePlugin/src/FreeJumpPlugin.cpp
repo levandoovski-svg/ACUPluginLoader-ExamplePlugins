@@ -127,6 +127,38 @@ namespace
         return bindableKeyCode >= kPadKeyBase && bindableKeyCode < kPadKeyBase + PadCode_COUNT;
     }
 
+    // A blocked entry may name a raw game pad slot directly, which is the only
+    // form that works for a controller the plugin cannot identify (no XInput
+    // device for it to poll).
+    bool IsPadSlotCode(int blockedKeyCode)
+    {
+        return blockedKeyCode >= kPadSlotBase && blockedKeyCode < kPadSlotBase + kMaxPadSlot;
+    }
+
+    int PadSlotOf(int blockedKeyCode)
+    {
+        return IsPadSlotCode(blockedKeyCode) ? blockedKeyCode - kPadSlotBase : -1;
+    }
+
+    // The plugin's own name for a game pad slot, from the device-6 mapper table
+    // (slot 0 = A, 1 = B, 2 = X, 3 = Y, 4 = RB, 5 = LB, 6 = Start, 7 = Back).
+    // Defined after PadCodeName, which it uses for the label.
+
+    // Valid entries for the Parkour Mode block list. Wider than
+    // IsValidBindableKey on purpose: the extra range is not bindable by the
+    // player for any other feature, it is what the measurement produces.
+    bool IsValidBlockedKey(int blockedKeyCode)
+    {
+        return IsValidBindableKey(blockedKeyCode) || IsPadSlotCode(blockedKeyCode);
+    }
+
+    // The plugin's own name for a game pad slot, from the device-6 mapper table
+    // (slot 0 = A, 1 = B, 2 = X, 3 = Y, 4 = RB, 5 = LB, 6 = Start, 7 = Back).
+    // On a pad whose physical layout differs the name is the game's mapping of
+    // that slot, not the physical label - which is why it is a hint, and why the
+    // measured slot is what actually gets cleared.
+    const char* PadSlotName(int gameSlot);   // defined after PadCodeName
+
     // XInput is loaded dynamically: the loader environment may predate
     // xinput1_4.dll, and no XInput import library is linked into the plugin.
     // The game itself imports xinput1_3.dll, so an XInput-capable pad is already
@@ -298,6 +330,17 @@ namespace
         if (mouseName)
             label << " (" << mouseName << ")";
         return label.str();
+    }
+
+    const char* PadSlotName(int gameSlot)
+    {
+        static constexpr ParkourPadCode kSlotToPadCode[] = {
+            PadCode_A, PadCode_B, PadCode_X, PadCode_Y, PadCode_RB, PadCode_LB,
+            PadCode_START, PadCode_BACK,
+        };
+        if (gameSlot < 0 || gameSlot >= 8)
+            return "";
+        return PadCodeName(kPadKeyBase + kSlotToPadCode[gameSlot]);
     }
 
     // LMB/RMB (and the other mouse buttons) are bindable. While the loader
@@ -654,29 +697,42 @@ namespace
         owner->NoteGamePadState(padState);
     }
 
+    // Clears a single slot of a 0x110-byte DirectInput pad state.
+    void ClearPadSnapshotSlot(uint8_t* padState, int gameSlot)
+    {
+        if (gameSlot < 0 || gameSlot >= kMaxPadSlot)
+            return;
+        // Clear the whole byte, not just bit 7, so the button is not merely
+        // unpressed but indistinguishable from "never touched this frame".
+        padState[0x30 + gameSlot] = 0;
+    }
+
     // Clears every blocked controller entry from a 0x110-byte DirectInput pad
-    // state. A controller code whose slot was MEASURED uses that slot; anything
-    // else falls back to the built-in table. A slot that cannot be resolved is
-    // skipped rather than guessed at.
+    // state. A controller code clears every slot MEASURED for it (the same
+    // physical button sits at different slots under different emulations, so a
+    // code can legitimately have several) and falls back to the built-in table
+    // only when it has none yet. A raw-slot entry clears exactly its slot. A
+    // slot that cannot be resolved is skipped rather than guessed at.
     void ClearBlockedPadButtons(const FreeJumpPlugin* owner, AllRegisters* params,
                                 uint8_t* padState)
     {
         if (!owner || !padState || !IsParkourBlockingActive())
             return;
-        for (const int bindableKeyCode : owner->GetBlockedKeys())
+        for (const int blockedKeyCode : owner->GetBlockedKeys())
         {
-            const BlockedInputSlot slot = ComputeBlockedInputSlot(bindableKeyCode);
+            const BlockedInputSlot slot = ComputeBlockedInputSlot(blockedKeyCode);
             if (slot.kind == BlockedInputKind::PadSnapshotButton)
             {
-                const int gameSlot = owner->GetLearnedPadSlot(bindableKeyCode);
-                const int effectiveSlot = gameSlot >= 0 ? gameSlot : slot.slot;
-                if (effectiveSlot >= 0 && effectiveSlot < 0xE0)
+                // Every measured slot first ...
+                bool clearedAnyMeasured = false;
+                for (int gameSlot : owner->GetLearnedPadSlots(blockedKeyCode))
                 {
-                    // Clear the whole byte, not just bit 7, so the button is
-                    // not merely unpressed but indistinguishable from "not
-                    // touched this frame".
-                    padState[0x30 + effectiveSlot] = 0;
+                    ClearPadSnapshotSlot(padState, gameSlot);
+                    clearedAnyMeasured = true;
                 }
+                // ... the built-in table only when nothing was ever measured.
+                if (!clearedAnyMeasured)
+                    ClearPadSnapshotSlot(padState, slot.slot);
             }
             else if (slot.kind == BlockedInputKind::PadSnapshotHat)
             {
@@ -684,6 +740,10 @@ namespace
                 // keymap fill and the mapper (0/9000/18000/27000) fails against
                 // it, which is what frees all four d-pad directions at once.
                 *reinterpret_cast<uint32_t*>(padState + 0x20) = 0xFFFFFFFFu;
+            }
+            else if (const int rawSlot = PadSlotOf(blockedKeyCode); rawSlot >= 0)
+            {
+                ClearPadSnapshotSlot(padState, rawSlot);
             }
         }
     }
@@ -1289,27 +1349,101 @@ void FreeJumpPlugin::LearnPadSlotWhileWaiting()
     // button occupies on this controller - measured, not assumed, which is
     // exactly what makes this survive DS4Windows being on or off (or any other
     // emulator renumbering the buttons the game is handed).
-    // m_PadDown is refreshed before this runs and m_KeyPressedThisFrame holds
-    // this frame's rising edges for every bindable code (updated for pad codes
-    // by UpdateAllKeyStates, which any pending rebind triggers). Prefer that
-    // over m_PadPreviousDown, which is never written.
+    // m_KeyPressedThisFrame holds this frame's rising edges for every bindable
+    // code, computed for pad codes from m_PadDown (the XInput poll) by
+    // UpdateAllKeyStates, which any pending rebind triggers. So the plugin sees
+    // a pad press only when XInput has the device - which is exactly why the
+    // fallback below matters.
+    //
+    // When the plugin cannot see the pad at all (a raw DualSense with
+    // DS4Windows in DS4 output mode exposes no XInput device), there is no
+    // plugin-side press to name the button - but the game's own state still
+    // says which slot just rose, and that is enough: the entry is created for
+    // the slot itself, with no assumption about which button it is.
+    bool pressedByPlugin = false;
     int pressedPadCode = 0;
-    for (int padCode = 0; padCode < PadCode_COUNT && !pressedPadCode; ++padCode)
+    for (int padCode = 0; padCode < PadCode_COUNT; ++padCode)
     {
-        if (m_KeyPressedThisFrame[kPadKeyBase + padCode])
-            pressedPadCode = kPadKeyBase + padCode;
+        if (!m_KeyPressedThisFrame[kPadKeyBase + padCode])
+            continue;
+        pressedByPlugin = true;
+        pressedPadCode = kPadKeyBase + padCode;
+        break;
+    }
+    if (!pressedByPlugin)
+    {
+        const int risingSlot = GetRisingGamePadSlot();
+        if (risingSlot >= 0)
+            RememberBlockedKey(kPadSlotBase + risingSlot);
+        return;
+    }
+    const int risingSlot = GetRisingGamePadSlot();
+    if (risingSlot >= 0)
+        RememberLearnedPadSlot(pressedPadCode, risingSlot);
+}
+
+void FreeJumpPlugin::LearnPadSlotsFromHeldButtons()
+{
+    // Parkour Mode is ON and the plugin can see the pad (XInput). Every press of
+    // an already-blocked controller button re-measures which slot the game
+    // reports it as, so a stored measurement taken under one emulation stays
+    // correct when the emulation changes - the very DS4Windows/Xbox360 switch
+    // that made blocking mode-dependent. Only a slot that rose in the same
+    // frame as the plugin's own rising edge is accepted, so a second button
+    // held at the same time cannot be mis-attributed.
+    if (!m_GamePadObservedThisFrame)
+        return;
+    int pressedPadCode = 0;
+    for (int padCode = 0; padCode < PadCode_COUNT; ++padCode)
+    {
+        if (!m_KeyPressedThisFrame[kPadKeyBase + padCode])
+            continue;
+        pressedPadCode = kPadKeyBase + padCode;
+        break;
     }
     if (!pressedPadCode)
         return;
-    for (int slot = 0x30; slot < 0xE0; ++slot)
+    if (std::find(m_UserBlockedKeys.begin(), m_UserBlockedKeys.end(), pressedPadCode)
+        == m_UserBlockedKeys.end())
+        return;
+    const int risingSlot = GetRisingGamePadSlot();
+    if (risingSlot >= 0)
+        RememberLearnedPadSlot(pressedPadCode, risingSlot);
+}
+
+// The game's pad slot that went from released to pressed in the currently
+// observed frame, or -1 when there is none. This is the measurement primitive:
+// it needs no XInput, no emulator knowledge and no table.
+static int GetRisingGamePadSlotHelper(const std::array<uint8_t, 0x110>& cur,
+                                      const std::array<uint8_t, 0x110>& prev)
+{
+    for (int slot = 0; slot < kMaxPadSlot; ++slot)
     {
-        const bool pressedNow = (m_GamePadSnapshot[slot] & 0x80) != 0;
-        const bool pressedLast = (m_GamePadSnapshotPrev[slot] & 0x80) != 0;
-        if (!pressedNow || pressedLast)
-            continue;
-        RememberLearnedPadSlot(pressedPadCode, slot - 0x30);
-        break;   // one press, one button: the first rising slot is the one
+        const bool pressedNow = (cur[0x30 + slot] & 0x80) != 0;
+        const bool pressedLast = (prev[0x30 + slot] & 0x80) != 0;
+        if (pressedNow && !pressedLast)
+            return slot;
     }
+    return -1;
+}
+
+int FreeJumpPlugin::GetRisingGamePadSlot() const
+{
+    if (!m_GamePadObservedThisFrame)
+        return -1;
+    return GetRisingGamePadSlotHelper(m_GamePadSnapshot, m_GamePadSnapshotPrev);
+}
+
+// Adds a blocked key, deduplicated. Returns true when the list changed.
+bool FreeJumpPlugin::RememberBlockedKey(int blockedKeyCode)
+{
+    if (!IsValidBlockedKey(blockedKeyCode))
+        return false;
+    if (std::find(m_UserBlockedKeys.begin(), m_UserBlockedKeys.end(), blockedKeyCode)
+        != m_UserBlockedKeys.end())
+        return false;
+    m_UserBlockedKeys.push_back(blockedKeyCode);
+    return true;
 }
 
 int FreeJumpPlugin::GetLearnedPadSlot(int bindablePadCode) const
@@ -1322,21 +1456,32 @@ int FreeJumpPlugin::GetLearnedPadSlot(int bindablePadCode) const
     return -1;
 }
 
+std::vector<int> FreeJumpPlugin::GetLearnedPadSlots(int blockedKeyCode) const
+{
+    // Every slot ever measured for this entry: the same physical button sits at
+    // different slots under different emulations (and after an emulator
+    // restart), and clearing all of them keeps blocking correct in each without
+    // re-measuring in every mode first.
+    std::vector<int> slots;
+    for (const std::pair<int, int>& learned : m_LearnedPadSlots)
+    {
+        if (learned.first == blockedKeyCode
+            && std::find(slots.begin(), slots.end(), learned.second) == slots.end())
+        {
+            slots.push_back(learned.second);
+        }
+    }
+    return slots;
+}
+
 void FreeJumpPlugin::RememberLearnedPadSlot(int bindablePadCode, int gameSlot)
 {
-    if (gameSlot < 0 || gameSlot >= 0xE0)
+    if (gameSlot < 0 || gameSlot >= kMaxPadSlot)
         return;
     for (std::pair<int, int>& learned : m_LearnedPadSlots)
     {
-        if (learned.first == bindablePadCode)
-        {
-            if (learned.second != gameSlot)
-            {
-                learned.second = gameSlot;
-                SaveSettings();
-            }
-            return;
-        }
+        if (learned.first == bindablePadCode && learned.second == gameSlot)
+            return;   // already known
     }
     m_LearnedPadSlots.push_back({ bindablePadCode, gameSlot });
     SaveSettings();
@@ -1368,12 +1513,17 @@ std::string FreeJumpPlugin::DescribeBlockedInputTarget(int bindableKeyCode)
     }
     case BlockedInputKind::PadSnapshotButton:
     {
-        char detail[64] = {};
+        char detail[128] = {};
         if (const FreeJumpPlugin* self = g_ParkourModeInstance)
         {
-            const int measured = self->GetLearnedPadSlot(bindableKeyCode);
-            if (measured >= 0)
-                snprintf(detail, sizeof(detail), "game slot %d (measured)", measured);
+            const std::vector<int> measured = self->GetLearnedPadSlots(bindableKeyCode);
+            if (!measured.empty())
+            {
+                std::string slots = std::to_string(measured.front());
+                for (size_t i = 1; i < measured.size(); ++i)
+                    slots += "/" + std::to_string(measured[i]);
+                snprintf(detail, sizeof(detail), "game slot %s (measured)", slots.c_str());
+            }
         }
         if (!*detail)
             snprintf(detail, sizeof(detail), "game slot %d", slot.slot);
@@ -1384,9 +1534,28 @@ std::string FreeJumpPlugin::DescribeBlockedInputTarget(int bindableKeyCode)
     case BlockedInputKind::PadSnapshotHat:
         where << "controller d-pad (all four directions)";
         break;
-    default:
+    case BlockedInputKind::Unsupported:
+    {
+        // The last possibility is a raw game pad slot, which is not derived
+        // from a plugin pad code at all: the measurement produced it from what
+        // the game itself reported, for a controller the plugin cannot name.
+        const int rawSlot = PadSlotOf(bindableKeyCode);
+        if (rawSlot >= 0)
+        {
+            const char* slotName = PadSlotName(rawSlot);
+            if (*slotName)
+            {
+                char detail[80] = {};
+                snprintf(detail, sizeof(detail), "game pad slot %d (%s)", rawSlot, slotName);
+                return detail;
+            }
+            char detail[64] = {};
+            snprintf(detail, sizeof(detail), "game pad slot %d", rawSlot);
+            return detail;
+        }
         return "NOT blocked - the game reads this control as an analog axis, "
                "which this build does not map";
+    }
     }
     return where.str();
 }
@@ -1445,6 +1614,12 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseBool(value, enabled))
                 m_ParkourModeOn = enabled;
         }
+        else if (TryGetValue(trimmedLine, "WatchGamePadInput=", value))
+        {
+            bool enabled = false;
+            if (TryParseBool(value, enabled))
+                m_WatchGamePadInput = enabled;
+        }
         else if (TryGetValue(trimmedLine, "DetachPadFallback=", value))
         {
             bool enabled = false;
@@ -1494,7 +1669,7 @@ void FreeJumpPlugin::LoadSettings()
             for (const std::string_view keyToken : Split(value, '|'))
             {
                 int code = 0;
-                if (TryParseInteger(keyToken, 10, code) && IsValidBindableKey(code))
+                if (TryParseInteger(keyToken, 10, code) && IsValidBlockedKey(code))
                     loadedBlockedKeys.push_back(code);
             }
             hasBlockedKeys = true;
@@ -1580,6 +1755,7 @@ void FreeJumpPlugin::SaveSettings()
     file << "ParkourModeKeyPad=" << std::hex << m_ParkourModeKeyPad << std::dec << "\n";
     file << "ParkourModeOn=" << (m_ParkourModeOn ? 1 : 0) << "\n";
     file << "DetachPadFallback=" << (m_BlockPadWhileParkour ? 1 : 0) << "\n";
+    file << "WatchGamePadInput=" << (m_WatchGamePadInput ? 1 : 0) << "\n";
     // Parkour Mode's blocked buttons, as decimal bindable codes. Keyboard/mouse
     // keys and controller codes are both written, so a controller assignment
     // survives a restart exactly as it was assigned.
@@ -2143,6 +2319,11 @@ void FreeJumpPlugin::OnUpdate()
         // pad state for the same frame.
         LearnPadSlotWhileWaiting();
     }
+    // Parkour Mode ON: every press of an already-blocked controller button
+    // re-measures its slot, so the blocking follows the controller's current
+    // emulation instead of the one it was first measured under.
+    if (m_ParkourModeOn && !m_UserBlockedKeys.empty())
+        LearnPadSlotsFromHeldButtons();
 
     // A rebind is always started by clicking a UI button, i.e. with a mouse
     // button. The starting click itself must not be captured as the new
@@ -2222,14 +2403,13 @@ void FreeJumpPlugin::OnUpdate()
         // Keyboard keys, mouse buttons and pad buttons are all assignable; the
         // usual rebind guards (release latch for LMB/RMB) come from captureKey,
         // so the click that started this rebind cannot capture itself.
+        // A controller the plugin cannot see (no XInput device) is handled by
+        // LearnPadSlotWhileWaiting, which reads the game's own pad state and
+        // creates the raw-slot entry itself; this branch keeps the keyboard,
+        // mouse and XInput-visible pad cases.
         int captured = 0;
-        if (captureKey(captured))
+        if (captureKey(captured) && RememberBlockedKey(captured))
         {
-            if (std::find(m_UserBlockedKeys.begin(), m_UserBlockedKeys.end(), captured)
-                == m_UserBlockedKeys.end())
-            {
-                m_UserBlockedKeys.push_back(captured);
-            }
             m_JustCapturedKey = captured;
             m_WaitingForBlockedKey = false;
             SaveSettings();
@@ -2319,7 +2499,7 @@ void FreeJumpPlugin::OnUpdate()
     // slot that button occupies requires watching the game's pad state, which
     // is exactly what these hooks observe.
     const bool wantParkourHook = m_ParkourModeOn && !m_UserBlockedKeys.empty();
-    const bool wantPadWatch = m_WaitingForBlockedKey;
+    const bool wantPadWatch = m_WaitingForBlockedKey || m_WatchGamePadInput;
     const bool wantParkourSeams = wantParkourHook || wantPadWatch;
     const bool anyParkourSuppressActive =
         m_KbmFillSuppressActive || m_PadPollSanitizeActive
@@ -2540,12 +2720,29 @@ void FreeJumpPlugin::OnImGuiRender()
         }
         if (!m_LearnedPadSlots.empty())
         {
-            ImGui::TextDisabled("   measured controller mapping:");
+            ImGui::TextDisabled("   measured controller mapping (one line per slot):");
             for (const std::pair<int, int>& learned : m_LearnedPadSlots)
             {
                 ImGui::TextDisabled("      %s -> game slot %d",
                                     KeyCodeLabel(learned.first).c_str(), learned.second);
             }
+        }
+        // Slots blocked by measurement rather than by name, i.e. the entries
+        // that work for a controller the plugin itself cannot identify.
+        bool anyRawSlotBlocked = false;
+        for (const int blocked : m_UserBlockedKeys)
+        {
+            const int rawSlot = IsPadSlotCode(blocked) ? blocked - kPadSlotBase : -1;
+            if (rawSlot < 0)
+                continue;
+            if (!anyRawSlotBlocked)
+            {
+                ImGui::TextDisabled("   blocked by measured slot (works without XInput):");
+                anyRawSlotBlocked = true;
+            }
+            const char* slotName = PadSlotName(rawSlot);
+            ImGui::TextDisabled("      game pad slot %d -> %s", rawSlot,
+                                *slotName ? slotName : "(unnamed)");
         }
         ImGui::Text("  Toggle key: %s", KeyCodeLabel(EffectiveParkourModeKey()).c_str());
         if (m_WaitingForParkourKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key or pad button to bind..."); }
@@ -2624,6 +2821,10 @@ void FreeJumpPlugin::OnImGuiRender()
                 "Stick directions and the triggers cannot be blocked (the game reads them as "
                 "analog axes); every other keyboard key, mouse button, controller button and "
                 "the d-pad can.");
+            ImGui::TextDisabled(
+                "Assigning a button also measures which slot the GAME reports it as, so blocking "
+                "follows the controller's current setup - including DS4Windows's Xbox 360 vs "
+                "DS4 output mode.");
             ImGui::TreePop();
         }
         bool blockPad = m_BlockPadWhileParkour;
@@ -2633,6 +2834,17 @@ void FreeJumpPlugin::OnImGuiRender()
             SaveSettings();
             if (m_ParkourModeOn)
                 ApplyParkourMode(false), ApplyParkourMode(true);
+        }
+        // The diagnostics switch. With this on, the observation seams are
+        // installed even with nothing blocked, so the "game sees" line reports
+        // what the game's own device layer produces for a controller - the one
+        // fact that decides whether blocking can work at all, and the first
+        // thing to check when a blocked button is still reaching the game.
+        bool watchPad = m_WatchGamePadInput;
+        if (ImGui::Checkbox("Watch the game's pad input (diagnostics)", &watchPad))
+        {
+            m_WatchGamePadInput = watchPad;
+            SaveSettings();
         }
     }
 
