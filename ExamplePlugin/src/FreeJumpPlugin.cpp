@@ -2417,34 +2417,20 @@ void FreeJumpPlugin::OnImGuiRender()
         ImGui::Text("  Toggle key: %s", KeyCodeLabel(EffectiveParkourModeKey()).c_str());
         if (ImGui::TreeNode("User Blocked Keys"))
         {
-            bool changed = false;
             for (int i = 0; i < (int)m_UserBlockedKeys.size(); ++i)
             {
                 int code = m_UserBlockedKeys[i];
                 std::string label = KeyCodeLabel(code);
-                if (ImGui::Checkbox(label.c_str(), &code))
-                {
-                    if (code)
-                        m_UserBlockedKeys[i] = code;
-                    else
-                    {
-                        m_UserBlockedKeys.erase(m_UserBlockedKeys.begin() + i);
-                        --i;
-                    }
-                    changed = true;
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::TextDisabled("Blocks this key when parkour mode is ON, regardless of profile.");
+                ImGui::TextUnformatted(label.c_str());
                 ImGui::SameLine();
                 if (ImGui::Button(("Remove##UserBlocked" + std::to_string(i)).c_str()))
                 {
                     m_UserBlockedKeys.erase(m_UserBlockedKeys.begin() + i);
-                    changed = true;
+                    SaveSettings();
                     break;
                 }
             }
-            if (changed)
-                SaveSettings();
+            ImGui::SameLine();
             if (ImGui::Button("Add key to block..."))
             {
                 m_WaitingForKey = true;
