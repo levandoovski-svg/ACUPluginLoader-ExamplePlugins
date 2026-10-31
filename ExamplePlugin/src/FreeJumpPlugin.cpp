@@ -163,41 +163,96 @@ namespace
         return cached;
     }
 
-    const char* ActionKeyName(int actionIdx)
+    // ── Parkour Mode: how a blocked button maps onto the game's raw input ──
+    // Parkour Mode blocks *buttons*, not in-game actions, so a blocked entry is
+    // described as "which byte of the game's own this-frame input buffer is
+    // cleared". Both blockers act the moment their buffer has just been filled
+    // and before any consumer reads it, so nothing downstream (the keymap fill,
+    // the pad keymap/mapper, the bool→float mirrors, edge and hold detection)
+    // can observe the button at all.
+    enum class BlockedInputKind
     {
-        static const char* names[kActionKeyCount] = {
-            "ParkourUp (Space)",
-            "LMB (Attack)",
-            "EagleVision",
-            "ParkourDownInteract",
-            "Disguise",
-            "Numpad4 CycleLeftHand",
-            "Medicine",
-            "Numpad6 CycleBombs",
-            "Map",
-            "Escape",
-            "Crouch",
-            "RMB (Aim)",
-            "Sprint",
-            "BombDrop",
-            "Reload",
-            "CenterCamera",
-            "SlotPhantom",
-            "SlotBerserk",
-            "SlotGun",
-            "SlotSmokeBomb",
-            "SlotStunBomb",
-            "SlotCherryBomb",
-            "SlotPoisonBomb",
-            "SlotMoneyPouch",
-            "Slot9_booster",
-        };
-        if (actionIdx < 0 || actionIdx >= kActionKeyCount)
-            return "";
-        // Slots beyond the initializer list are nullptr; dereferencing them
-        // crashed the disabled-actions UI the moment its tree was opened.
-        const char* name = names[actionIdx];
-        return name ? name : "";
+        KeyboardScancode,   // DirectInput keyboard state byte, bit 7 = pressed
+        MouseButton,        // DIMOUSESTATE rgbButtons[i] at mouseState + 0xC
+        PadSnapshotButton,  // pad snapshot byte at +0x30 + slot
+        PadSnapshotHat,     // pad snapshot POV dword at +0x20 (d-pad)
+        Unsupported,        // no known slot in the game's buffers; nothing cleared
+    };
+    struct BlockedInputSlot
+    {
+        BlockedInputKind kind = BlockedInputKind::Unsupported;
+        int slot = -1;   // byte index inside the buffer named by `kind`
+    };
+
+    // Keyboard: the keymap fill indexes the DirectInput keyboard state (the
+    // 256-byte buffer the keyboard poll writes) by scancode, with the usual
+    // left/right-agnostic special cases (0x1D/0x9D ctrl, 0x2A/0x36 shift,
+    // 0x38/0xB8 alt, 0x0F tab). MapVirtualKeyA produces exactly those codes, so
+    // blocking "Left Ctrl" clears 0x1D and leaves "Right Ctrl" (0x9D) live —
+    // the player blocks precisely the button he assigned, nothing wider.
+    BlockedInputSlot ComputeKeyboardSlot(int bindableKeyCode)
+    {
+        const UINT scancode = MapVirtualKeyA((UINT)bindableKeyCode, MAPVK_VK_TO_VSC);
+        if (scancode == 0 || scancode > 0xFF)
+            return {};
+        return { BlockedInputKind::KeyboardScancode, static_cast<int>(scancode) };
+    }
+
+    // Mouse: the keymap fill reads `mouseState[0xC + buttonIndex]` for a type-2
+    // (mouse) entry, i.e. DirectInput's DIMOUSESTATE rgbButtons: 0 = left,
+    // 1 = right, 2 = middle, 3 = X1, 4 = X2 (the poll asks for the 0x14-byte
+    // variant, which has room for 8).
+    BlockedInputSlot ComputeMouseButtonSlot(int bindableKeyCode)
+    {
+        switch (bindableKeyCode)
+        {
+        case VK_LBUTTON:  return { BlockedInputKind::MouseButton, 0 };
+        case VK_RBUTTON:  return { BlockedInputKind::MouseButton, 1 };
+        case VK_MBUTTON:  return { BlockedInputKind::MouseButton, 2 };
+        case VK_XBUTTON1: return { BlockedInputKind::MouseButton, 3 };
+        case VK_XBUTTON2: return { BlockedInputKind::MouseButton, 4 };
+        default: break;
+        }
+        return {};
+    }
+
+    // Controller: the plugin's ParkourPadCode -> the game's pad snapshot slot.
+    // The digital buttons follow the game's own device-6 (Xbox-style) mapper
+    // table, dump-proven from ACU 1.5.0: slot 0 = A, 1 = B, 2 = X, 3 = Y,
+    // 4 = RB, 5 = LB, 6 = Start, 7 = Back; L3/R3 extend the same table.
+    // The d-pad is not a button there: it is the hat dword at +0x20 that the
+    // mapper compares against 0/9000/18000/27000, and 0xFFFFFFFF is
+    // DirectInput's "centered" value, which every direction test rejects.
+    BlockedInputSlot ComputePadSnapshotSlot(int bindableKeyCode)
+    {
+        using K = BlockedInputKind;
+        if (!IsPadCode(bindableKeyCode))
+            return {};
+        switch (bindableKeyCode - kPadKeyBase)
+        {
+        case PadCode_A:     return { K::PadSnapshotButton, 0 };
+        case PadCode_B:     return { K::PadSnapshotButton, 1 };
+        case PadCode_X:     return { K::PadSnapshotButton, 2 };
+        case PadCode_Y:     return { K::PadSnapshotButton, 3 };
+        case PadCode_RB:    return { K::PadSnapshotButton, 4 };
+        case PadCode_LB:    return { K::PadSnapshotButton, 5 };
+        case PadCode_START: return { K::PadSnapshotButton, 6 };
+        case PadCode_BACK:  return { K::PadSnapshotButton, 7 };
+        case PadCode_L3:    return { K::PadSnapshotButton, 8 };
+        case PadCode_R3:    return { K::PadSnapshotButton, 9 };
+        case PadCode_DPAD_UP:
+        case PadCode_DPAD_DOWN:
+        case PadCode_DPAD_LEFT:
+        case PadCode_DPAD_RIGHT:
+            return { K::PadSnapshotHat, 0 };
+        default:
+            break;
+        }
+        // Triggers and stick directions: the game derives those actions from
+        // the snapshot's analog axis dwords, which this build has not mapped.
+        // Clearing an unknown byte would risk hiding the wrong button, so the
+        // entry is reported and skipped instead of being guessed at.
+        return {};
     }
 
     const char* PadCodeName(int bindableKeyCode)
@@ -398,195 +453,136 @@ namespace
         return owner->ShouldFallbackBlockCandidate(action) ? 1 : 0;
     }
 
-    // ── Parkour mode: action-key suppression ──────────────────────
-    // Parkour Mode frees buttons by forcing the selected ActionKeyCode entries
-    // of InputContainerBig unpressed (keyStates_thisFrame, +0x30, 32 bytes).
-    // The game writes those same 32 bytes THREE times per frame, and a single
-    // hook after the first write can only ever cover the first one:
+    // ── Parkour mode: block the player's assigned buttons ─────────────
     //
-    //   0x14273B2B0  keyboard/mouse keymap fill      (called at 0x14273BC70)
-    //   → site K, 0x14273BC7B                        (zero here: keyboard/mouse)
-    //   0x14273C190  mouse vectors + bool→float conversion
-    //   …
-    //   0x14273BE10  gamepad stage — a separate function, so it always runs
-    //                after everything above and rewrites keyStates again:
-    //                  device id 9 → keymap fill 0x14273B390, then
-    //                                → site P, 0x14273BEC5
-    //                                → 0x14273C4C0 and the bool→float conversion
-    //                  any other id → jmp 0x142739E40 (hard-coded per-device
-    //                                mapper; its case bodies write
-    //                                keyStates[0..15] directly), cases converge
-    //                                at 0x14273A71E, then
-    //                                → site M, 0x14273A726
-    //                                → bool→float conversion at 0x14273A736
+    // Parkour Mode no longer ticks in-game actions off a list. The player
+    // assigns BUTTONS (keyboard keys, mouse buttons, controller buttons), and
+    // each assigned button is erased from the game's own copy of this frame's
+    // raw input before anything reads it. That is what makes the assignment
+    // reliable: an in-game binding to a blocked key cannot fire regardless of
+    // which ActionKeyCode it drives, whether the player rebound it, or whether
+    // the game reaches that key through its keyboard, mouse or controller
+    // bindings — and the plugin's own polling (Win32 GetAsyncKeyState and its
+    // independent XInput reader) is untouched, so the same button can drive a
+    // parkour trigger at the very same moment.
     //
-    // That ordering is why controller buttons stayed live through the builds
-    // that only hooked site K: the pad stage resurrected the cleared bytes a
-    // few hundred instructions later. Both pad sites sit *before* their own
-    // stage's bool→float conversion, so zeroing there also zeroes the
-    // fltIsPressed_LMB/RMB/Reload mirrors (+0x274/+0x29C/+0x2A8) that a pad
-    // drives through its triggers — those floats are computed from these very
-    // bytes by the loop at 0x14273BED7 / 0x14273A742.
+    // Two seams, each one at the single point where the game's copy of a
+    // device's state is created:
     //
-    // Register/byte evidence (ACU 1.5.0 dump, `MODLOG/scripts`): all three
-    // sites execute with rbx = InputContainerBig* (set at 0x14273BAxx /
-    // 0x14273BE24 / 0x142739E57; each function only restores rbx after the
-    // site), and the stolen bytes are whole, position-independent
-    // instructions the trampoline can re-execute:
-    //   0x14273BC7B  6 bytes  48 8B D6 48 8B CB          mov rdx,rsi; mov rcx,rbx
-    //   0x14273BEC5  7 bytes  48 8D 93 64 08 00 00       lea rdx,[rbx+0x864]
-    //   0x14273A726  8 bytes  4C 8B B4 24 48 01 00 00    mov r14,[rsp+0x148]
+    //   keyboard/mouse — the keymap fill at 0x14273B2B0, hooked at its entry.
+    //     The frame input update calls the keyboard poll (0x142728C40, a
+    //     256-byte DirectInput key state) and the mouse poll (0x142728F20, a
+    //     0x14-byte DIMOUSESTATE), then calls the fill with those buffers in
+    //     r8 and rdx. The fill is their ONLY consumer: it resolves the
+    //     player's in-game keymap against them and writes every
+    //     keyStates_thisFrame entry, from which the bool→float mirrors
+    //     (+0x274 LMB / +0x29C RMB / +0x2A8 Reload) and all edge/hold
+    //     bookkeeping are derived. Clearing a byte there therefore removes the
+    //     button from the whole frame in one place.
+    //
+    //   gamepad — the game's pad poll at 0x142728A1F, immediately after
+    //     GetDeviceState has filled the 0x110-byte DirectInput state in rsi.
+    //     This one function is the ONLY source of pad state on both of the
+    //     game's pad paths (the device-9 keymap fill at 0x14273B390 writes
+    //     InputContainerBig+0x864, the hard-coded per-device mapper at
+    //     0x142739E40 reads a stack copy at rsp+0x20 — in both cases the very
+    //     buffer rsi points at), so clearing a button here hides it from the
+    //     keymap and the mapper alike: no action, no press edge, no hold.
+    //
+    // Previous sessions' approach — zeroing keyStates_thisFrame for selected
+    // ActionKeyCode entries at three post-hoc sites (0x14273BC7B / 0x14273BEC5
+    // / 0x14273A726) plus the pad snapshot at 0x14273BEB3 — is gone together
+    // with the checkbox list that drove it. Those sites could only suppress an
+    // *action* (they had to guess which pad button an action was bound to, and
+    // the game resurrected the bytes from the pad stage), while blocking the
+    // raw buffer makes the whole question moot: nothing downstream can write a
+    // pressed state for a button the game never received.
     FreeJumpPlugin* g_ParkourModeInstance = nullptr;
 
-    // Per-site hit counters, surfaced in the UI. They answer the one question
-    // static analysis cannot: does this site actually execute for the player's
-    // device in this build. All-zero while pressing pad buttons means the pad
-    // input never reaches these functions, i.e. a different seam is needed.
-    uint32_t g_SuppressHitsKbm = 0;
-    uint32_t g_SuppressHitsPadKeymap = 0;
-    uint32_t g_SuppressHitsMapper = 0;
-    uint32_t g_SuppressHitsPadSnapshot = 0;
-    uint32_t g_SuppressHitsPadPoll = 0;
-
-    // The pad button code the game's own controller bindings resolve each
-    // action to, as last read from the pad keymap. Surfaced in the UI so that
-    // "Attack" can be seen to mean, say, pad button 2 on this particular pad.
-    int16_t g_PadCodeForAction[kActionKeyCount] = {};
-
-    // Fallback pad-button numbers, used only when the game's own keymap cannot
-    // be consulted. The game's pad snapshot lays its digital buttons out at
-    // +0x30+code, and the 1.5.0 dump shows the device-6 mapper mapping those
-    // slots as 0=A, 1=B, 2=X, 3=Y, 4=RB, 5=LB, which is exactly the player's
-    // native layout: Attack=X(2), EagleVision=Y(3), Aim/LB(5), BombDrop/RB(4).
-    // -1 means "no known pad button for this action".
-    constexpr int16_t kDefaultPadCodeForAction[kActionKeyCount] = {
-        -1, // 0x00 ParkourUp            (A - deliberately NOT blocked)
-         2, // 0x01 Attack               -> pad X
-         3, // 0x02 EagleVision          -> pad Y
-        -1, // 0x03 ParkourDownInteract (B - deliberately NOT blocked)
-        -1, // 0x04 Disguise
-        -1, // 0x05 Numpad4CycleLeftHand
-        -1, // 0x06 Medicine
-        -1, // 0x07 Numpad6CycleBombs
-        -1, // 0x08 Map
-        -1, // 0x09 Escape
-        -1, // 0x0A Crouch
-         5, // 0x0B Aim                 -> pad LB
-        -1, // 0x0C Sprint
-         4, // 0x0D BombDrop            -> pad RB
-        -1, // 0x0E Reload
-        -1, // 0x0F CenterCamera
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    };
-
-    // Resolved pad button for an action while the mask is applied, as a GAME
-    // SNAPSHOT slot (byte +0x30+slot in the poll's 0x110-byte state):
-    //   1. the player's own binding (Parkour Mode's per-action pad binding) -
-    //      authoritative, converted from the plugin's ParkourPadCode to the
-    //      game's slot via the dump-proven device-6 layout;
-    //   2. the game's own controller binding, as last resolved from the pad
-    //      keymap (only populated on the device-9 keymap path);
-    //   3. the built-in native layout for the default actions.
-    // Returns -1 only when nothing is known at all.
-    int ResolvePadCodeForAction(const FreeJumpPlugin* owner, int actionIdx)
+    bool IsParkourBlockingActive()
     {
-        // Plugin ParkourPadCode -> game snapshot slot. Dump-proven from the
-        // device-6 (XInput-style) mapper case: slot 0=A, 1=B, 2=X, 3=Y,
-        // 4=RB, 5=LB, 6=Start/Options, 7=Back/Share. Other pad controls
-        // (triggers, sticks, dpad) have no proven slot and are not hidden.
-        switch (owner->GetActionPadBinding(actionIdx) - kPadKeyBase)
-        {
-            case PadCode_A:     return 0;
-            case PadCode_B:     return 1;
-            case PadCode_X:     return 2;
-            case PadCode_Y:     return 3;
-            case PadCode_RB:    return 4;
-            case PadCode_LB:    return 5;
-            case PadCode_START: return 6;
-            case PadCode_BACK:  return 7;
-            default: break;
-        }
-        if (g_PadCodeForAction[actionIdx] >= 0)
-            return g_PadCodeForAction[actionIdx];
-        return kDefaultPadCodeForAction[actionIdx];
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        return owner && !owner->GetBlockedKeys().empty();
     }
 
-    void ZeroDisabledActionKeyStates(AllRegisters* params)
+    // The one mapping both blockers use: bindable code -> the byte(s) of the
+    // game's own input buffers that must be cleared for it.
+    BlockedInputSlot ComputeBlockedInputSlot(int bindableKeyCode)
     {
-        FreeJumpPlugin* owner = g_ParkourModeInstance;
-        if (!owner)
+        switch (bindableKeyCode)
+        {
+        case VK_LBUTTON:
+        case VK_RBUTTON:
+        case VK_MBUTTON:
+        case VK_XBUTTON1:
+        case VK_XBUTTON2:
+            return ComputeMouseButtonSlot(bindableKeyCode);
+        default:
+            break;
+        }
+        if (IsPadCode(bindableKeyCode))
+            return ComputePadSnapshotSlot(bindableKeyCode);
+        if (bindableKeyCode >= kKeyboardKeyMin && bindableKeyCode <= kKeyboardKeyMax)
+            return ComputeKeyboardSlot(bindableKeyCode);
+        return {};
+    }
+
+    // Keyboard/mouse blocker. Runs at the keymap fill's entry, with the
+    // fill's own argument registers live: r8 = the keyboard state buffer the
+    // keyboard poll just wrote (256 bytes, one byte per DirectInput scancode,
+    // bit 7 = pressed) and rdx = the mouse state the mouse poll just wrote
+    // (DIMOUSESTATE: lX/lY/lZ then rgbButtons at +0xC). Both buffers contain
+    // only this frame's state, so clearing a byte here removes that key from
+    // the entire frame — see the seam documentation above.
+    void SanitizeKbmKeymapFillSource(AllRegisters* params)
+    {
+        if (!IsParkourBlockingActive())
             return;
-        const uint32_t disabledMask = owner->GetDisabledActionMask();
-        if (!disabledMask)
-            return;
-        auto* inputContainer = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_));
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        auto* inputContainer = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rcx_));
+        auto* keyboardState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->r8_));
+        auto* mouseState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rdx_));
         if (!inputContainer)
             return;
-        // Cache for VerifySuppressionIntegrity: the shared zeroing helper is the
-        // one place all three keyStates sites run with a proven-valid rbx.
-        owner->NoteInputContainer(inputContainer);
-
-        uint8_t* keyStatesThisFrame = inputContainer + 0x30; // InputContainer::keyStates_thisFrame
-        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+        // WHICH buffer r8 points at cannot be read off the statically
+        // disassembled caller: the input update's bytes that set it sit at
+        // 0x14273BC64, which another plugin's runtime trampoline has replaced
+        // in the dump. So rather than guess, the write is verified against the
+        // two buffers the frame's own code provably produces (the copies at
+        // 0x14273BB4F/0x14273BB5E and the caller's `mov rdx,rsi` at
+        // 0x14273BC6A). If a build ever hands the fill something else, the
+        // callback declines to touch anything rather than corrupting an
+        // unrelated buffer - Parkour Mode then stops blocking, it does not
+        // crash. The offsets are the InputContainerBig fields the dump shows
+        // the input update using; see the seam notes above.
+        constexpr uintptr_t kMouseState_thisFrame = 0x22098;   // 0x14 bytes, DIMOUSESTATE
+        constexpr uintptr_t kKbdState_thisFrame = 0x220C0;    // 0x100 bytes, scancodes
+        constexpr uintptr_t kKbdState_prevFrame = 0x221C0;    // 0x100 bytes, scancodes
+        const bool mouseStateIsFrameBuffer =
+            mouseState == inputContainer + kMouseState_thisFrame;
+        const bool keyboardStateIsFrameBuffer =
+            keyboardState == inputContainer + kKbdState_thisFrame
+            || keyboardState == inputContainer + kKbdState_prevFrame;
+        if (!mouseStateIsFrameBuffer && !keyboardStateIsFrameBuffer)
+            return;
+        for (const int bindableKeyCode : owner->GetBlockedKeys())
         {
-            if (disabledMask & (1u << actionIdx))
-                keyStatesThisFrame[actionIdx] = 0;
-        }
-    }
-
-    // ── Parkour Mode, gamepad: hide the physical button from the game ──────
-    // Zeroing keyStates stops an *action*; it does not stop the game from
-    // knowing that pad button 3 is down. The pad stage publishes this frame's
-    // snapshot into InputContainerBig+0x864 (0x110 bytes, the same buffer the
-    // keymap fill 0x14273B390 reads): button `code` is the byte at +0x30+code
-    // with bit 7 as the pressed flag. That buffer is the only pad view the rest
-    // of the frame gets, so clearing a button here means the game cannot detect
-    // it at all - no action, no press edge, no held-button bookkeeping - while
-    // the plugin's own XInput polling (a separate DLL reading the real device)
-    // still sees it and can fire parkour triggers bound to that button.
-    //
-    // WHICH button is decided by the game's own pad keymap, i.e. the player's
-    // in-game controller bindings: rdi at this site is that table, entry stride
-    // 0x214, entry type at +4, pad button code at +8 (exactly what the fill
-    // reads). So "Attack" hides whatever button is bound to attack on this pad
-    // instead of a hard-coded layout, and an action bound to a stick axis or a
-    // hat compare (entry type 2) is left to the keyStates sites.
-    void SanitizePadSnapshotForDisabledActions(AllRegisters* params)
-    {
-        ++g_SuppressHitsPadSnapshot;
-        FreeJumpPlugin* owner = g_ParkourModeInstance;
-        if (!owner)
-            return;
-        const uint32_t disabledMask = owner->GetDisabledActionMask();
-        if (!disabledMask)
-            return;
-        auto* inputContainer = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_));
-        const auto* padKeymap = reinterpret_cast<const uint8_t*>(
-            static_cast<uintptr_t>(params->rdi_));
-        if (!inputContainer || !padKeymap)
-            return;
-
-        uint8_t* padState = inputContainer + 0x864; // this frame's pad snapshot
-        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
-        {
-            if (!(disabledMask & (1u << actionIdx)))
-                continue;
-            // Clear first: an action that resolves to no pad button (axis/hat
-            // binding, or not pad-bound at all) must read as unresolved rather
-            // than keep last frame's code - a stale value displayed the wrong
-            // button next to a ticked action.
-            g_PadCodeForAction[actionIdx] = -1;
-            const uint8_t* entry = padKeymap + static_cast<size_t>(actionIdx) * 0x214;
-            const int32_t entryType = *reinterpret_cast<const int32_t*>(entry + 4);
-            const int32_t padCode = *reinterpret_cast<const int32_t*>(entry + 8);
-            if (entryType != 1)   // 1 = digital pad button, 2 = axis/hat comparison
-                continue;
-            if (padCode < 0 || padCode > 0xDE) // buttons live at +0x30 inside 0x110 bytes
-                continue;
-            g_PadCodeForAction[actionIdx] = static_cast<int16_t>(padCode);
-            // Clear the whole byte, not just the pressed bit: a button the game
-            // can still see as "held" or as having an edge is still detectable.
-            padState[0x30 + padCode] = 0;
+            const BlockedInputSlot slot = ComputeBlockedInputSlot(bindableKeyCode);
+            switch (slot.kind)
+            {
+            case BlockedInputKind::KeyboardScancode:
+                // Clear the whole byte, not just bit 7, so the key is not merely
+                // unpressed but indistinguishable from "not touched this frame".
+                if (keyboardStateIsFrameBuffer)
+                    keyboardState[slot.slot] = 0;
+                break;
+            case BlockedInputKind::MouseButton:
+                if (mouseStateIsFrameBuffer)
+                    mouseState[0xC + slot.slot] = 0;   // DIMOUSESTATE rgbButtons
+                break;
+            default:
+                break;
+            }
         }
     }
 
@@ -594,11 +590,11 @@ namespace
     // 0x1427289A0 is the game's pad poll, and it is the ONE function both
     // gamepad paths go through:
     //   0x14273BEA1  call 0x1427289A0   device id 9  -> writes InputContainerBig+0x864
-    //   0x14273EA6   call 0x1427289A0   every other id -> writes a stack copy at rsp+0x20
+    //   0x142739EA6  call 0x1427289A0   every other id -> writes a stack copy at rsp+0x20
     // Both are a 0x110-byte DirectInput state whose digital buttons live at
-    // +0x30+code (bit 7 = pressed). Inside the poll the destination buffer is
-    // rsi (set at 0x142728B8 from the caller's rdx) and rbx is the
-    // InputContainerBig*.
+    // +0x30+code (bit 7 = pressed) and whose hat dwords start at +0x20. Inside
+    // the poll the destination buffer is rsi (set at 0x142728B8 from the
+    // caller's rdx) and rbx is the InputContainerBig*.
     //
     // Hooking at 0x142728A1F - the instruction right after GetDeviceState
     // returned and filled the buffer - therefore lets one site clear the
@@ -608,128 +604,71 @@ namespace
     //
     // The rest of the poll function only reads the container's own analog
     // fields (+0x380) and the stack scratch area, never the buffer we clear,
-    // so the force-feedback / vibration tail still works; and only the digital
-    // button bytes are touched, so the sticks stay fully alive.
+    // so the force-feedback / vibration tail still works; and only the bytes
+    // the player assigned are touched, so every other button and the sticks
+    // stay fully alive.
     void SanitizePadPollSnapshot(AllRegisters* params)
     {
-        ++g_SuppressHitsPadPoll;
-        FreeJumpPlugin* owner = g_ParkourModeInstance;
-        if (!owner)
+        if (!IsParkourBlockingActive())
             return;
-        const uint32_t disabledMask = owner->GetDisabledActionMask();
-        if (!disabledMask)
-            return;
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
         auto* padState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rsi_));
         if (!padState)
             return;
-        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+        for (const int bindableKeyCode : owner->GetBlockedKeys())
         {
-            if (!(disabledMask & (1u << actionIdx)))
-                continue;
-            const int padCode = ResolvePadCodeForAction(owner, actionIdx);
-            if (padCode < 0)
-                continue;
-            // Clear the whole byte, not just bit 7, so the button is not merely
-            // unpressed but indistinguishable from "not touched this frame".
-            padState[0x30 + padCode] = 0;
+            const BlockedInputSlot slot = ComputeBlockedInputSlot(bindableKeyCode);
+            switch (slot.kind)
+            {
+            case BlockedInputKind::PadSnapshotButton:
+                // Clear the whole byte, not just bit 7, so the button is not
+                // merely unpressed but indistinguishable from "not touched".
+                padState[0x30 + slot.slot] = 0;
+                break;
+            case BlockedInputKind::PadSnapshotHat:
+            {
+                // DirectInput's "hat centered": every direction compare in the
+                // mapper (0/9000/18000/27000) fails against it, which is what
+                // frees all four d-pad directions in one write.
+                *reinterpret_cast<uint32_t*>(padState + 0x20) = 0xFFFFFFFFu;
+                break;
+            }
+            default:
+                break;
+            }
         }
     }
 
-    void SuppressDisabledActionKeys_Kbm(AllRegisters* params)
+    // ── Parkour Mode, keyboard/mouse: clear the blocked key before the
+    //    game's keymap fill can resolve it ─────────────────────────────
+    // 0x14273B2B0 is that fill, entered once per frame from the input update
+    // at 0x14273BC70 with:
+    //   rcx = InputContainerBig*      (keyStates_thisFrame is rcx+0x30, 32 bytes)
+    //   rdx = the mouse state buffer   (DIMOUSESTATE, buttons at +0xC)
+    //   r8  = the keyboard state buffer (256 scancode bytes, bit 7 = pressed)
+    //   r9  = the player's keymap      (32 entries, stride 0x214: type at +4,
+    //                                   code at +8; type 1 = keyboard scancode,
+    //                                   type 2 = mouse button index)
+    // and it is the only reader of rdx/r8 this frame. Hooking its entry gives
+    // the blocked key's byte to the callback in the fill's own registers, so
+    // the fill then writes 0 into every keyStates_thisFrame entry that key
+    // drives — no action, no analog mirror (+0x274 LMB / +0x29C RMB /
+    // +0x2A8 Reload), no press edge, no held-button bookkeeping.
+    struct ParkourModeKbmFillHook : AutoAssemblerCodeHolder_Base
     {
-        ++g_SuppressHitsKbm;
-        ZeroDisabledActionKeyStates(params);
-    }
-
-    void SuppressDisabledActionKeys_PadKeymap(AllRegisters* params)
-    {
-        ++g_SuppressHitsPadKeymap;
-        ZeroDisabledActionKeyStates(params);
-    }
-
-    void SuppressDisabledActionKeys_Mapper(AllRegisters* params)
-    {
-        ++g_SuppressHitsMapper;
-        ZeroDisabledActionKeyStates(params);
-    }
-
-    // One holder per site: a plugin that owns one of them must not cost us the
-    // other two devices.
-    struct ParkourModeKbmSuppressHook : AutoAssemblerCodeHolder_Base
-    {
-        ParkourModeKbmSuppressHook()
+        ParkourModeKbmFillHook()
         {
             PresetScript_CCodeInTheMiddle(
-                0x14273BC7B, 6,
-                SuppressDisabledActionKeys_Kbm,
+                0x14273B2B0, 8,
+                SanitizeKbmKeymapFillSource,
                 RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
                 true);
         }
     };
 
-    struct ParkourModePadKeymapSuppressHook : AutoAssemblerCodeHolder_Base
+    AutoAssembleWrapper<ParkourModeKbmFillHook>& GetParkourModeKbmFillHook()
     {
-        ParkourModePadKeymapSuppressHook()
-        {
-            PresetScript_CCodeInTheMiddle(
-                0x14273BEC5, 7,
-                SuppressDisabledActionKeys_PadKeymap,
-                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
-                true);
-        }
-    };
-
-    struct ParkourModeMapperSuppressHook : AutoAssemblerCodeHolder_Base
-    {
-        ParkourModeMapperSuppressHook()
-        {
-            PresetScript_CCodeInTheMiddle(
-                0x14273A726, 8,
-                SuppressDisabledActionKeys_Mapper,
-                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
-                true);
-        }
-    };
-
-    AutoAssembleWrapper<ParkourModeKbmSuppressHook>& GetParkourModeKbmSuppressHook()
-    {
-        static AutoAssembleWrapper<ParkourModeKbmSuppressHook> s_hook;
-        return s_hook;
-    }
-
-    AutoAssembleWrapper<ParkourModePadKeymapSuppressHook>& GetParkourModePadKeymapSuppressHook()
-    {
-        static AutoAssembleWrapper<ParkourModePadKeymapSuppressHook> s_hook;
-        return s_hook;
-    }
-
-    AutoAssembleWrapper<ParkourModeMapperSuppressHook>& GetParkourModeMapperSuppressHook()
-    {
-        static AutoAssembleWrapper<ParkourModeMapperSuppressHook> s_hook;
-        return s_hook;
-    }
-
-    // Hides the disabled actions' pad buttons in the pad snapshot itself,
-    // before the game's keymap fill reads it (device-9 / keymap pad path).
-    // Vanilla 0x14273BEB3 is `lea rdx,[rbx+0x864]` - 7 whole bytes, and it runs
-    // after the poll at 0x14273BEA1 filled the snapshot and before the fill
-    // call at 0x14273BEC0 consumes it. rbx is InputContainerBig*, rdi the pad
-    // keymap; the site after the fill (0x14273BEC5) is a separate hook.
-    struct ParkourModePadSnapshotHook : AutoAssemblerCodeHolder_Base
-    {
-        ParkourModePadSnapshotHook()
-        {
-            PresetScript_CCodeInTheMiddle(
-                0x14273BEB3, 7,
-                SanitizePadSnapshotForDisabledActions,
-                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
-                true);
-        }
-    };
-
-    AutoAssembleWrapper<ParkourModePadSnapshotHook>& GetParkourModePadSnapshotHook()
-    {
-        static AutoAssembleWrapper<ParkourModePadSnapshotHook> s_hook;
+        static AutoAssembleWrapper<ParkourModeKbmFillHook> s_hook;
         return s_hook;
     }
 
@@ -773,10 +712,10 @@ namespace
     // pad-bound override triggers keep working.
     //
     // Kept only as a fallback for builds whose pad input does not go through
-    // the two suppression sites above (watch the site-hit counters: all zero
-    // while pressing pad buttons means this fallback is the only option left).
-    // It disables the ENTIRE controller, sticks included, so the character
-    // cannot move while Parkour Mode is on — which is why it is now off by
+    // the pad-poll site above (e.g. the UI reports that site as owned by
+    // another plugin, and blocked pad buttons still reach the game). It
+    // disables the ENTIRE controller, sticks included, so the character
+    // cannot move while Parkour Mode is on — which is why it is off by
     // default instead of being the primary mechanism.
     // The whole function is replaced (no return path needed), and the original
     // prologue is restored on deactivate.
@@ -1084,30 +1023,14 @@ namespace
             && site[11] == 0x49 && site[12] == 0xFF && site[13] == 0xE2);
     }
 
-    // Each suppression site is asserted separately so one owned by another
-    // plugin does not disable the other two.
-    bool IsKbmSuppressSitePatched()
+    // Each blocking site is asserted separately, so one already owned by
+    // another plugin costs only its own device's blocking.
+    bool IsKbmFillSitePatched()
     {
-        // Vanilla: mov rdx,rsi ; mov rcx,rbx  (0x14273BC7B, 6 bytes).
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BC7B);
-        return !(site[0] == 0x48 && site[1] == 0x8B && site[2] == 0xD6
-            && site[3] == 0x48 && site[4] == 0x8B && site[5] == 0xCB);
-    }
-
-    bool IsPadKeymapSuppressSitePatched()
-    {
-        // Vanilla: lea rdx,[rbx+0x864]  (0x14273BEC5, 7 bytes).
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BEC5);
-        return !(site[0] == 0x48 && site[1] == 0x8D && site[2] == 0x93
-            && site[3] == 0x64 && site[4] == 0x08 && site[5] == 0x00 && site[6] == 0x00);
-    }
-
-    bool IsPadSnapshotSitePatched()
-    {
-        // Vanilla: lea rdx,[rbx+0x864]  (0x14273BEB3, 7 bytes).
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BEB3);
-        return !(site[0] == 0x48 && site[1] == 0x8D && site[2] == 0x93
-            && site[3] == 0x64 && site[4] == 0x08 && site[5] == 0x00 && site[6] == 0x00);
+        // Vanilla prologue: lea r10,[rcx+0x30] ; add r9,8  (0x14273B2B0, 8 bytes).
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273B2B0);
+        return !(site[0] == 0x4C && site[1] == 0x8D && site[2] == 0x51 && site[3] == 0x30
+            && site[4] == 0x49 && site[5] == 0x83 && site[6] == 0xC1 && site[7] == 0x08);
     }
 
     bool IsPadPollSitePatched()
@@ -1116,14 +1039,6 @@ namespace
         const uint8_t* site = reinterpret_cast<const uint8_t*>(0x142728A1F);
         return !(site[0] == 0x40 && site[1] == 0x0F && site[2] == 0xB6
             && site[3] == 0xFF && site[4] == 0x85 && site[5] == 0xC0);
-    }
-
-    bool IsMapperSuppressSitePatched()
-    {
-        // Vanilla: mov r14,[rsp+0x148]  (0x14273A726, 8 bytes).
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273A726);
-        return !(site[0] == 0x4C && site[1] == 0x8B && site[2] == 0xB4 && site[3] == 0x24
-            && site[4] == 0x48 && site[5] == 0x01 && site[6] == 0x00 && site[7] == 0x00);
     }
 
     bool IsParkourPadPollSitePatched()
@@ -1173,41 +1088,6 @@ void WidenAcceptanceRanges(AvailableParkourAction& action)
 
 // ── INI persistence ───────────────────────────────────────────────────
 
-// ── Parkour Mode: input-integrity verification ────────────────────────
-// The suppression sites must leave every freed byte zero by the time the
-// game's conversion/parkour passes consume them. Rather than trusting that
-// every write path stays hooked forever, the verifier re-reads the freed
-// bytes from the cached InputContainerBig each frame. Any nonzero freed
-// byte is a LEAK — ground truth that some input path this build does not
-// hook wrote it — so the UI shows it and (opt-in) the whole-pad detach
-// engages as a last resort, releasing itself again after a long clean
-// streak. Keyboard/mouse leaks cannot be helped by detaching the pad; they
-// are still surfaced so the build can be re-examined.
-//
-// Guarded read: the cached pointer was valid the moment a hook cached it,
-// but the game may free it later (menu transitions, save loads); the read
-// must not kill the game.
-// Returns 0xFFFFFFFF when the read faulted (container no longer valid).
-static uint32_t ReadFreedKeyStatesGuarded(const void* container, uint32_t disabledMask)
-{
-    __try
-    {
-        const uint8_t* keyStatesThisFrame =
-            static_cast<const uint8_t*>(container) + 0x30; // InputContainer::keyStates_thisFrame
-        uint32_t leakedMask = 0;
-        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
-        {
-            if ((disabledMask & (1u << actionIdx)) && keyStatesThisFrame[actionIdx] != 0)
-                leakedMask |= (1u << actionIdx);
-        }
-        return leakedMask;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return 0xFFFFFFFFu;
-    }
-}
-
 static std::string GetIniPath()
 {
     char documents[MAX_PATH]{};
@@ -1225,12 +1105,56 @@ static std::string GetIniPath()
     return "FreeJumpPlugin.ini";
 }
 
+// ── Parkour Mode: what a blocked entry means in the game's own buffers ────
+// Shown next to every entry of the blocked list, so the player can see that
+// "Mouse Left" really is the game's button 0 and "Left Ctrl" really is
+// scancode 0x1D rather than having to take the suppression on trust.
+std::string FreeJumpPlugin::DescribeBlockedInputTarget(int bindableKeyCode)
+{
+    const BlockedInputSlot slot = ComputeBlockedInputSlot(bindableKeyCode);
+    std::ostringstream where;
+    switch (slot.kind)
+    {
+    case BlockedInputKind::KeyboardScancode:
+        where << "keyboard scancode 0x" << std::uppercase << std::hex << slot.slot;
+        break;
+    case BlockedInputKind::MouseButton:
+    {
+        const char* buttonName = "extra button";
+        switch (slot.slot)
+        {
+        case 0: buttonName = "left"; break;
+        case 1: buttonName = "right"; break;
+        case 2: buttonName = "middle"; break;
+        case 3: buttonName = "X1"; break;
+        case 4: buttonName = "X2"; break;
+        default: break;
+        }
+        where << "mouse button " << slot.slot << " (" << buttonName << ")";
+        break;
+    }
+    case BlockedInputKind::PadSnapshotButton:
+        where << "controller button " << slot.slot
+              << " (" << PadCodeName(bindableKeyCode) << ")";
+        break;
+    case BlockedInputKind::PadSnapshotHat:
+        where << "controller d-pad (all four directions)";
+        break;
+    default:
+        return "NOT blocked - the game reads this control as an analog axis, "
+               "which this build does not map";
+    }
+    return where.str();
+}
+
 void FreeJumpPlugin::LoadSettings()
 {
     std::ifstream file(GetIniPath());
     if (!file) return;
 
     std::vector<ParkourActionOverride> loadedOverrides;
+    std::vector<int> loadedBlockedKeys;
+    bool hasBlockedKeys = false;   // distinguishes "list cleared" from "key absent"
     bool hasOverrideCount = false;
     bool hasOverrideData = false;
     std::string line;
@@ -1281,50 +1205,20 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseBool(value, enabled))
                 m_BlockPadWhileParkour = enabled;
         }
-        else if (TryGetValue(trimmedLine, "AutoFallbackOnLeak=", value))
-        {
-            bool enabled = false;
-            if (TryParseBool(value, enabled))
-                m_AutoFallbackOnLeak = enabled;
-        }
+        // Legacy `AutoFallbackOnLeak=` is not read any more: it armed the pad-detach
+        // fallback from the action-level leak detector, which no longer exists
+        // (buttons are now blocked at their source). The manual "detach the
+        // controller" fallback below is still available.
         // Legacy `BlockPadWhileParkour=` is deliberately NOT read: in 0.11 it
         // defaulted to 1 and was the primary (whole-pad) mechanism. Honouring a
         // stored 1 would silently re-enable the detach as the active fix and
         // freeze the sticks, hiding the per-site suppression. Unknown keys are
         // skipped, so old files load cleanly and the option is simply off.
-        else if (TryGetValue(trimmedLine, "ParkourDisabledActions=", value))
-        {
-            uint32_t mask = 0;
-            for (const std::string_view actionToken : Split(value, '|'))
-            {
-                int actionIdx = 0;
-                if (TryParseInteger(actionToken, 10, actionIdx)
-                    && actionIdx >= 0 && actionIdx < kActionKeyCount)
-                {
-                    mask |= (1u << actionIdx);
-                }
-            }
-            m_DisabledActionMask = mask;
-        }
-        else if (TryGetValue(trimmedLine, "ParkourPadBindings=", value))
-        {
-            // Pairs of "actionIdx:bindableCode" (bindableCode = kPadKeyBase +
-            // ParkourPadCode). Unknown/malformed pairs are skipped.
-            for (const std::string_view pairToken : Split(value, '|'))
-            {
-                const size_t colon = pairToken.find(':');
-                if (colon == std::string_view::npos)
-                    continue;
-                int actionIdx = 0, boundCode = 0;
-                if (TryParseInteger(pairToken.substr(0, colon), 10, actionIdx)
-                    && TryParseInteger(pairToken.substr(colon + 1), 10, boundCode)
-                    && actionIdx >= 0 && actionIdx < kActionKeyCount
-                    && boundCode >= kPadKeyBase && boundCode < kMaxBindableKey)
-                {
-                    m_ActionPadBindings[actionIdx] = boundCode;
-                }
-            }
-        }
+        // Legacy `ParkourDisabledActions=` and `ParkourPadBindings=` are
+        // deliberately NOT read: they described the old per-action checkbox
+        // set, whose meaning depended on the in-game bindings of the moment it
+        // was saved. Unknown keys are skipped, so an old file loads cleanly and
+        // the fresh default set (LMB/RMB/Left Ctrl) is used instead.
         else if (TryGetValue(trimmedLine, "WallToHangEnabled=", value))
         {
             bool enabled = false;
@@ -1343,18 +1237,21 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_DiveHotkeyPad = keyCode;
         }
-        else if (TryGetValue(trimmedLine, "UserBlockedKeys=", value))
+        else if (TryGetValue(trimmedLine, "ParkourBlockedKeys=", value))
         {
-            // Pairs of "keyCode" (bindable code). Unknown/malformed pairs are skipped.
+            // Parkour Mode's blocked buttons: bindable codes (keyboard/mouse
+            // Win32 virtual keys and controller codes), pipe-separated.
+            // An EMPTY value is a meaningful state - the player deliberately
+            // blocked nothing - so it must replace, not fall back to, the
+            // built-in defaults.
+            loadedBlockedKeys.clear();
             for (const std::string_view keyToken : Split(value, '|'))
             {
                 int code = 0;
-                if (TryParseInteger(keyToken, 10, code)
-                    && code >= kKeyboardKeyMin && code <= kMaxBindableKey)
-                {
-                    m_UserBlockedKeys.push_back(code);
-                }
+                if (TryParseInteger(keyToken, 10, code) && IsValidBindableKey(code))
+                    loadedBlockedKeys.push_back(code);
             }
+            hasBlockedKeys = true;
         }
         else if (TryGetValue(trimmedLine, "NumOverrides=", value))
         {
@@ -1392,6 +1289,8 @@ void FreeJumpPlugin::LoadSettings()
         }
     }
 
+    if (hasBlockedKeys)
+        m_UserBlockedKeys = std::move(loadedBlockedKeys);
     if (hasOverrideCount || hasOverrideData)
         m_Overrides = std::move(loadedOverrides);
 }
@@ -1412,51 +1311,22 @@ void FreeJumpPlugin::SaveSettings()
     file << "ParkourModeKeyPad=" << std::hex << m_ParkourModeKeyPad << std::dec << "\n";
     file << "ParkourModeOn=" << (m_ParkourModeOn ? 1 : 0) << "\n";
     file << "DetachPadFallback=" << (m_BlockPadWhileParkour ? 1 : 0) << "\n";
-    file << "AutoFallbackOnLeak=" << (m_AutoFallbackOnLeak ? 1 : 0) << "\n";
-    file << "ParkourDisabledActions=";
-    {
-        bool firstAction = true;
-        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
-        {
-            if (!(m_DisabledActionMask & (1u << actionIdx)))
-                continue;
-            if (!firstAction)
-                file << "|";
-            file << actionIdx;
-            firstAction = false;
-        }
-    }
-    file << "\n";
-    // Per-action controller-button bindings for Parkour Mode ("action:code"
-    // pairs). Only actions the player actually bound are written.
-    file << "ParkourPadBindings=";
-    {
-        bool firstBinding = true;
-        for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
-        {
-            const int boundCode = m_ActionPadBindings[actionIdx];
-            if (boundCode < kPadKeyBase)
-                continue;
-            if (!firstBinding)
-                file << "|";
-            file << actionIdx << ":" << boundCode;
-            firstBinding = false;
-        }
-    }
-    file << "\n";
-    // User-specified keys to block when parkour mode is on
-    file << "UserBlockedKeys=";
+    // Parkour Mode's blocked buttons, as decimal bindable codes. Keyboard/mouse
+    // keys and controller codes are both written, so a controller assignment
+    // survives a restart exactly as it was assigned.
+    // NB: the key name is new in 0.14. A pre-0.14 file (with the old
+    // `UserBlockedKeys=` / `ParkourDisabledActions=` keys) has no
+    // `ParkourBlockedKeys=` line at all, so it keeps the built-in defaults
+    // instead of inheriting an obsolete or empty list.
+    file << "ParkourBlockedKeys=";
     {
         bool firstKey = true;
-        for (int code : m_UserBlockedKeys)
+        for (const int code : m_UserBlockedKeys)
         {
-            if (code < kPadKeyBase)
-            {
-                if (!firstKey)
-                    file << "|";
-                file << code;
-                firstKey = false;
-            }
+            if (!firstKey)
+                file << "|";
+            file << code;
+            firstKey = false;
         }
     }
     file << "\n";
@@ -1547,12 +1417,9 @@ void FreeJumpPlugin::OnBeforeActivate()
     m_Callbacks.m_CallbackPriority = 5.0f;
     m_Callbacks.m_Name = "FreeJumpPlugin";
 
-    // Per-action controller-button bindings for Parkour Mode: default to 0
-    // (unbound) so the INI is clean; the Bind buttons in the checkbox area
-    // populate them at play-time.
-    for (int i = 0; i < 0x20; ++i) m_ActionPadBindings[i] = 0;
-
-    if (m_ParkourModeOn && m_DisabledActionMask)
+    // Parkour Mode installs only while it is on AND at least one button is
+    // assigned; an empty list means nothing to block, so the hooks stay off.
+    if (m_ParkourModeOn && !m_UserBlockedKeys.empty())
         ApplyParkourMode(true);
     if (m_WallToHangEnabled)
         ApplyWallToHang(true);
@@ -1560,8 +1427,7 @@ void FreeJumpPlugin::OnBeforeActivate()
 
 void FreeJumpPlugin::OnBeforeDeactivate()
 {
-    if (m_KbmSuppressActive || m_PadKeymapSuppressActive || m_MapperSuppressActive
-        || m_PadSnapshotSuppressActive || m_PadPollSanitizeActive || m_PadBlockHookActive)
+    if (m_KbmFillSuppressActive || m_PadPollSanitizeActive || m_PadBlockHookActive)
         ApplyParkourMode(false);
     if (m_WallToHangHooksActive)
         ApplyWallToHang(false);
@@ -1583,83 +1449,32 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
 {
     if (enable)
     {
-        // Every suppression callback reads this, so it has to be set before any
-        // hook below can fire - including when the KBM site is owned by
-        // someone else and only a pad site installs.
+        // Every blocker reads this, so it has to be published before any hook
+        // below can fire - including when one site is owned by someone else and
+        // only the other family's site installs.
         g_ParkourModeInstance = this;
 
-        if (!m_KbmSuppressActive && !m_PadKeymapSuppressActive && !m_MapperSuppressActive
-            && !m_PadSnapshotSuppressActive)
-        {
-            // Fresh activation: the counters then describe this ON period.
-            g_SuppressHitsKbm = 0;
-            g_SuppressHitsPadKeymap = 0;
-            g_SuppressHitsMapper = 0;
-            g_SuppressHitsPadSnapshot = 0;
-            g_SuppressHitsPadPoll = 0;
-            for (int16_t& padCode : g_PadCodeForAction)
-                padCode = -1;
-            m_LeakStreak = 0;
-            m_CleanFrameStreak = 0;
-            m_LastLeakMask = 0;
-        }
-
-        // Three independent sites. One that another plugin already patched is
-        // skipped (never fought over) and costs only its own device; the UI
-        // reports which sites are live.
+        // Two independent sites, one per device family. A site another plugin
+        // already patched is skipped (never fought over) and costs only its own
+        // family; the UI reports which are live, and the retry in OnUpdate
+        // installs one that was refused earlier.
         bool anyRefused = false;
-        if (!m_KbmSuppressActive)
+        if (!m_KbmFillSuppressActive)
         {
-            if (IsKbmSuppressSitePatched())
+            if (IsKbmFillSitePatched())
                 anyRefused = true;
             else
             {
-                GetParkourModeKbmSuppressHook().Activate();
-                m_KbmSuppressActive = true;
+                GetParkourModeKbmFillHook().Activate();
+                m_KbmFillSuppressActive = true;
             }
         }
-        if (!m_PadKeymapSuppressActive)
-        {
-            if (IsPadKeymapSuppressSitePatched())
-                anyRefused = true;
-            else
-            {
-                GetParkourModePadKeymapSuppressHook().Activate();
-                m_PadKeymapSuppressActive = true;
-            }
-        }
-        if (!m_MapperSuppressActive)
-        {
-            if (IsMapperSuppressSitePatched())
-                anyRefused = true;
-            else
-            {
-                GetParkourModeMapperSuppressHook().Activate();
-                m_MapperSuppressActive = true;
-            }
-        }
-        // Hides the buttons themselves. Independent of the three above: this is
-        // the site that makes the game unable to detect the button rather than
-        // just ignoring the action it drives.
-        if (!m_PadSnapshotSuppressActive)
-        {
-            if (IsPadSnapshotSitePatched())
-                anyRefused = true;
-            else
-            {
-                GetParkourModePadSnapshotHook().Activate();
-                m_PadSnapshotSuppressActive = true;
-            }
-        }
-        // The primary gamepad mechanism: the button never reaches the game on
-        // either pad path (see ParkourModePadPollHook). Installed last so that,
-        // even if every keyStates site is taken, the buttons stay hidden.
+        // The pad path: one site at the poll covers both of the game's pad
+        // stages, so the buttons themselves never reach the game.
         if (!m_PadPollSanitizeActive)
         {
             if (IsPadPollSitePatched())
-            {
                 anyRefused = true;
-            }
             else
             {
                 GetParkourModePadPollHook().Activate();
@@ -1668,9 +1483,9 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         }
         m_ParkourHookRefused = anyRefused;
 
-        // Optional fallback, off by default: detach the pad device. It covers
-        // every device id without a per-button mapping, but it also disables
-        // the sticks. See ParkourModePadBlockHook.
+        // Optional fallback, off by default: detach the pad device. It hides
+        // every pad button without a per-button mapping, but it also disables
+        // the sticks, which is why it is not the primary mechanism.
         if (m_BlockPadWhileParkour && !m_PadBlockHookActive)
         {
             if (IsParkourPadPollSitePatched())
@@ -1686,25 +1501,10 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
     }
     else
     {
-        if (m_KbmSuppressActive)
+        if (m_KbmFillSuppressActive)
         {
-            GetParkourModeKbmSuppressHook().Deactivate();
-            m_KbmSuppressActive = false;
-        }
-        if (m_PadKeymapSuppressActive)
-        {
-            GetParkourModePadKeymapSuppressHook().Deactivate();
-            m_PadKeymapSuppressActive = false;
-        }
-        if (m_MapperSuppressActive)
-        {
-            GetParkourModeMapperSuppressHook().Deactivate();
-            m_MapperSuppressActive = false;
-        }
-        if (m_PadSnapshotSuppressActive)
-        {
-            GetParkourModePadSnapshotHook().Deactivate();
-            m_PadSnapshotSuppressActive = false;
+            GetParkourModeKbmFillHook().Deactivate();
+            m_KbmFillSuppressActive = false;
         }
         if (m_PadPollSanitizeActive)
         {
@@ -1720,60 +1520,6 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         }
         m_ParkourHookRefused = false;
         ApplyOverrideFallback(false);
-    }
-}
-
-void FreeJumpPlugin::VerifySuppressionIntegrity()
-{
-    m_LastLeakMask = 0;
-    if (!m_ParkourModeOn || m_DisabledActionMask == 0 || !m_CachedInputContainer)
-    {
-        m_LeakStreak = 0;
-        m_CleanFrameStreak = 0;
-        return;
-    }
-
-    const uint32_t readResult =
-        ReadFreedKeyStatesGuarded(m_CachedInputContainer, m_DisabledActionMask);
-    if (readResult == 0xFFFFFFFFu)
-    {
-        // The cached container went invalid between frames. Drop it and wait
-        // for the hooks to cache a fresh one rather than trusting old memory.
-        m_CachedInputContainer = nullptr;
-        m_LeakStreak = 0;
-        m_CleanFrameStreak = 0;
-        return;
-    }
-    m_LastLeakMask = readResult;
-
-    if (m_LastLeakMask)
-    {
-        ++m_LeakStreak;
-        ++m_LeakTotalFrames;
-        m_CleanFrameStreak = 0;
-        // Opt-in last resort: freeze the whole pad (sticks included) so the
-        // overrides keep working through the plugin's own polling. Only while
-        // a pad is actually connected — a keyboard leak is not helped by
-        // detaching the pad.
-        if (m_AutoFallbackOnLeak && !m_PadBlockHookActive
-            && m_ActivePadSlot >= 0 && m_LeakStreak >= 30)
-        {
-            GetParkourModePadBlockHook().Activate();
-            m_PadBlockHookActive = true;
-        }
-    }
-    else
-    {
-        m_LeakStreak = 0;
-        ++m_CleanFrameStreak;
-        // Recovery: the leak stopped, so do not keep the character pinned
-        // forever. ~3s at 60fps.
-        if (m_PadBlockHookActive && m_AutoFallbackOnLeak && m_CleanFrameStreak >= 180)
-        {
-            GetParkourModePadBlockHook().Deactivate();
-            m_PadBlockHookActive = false;
-            m_CleanFrameStreak = 0;
-        }
     }
 }
 
@@ -2026,11 +1772,6 @@ void FreeJumpPlugin::OnUpdate()
     m_JustCapturedKey = 0;
     UpdatePadStates();
 
-    // Parkour Mode's freed bytes are the honest measure of whether the
-    // suppression actually stuck this frame; the verifier counts leaks and
-    // can auto-escalate to the pad detach (see VerifySuppressionIntegrity).
-    VerifySuppressionIntegrity();
-
     // Every binding exists in two profiles (keyboard/mouse + controller).
     // Both profiles' states are refreshed every frame so that switching
     // profiles mid-session can never leave a stale rising edge behind (the
@@ -2059,7 +1800,7 @@ void FreeJumpPlugin::OnUpdate()
         [](const ParkourActionOverride& override) { return override.waitingForKey; });
     const bool anyRebindWaiting = m_WaitingForKey || m_WaitingForDiveKey
         || m_WaitingForParkourKey || waitingForOverrideKey
-        || m_WaitingPadBindAction >= 0;
+        || m_WaitingForBlockedKey;
     if (anyRebindWaiting)
         UpdateAllKeyStates();
 
@@ -2135,20 +1876,23 @@ void FreeJumpPlugin::OnUpdate()
             SaveSettings();
         }
     }
-    else if (m_WaitingPadBindAction >= 0)
+    else if (m_WaitingForBlockedKey)
     {
-        // Parkour Mode per-action pad binding: only pad presses are accepted.
-        // The rebind is started by a UI click, so no mouse-settling logic is
-        // needed here.
-        for (int padCode = 0; padCode < PadCode_COUNT; ++padCode)
+        // Parkour Mode: the next button the player presses becomes blocked.
+        // Keyboard keys, mouse buttons and pad buttons are all assignable; the
+        // usual rebind guards (release latch for LMB/RMB) come from captureKey,
+        // so the click that started this rebind cannot capture itself.
+        int captured = 0;
+        if (captureKey(captured))
         {
-            if (!WasKeyPressed(kPadKeyBase + padCode))
-                continue;
-            m_ActionPadBindings[m_WaitingPadBindAction] = kPadKeyBase + padCode;
-            m_JustCapturedKey = kPadKeyBase + padCode;
-            m_WaitingPadBindAction = -1;
+            if (std::find(m_UserBlockedKeys.begin(), m_UserBlockedKeys.end(), captured)
+                == m_UserBlockedKeys.end())
+            {
+                m_UserBlockedKeys.push_back(captured);
+            }
+            m_JustCapturedKey = captured;
+            m_WaitingForBlockedKey = false;
             SaveSettings();
-            break;
         }
     }
     else if (m_WaitingForParkourKey)
@@ -2193,27 +1937,6 @@ void FreeJumpPlugin::OnUpdate()
         SaveSettings();
     }
 
-    // If parkour mode is on, check for user-blocked keys and add them to
-    // the disabled mask so they are suppressed regardless of the profile.
-    if (m_ParkourModeOn && !m_UserBlockedKeys.empty())
-    {
-        for (int code : m_UserBlockedKeys)
-        {
-            if (code >= kKeyboardKeyMin && code <= kKeyboardKeyMax)
-            {
-                if (WasKeyPressed(code))
-                    m_DisabledActionMask |= (1u << (code & 0x1F));
-            }
-            else if (code >= kPadKeyBase && code < kMaxBindableKey)
-            {
-                int padCode = code - kPadKeyBase;
-                if (WasKeyPressed(code))
-                    m_DisabledActionMask |= (1u << padCode);
-            }
-        }
-        SaveSettings();
-    }
-
     for (ParkourActionOverride& override : m_Overrides)
     {
         if (!override.enable || !override.toggleMode)
@@ -2247,10 +1970,13 @@ void FreeJumpPlugin::OnUpdate()
         }
     }
 
-    const bool wantParkourHook = m_ParkourModeOn && m_DisabledActionMask != 0;
+    // Parkour Mode blocks buttons only while it is ON and the player has
+    // assigned at least one; adding the first button (or toggling the mode on)
+    // installs the sites, and the hooks come off the moment either stops being
+    // true, so the game's input is untouched whenever the feature is unused.
+    const bool wantParkourHook = m_ParkourModeOn && !m_UserBlockedKeys.empty();
     const bool anyParkourSuppressActive =
-        m_KbmSuppressActive || m_PadKeymapSuppressActive || m_MapperSuppressActive
-        || m_PadSnapshotSuppressActive || m_PadPollSanitizeActive;
+        m_KbmFillSuppressActive || m_PadPollSanitizeActive;
     // Re-run while anything is still missing, so a site that was refused once
     // (plugin loaded later, or a transient mismatch) is retried instead of
     // staying refused for the whole session.
@@ -2394,7 +2120,7 @@ void FreeJumpPlugin::OnImGuiRender()
             {
                 m_WaitingForKey = false;
                 m_WaitingForParkourKey = false;
-                m_WaitingPadBindAction = -1;
+                m_WaitingForBlockedKey = false;
                 for (ParkourActionOverride& override : m_Overrides)
                     override.waitingForKey = false;
             }
@@ -2412,67 +2138,14 @@ void FreeJumpPlugin::OnImGuiRender()
         if (m_ParkourModeOn)
         {
             ImGui::SameLine();
-            ImGui::TextDisabled("(frees the disabled actions' keys below)");
+            ImGui::TextDisabled("(hides the blocked buttons below from the game)");
+        }
+        if (m_ParkourModeOn && m_UserBlockedKeys.empty())
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(inactiveColor, "- nothing assigned yet");
         }
         ImGui::Text("  Toggle key: %s", KeyCodeLabel(EffectiveParkourModeKey()).c_str());
-        if (ImGui::TreeNode("User Blocked Keys"))
-        {
-            for (int i = 0; i < (int)m_UserBlockedKeys.size(); ++i)
-            {
-                int code = m_UserBlockedKeys[i];
-                std::string label = KeyCodeLabel(code);
-                ImGui::TextUnformatted(label.c_str());
-                ImGui::SameLine();
-                if (ImGui::Button(("Remove##UserBlocked" + std::to_string(i)).c_str()))
-                {
-                    m_UserBlockedKeys.erase(m_UserBlockedKeys.begin() + i);
-                    SaveSettings();
-                    break;
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Add key to block..."))
-            {
-                m_WaitingForKey = true;
-                m_WaitingForParkourKey = false;
-                m_WaitingForDiveKey = false;
-                for (ParkourActionOverride& override : m_Overrides)
-                    override.waitingForKey = false;
-            }
-            if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Press a key or pad button to add..."); }
-            ImGui::TreePop();
-        }
-        if (m_LastLeakMask)
-        {
-            std::string leakedButtons;
-            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
-            {
-                if (!(m_LastLeakMask & (1u << actionIdx)))
-                    continue;
-                if (!leakedButtons.empty())
-                    leakedButtons += ", ";
-                leakedButtons += ActionKeyName(actionIdx);
-            }
-            ImGui::TextColored(ImVec4(1.0f, 0.20f, 0.20f, 1.00f),
-                "INPUT LEAK: %s (an unhooked input path is writing freed keys)",
-                leakedButtons.c_str());
-        }
-        bool autoFallback = m_AutoFallbackOnLeak;
-        if (ImGui::Checkbox("Auto-engage detach fallback on persistent leak", &autoFallback))
-        {
-            m_AutoFallbackOnLeak = autoFallback;
-            SaveSettings();
-        }
-        if (m_PadBlockHookActive && m_AutoFallbackOnLeak)
-            ImGui::TextColored(inactiveColor, "Auto fallback: pad detach ENGAGED");
-        bool blockPad = m_BlockPadWhileParkour;
-        if (ImGui::Checkbox("Fallback: detach the controller (also stops stick movement)", &blockPad))
-        {
-            m_BlockPadWhileParkour = blockPad;
-            SaveSettings();
-            if (m_ParkourModeOn)
-                ApplyParkourMode(false), ApplyParkourMode(true);
-        }
         if (m_WaitingForParkourKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key or pad button to bind..."); }
         if (ImGui::Button(m_WaitingForParkourKey ? "Cancel Rebind##ParkourMode" : "Rebind##ParkourMode"))
         {
@@ -2480,84 +2153,84 @@ void FreeJumpPlugin::OnImGuiRender()
             if (m_WaitingForParkourKey)
             {
                 m_WaitingForKey = false;
+                m_WaitingForBlockedKey = false;
                 for (ParkourActionOverride& override : m_Overrides)
                     override.waitingForKey = false;
             }
         }
-        if (ImGui::TreeNode("Actions disabled while Parkour Mode is on"))
+
+        // ── Blocked buttons ──────────────────────────────────────────────
+        // The list is the whole feature: every button added here is erased
+        // from the game's own copy of this frame's input before the game reads
+        // it, so the game behaves as if that key/button simply does not exist
+        // while Parkour Mode is ON - while the plugin keeps reading it, so the
+        // very same button can drive a parkour override at that moment.
+        ImGui::TextWrapped(
+            "While Parkour Mode is ON, the game cannot see any button listed here. "
+            "Assign the buttons whose in-game actions you want freed; the button "
+            "itself keeps working for this plugin's overrides.");
+        if (ImGui::TreeNode("Buttons blocked while Parkour Mode is on"))
         {
-            bool maskChanged = false;
-            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
+            bool listChanged = false;
+            for (int i = 0; i < (int)m_UserBlockedKeys.size(); ++i)
             {
-                if (!*ActionKeyName(actionIdx))
-                    continue;
-                bool disabled = (m_DisabledActionMask & (1u << actionIdx)) != 0;
-                if (ImGui::Checkbox(ActionKeyName(actionIdx), &disabled))
-                {
-                    m_DisabledActionMask = disabled
-                        ? (m_DisabledActionMask | (1u << actionIdx))
-                        : (m_DisabledActionMask & ~(1u << actionIdx));
-                    maskChanged = true;
-                }
-            }
-            if (ImGui::Button("Restore defaults (X / Y / LB / Crouch)"))
-            {
-                // Attack=pad X, EagleVision=pad Y, Aim=pad LB (+Quickshot, which is
-                // Aim held while a target is locked), Crouch=the pad's analog
-                // trigger. This is the full list the player asked to be freed on a
-                // controller, and it is also the constructor default.
-                m_DisabledActionMask = (1u << 1) | (1u << 2) | (1u << 11) | (1u << 10);
-                maskChanged = true;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Select controller actions (X / Y / LB / RB)"))
-            {
-                // Additive: never silently re-enable something the player
-                // deliberately ticked off.
-                m_DisabledActionMask |= (1u << 1) | (1u << 2) | (1u << 11) | (1u << 13);
-                maskChanged = true;
-            }
-            if (maskChanged)
-                SaveSettings();
-            // Bind a controller button directly to each disabled action (skip
-            // the checkbox and bind straight to the action). Only the ticked
-            // actions show a Bind button.
-            for (int actionIdx = 0; actionIdx < kActionKeyCount; ++actionIdx)
-            {
-                // Guard BEFORE the PushID: the old order pushed for every
-                // iteration and popped only one at the loop end, so every
-                // unticked/skipped action leaked an ID off the stack each
-                // frame — Dear ImGui's "missing PopID" imbalance assertion.
-                if (!(m_DisabledActionMask & (1u << actionIdx)) || !*ActionKeyName(actionIdx))
-                    continue;
-                ImGui::PushID(actionIdx);
-                ImGui::Text("%s: ", ActionKeyName(actionIdx));
+                const int code = m_UserBlockedKeys[i];
+                ImGui::PushID(i);
+                ImGui::TextUnformatted(KeyCodeLabel(code).c_str());
                 ImGui::SameLine();
-                const int boundPadCode = GetActionPadBinding(actionIdx);
-                if (boundPadCode >= kPadKeyBase)
-                    ImGui::TextColored(holdColor, "button %d", boundPadCode - kPadKeyBase);
-                else
-                    ImGui::TextDisabled("(none)");
+                ImGui::TextDisabled("-> %s", DescribeBlockedInputTarget(code).c_str());
                 ImGui::SameLine();
-                const bool isBindingThis = (m_WaitingPadBindAction == actionIdx);
-                if (ImGui::Button(isBindingThis ? "Done" : "Bind"))
+                if (ImGui::Button("Remove"))
                 {
-                    m_WaitingPadBindAction = isBindingThis ? -1 : actionIdx;
-                    if (!isBindingThis)
-                    {
-                        // When binding starts, cancel any other rebind so the
-                        // captured button can't be mistaken for something else.
-                        m_WaitingForKey = false;
-                        m_WaitingForParkourKey = false;
-                        m_WaitingForDiveKey = false;
-                    }
-                    SaveSettings();
+                    m_UserBlockedKeys.erase(m_UserBlockedKeys.begin() + i);
+                    listChanged = true;
+                    ImGui::PopID();
+                    break;
                 }
                 ImGui::PopID();
             }
-            if (m_WaitingPadBindAction >= 0)
-                ImGui::TextColored(rebindColor, "Press a controller button (X=2, Y=3, LB=5, RB=4) ...");
+            if (m_UserBlockedKeys.empty())
+                ImGui::TextColored(inactiveColor, "Nothing is blocked yet.");
+            if (ImGui::Button(m_WaitingForBlockedKey ? "Cancel Add" : "Add button to block..."))
+            {
+                // Cancel every other rebind first: a button that is pressed
+                // while another rebind is waiting must not be captured twice.
+                m_WaitingForKey = false;
+                m_WaitingForParkourKey = false;
+                m_WaitingForDiveKey = false;
+                for (ParkourActionOverride& override : m_Overrides)
+                    override.waitingForKey = false;
+                m_WaitingForBlockedKey = !m_WaitingForBlockedKey;
+            }
+            if (m_WaitingForBlockedKey)
+            {
+                ImGui::SameLine();
+                ImGui::TextColored(rebindColor, "Press any key, mouse button or controller button...");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear all") && !m_UserBlockedKeys.empty())
+            {
+                m_UserBlockedKeys.clear();
+                listChanged = true;
+            }
+            if (listChanged)
+                SaveSettings();
+            // Transparency about what cannot be blocked: stick directions and
+            // triggers arrive as analog axes, and this build has not mapped
+            // them, so the UI says so instead of silently ignoring them.
+            ImGui::TextDisabled(
+                "Stick directions and the triggers cannot be blocked (the game reads them as "
+                "analog axes); every other keyboard key, mouse button, controller button and "
+                "the d-pad can.");
             ImGui::TreePop();
+        }
+        bool blockPad = m_BlockPadWhileParkour;
+        if (ImGui::Checkbox("Fallback: detach the controller (also stops stick movement)", &blockPad))
+        {
+            m_BlockPadWhileParkour = blockPad;
+            SaveSettings();
+            if (m_ParkourModeOn)
+                ApplyParkourMode(false), ApplyParkourMode(true);
         }
     }
 
@@ -2572,7 +2245,7 @@ void FreeJumpPlugin::OnImGuiRender()
             newOverride.waitingForKey = true; // start in bind mode
             m_WaitingForKey = false;
             m_WaitingForParkourKey = false;
-            m_WaitingPadBindAction = -1;
+            m_WaitingForBlockedKey = false;
             for (ParkourActionOverride& override : m_Overrides)
                 override.waitingForKey = false;
             m_Overrides.push_back(newOverride);
@@ -2617,7 +2290,7 @@ void FreeJumpPlugin::OnImGuiRender()
                         {
                             m_WaitingForKey = false;
                             m_WaitingForParkourKey = false;
-                            m_WaitingPadBindAction = -1;
+                            m_WaitingForBlockedKey = false;
                         }
                     }
                     if (ov.waitingForKey) ImGui::TextColored(rebindColor, "Input key or pad button to bind...");
