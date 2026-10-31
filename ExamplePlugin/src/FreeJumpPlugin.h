@@ -137,6 +137,7 @@ private:
     // both the game's own keymap and the built-in native-layout defaults, so
     // the player decides which controller button is freed for which action.
     std::array<int, 0x20> m_ActionPadBindings{};
+    std::vector<int> m_UserBlockedKeys;   // user-specified keys to block when parkour mode is on
     int m_WaitingPadBindAction = -1;   // UI rebind target, -1 = none
 
     // Wall-to-Hang (ported from ACUFixes-0.9.3 Parkour Helpers / dive helper).

@@ -1343,6 +1343,19 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseInteger(value, 16, keyCode) && IsValidBindableKey(keyCode))
                 m_DiveHotkeyPad = keyCode;
         }
+        else if (TryGetValue(trimmedLine, "UserBlockedKeys=", value))
+        {
+            // Pairs of "keyCode" (bindable code). Unknown/malformed pairs are skipped.
+            for (const std::string_view keyToken : Split(value, '|'))
+            {
+                int code = 0;
+                if (TryParseInteger(keyToken, 10, code)
+                    && code >= kKeyboardKeyMin && code <= kMaxBindableKey)
+                {
+                    m_UserBlockedKeys.push_back(code);
+                }
+            }
+        }
         else if (TryGetValue(trimmedLine, "NumOverrides=", value))
         {
             int count = 0;
@@ -1428,6 +1441,22 @@ void FreeJumpPlugin::SaveSettings()
                 file << "|";
             file << actionIdx << ":" << boundCode;
             firstBinding = false;
+        }
+    }
+    file << "\n";
+    // User-specified keys to block when parkour mode is on
+    file << "UserBlockedKeys=";
+    {
+        bool firstKey = true;
+        for (int code : m_UserBlockedKeys)
+        {
+            if (code < kPadKeyBase)
+            {
+                if (!firstKey)
+                    file << "|";
+                file << code;
+                firstKey = false;
+            }
         }
     }
     file << "\n";
@@ -2164,6 +2193,27 @@ void FreeJumpPlugin::OnUpdate()
         SaveSettings();
     }
 
+    // If parkour mode is on, check for user-blocked keys and add them to
+    // the disabled mask so they are suppressed regardless of the profile.
+    if (m_ParkourModeOn && !m_UserBlockedKeys.empty())
+    {
+        for (int code : m_UserBlockedKeys)
+        {
+            if (code >= kKeyboardKeyMin && code <= kKeyboardKeyMax)
+            {
+                if (WasKeyPressed(code))
+                    m_DisabledActionMask |= (1u << (code & 0x1F));
+            }
+            else if (code >= kPadKeyBase && code < kMaxBindableKey)
+            {
+                int padCode = code - kPadKeyBase;
+                if (WasKeyPressed(code))
+                    m_DisabledActionMask |= (1u << padCode);
+            }
+        }
+        SaveSettings();
+    }
+
     for (ParkourActionOverride& override : m_Overrides)
     {
         if (!override.enable || !override.toggleMode)
@@ -2365,6 +2415,47 @@ void FreeJumpPlugin::OnImGuiRender()
             ImGui::TextDisabled("(frees the disabled actions' keys below)");
         }
         ImGui::Text("  Toggle key: %s", KeyCodeLabel(EffectiveParkourModeKey()).c_str());
+        if (ImGui::TreeNode("User Blocked Keys"))
+        {
+            bool changed = false;
+            for (int i = 0; i < (int)m_UserBlockedKeys.size(); ++i)
+            {
+                int code = m_UserBlockedKeys[i];
+                std::string label = KeyCodeLabel(code);
+                if (ImGui::Checkbox(label.c_str(), &code))
+                {
+                    if (code)
+                        m_UserBlockedKeys[i] = code;
+                    else
+                    {
+                        m_UserBlockedKeys.erase(m_UserBlockedKeys.begin() + i);
+                        --i;
+                    }
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::TextDisabled("Blocks this key when parkour mode is ON, regardless of profile.");
+                ImGui::SameLine();
+                if (ImGui::Button(("Remove##UserBlocked" + std::to_string(i)).c_str()))
+                {
+                    m_UserBlockedKeys.erase(m_UserBlockedKeys.begin() + i);
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed)
+                SaveSettings();
+            if (ImGui::Button("Add key to block..."))
+            {
+                m_WaitingForKey = true;
+                m_WaitingForParkourKey = false;
+                m_WaitingForDiveKey = false;
+                for (ParkourActionOverride& override : m_Overrides)
+                    override.waitingForKey = false;
+            }
+            if (m_WaitingForKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Press a key or pad button to add..."); }
+            ImGui::TreePop();
+        }
         if (m_LastLeakMask)
         {
             std::string leakedButtons;
