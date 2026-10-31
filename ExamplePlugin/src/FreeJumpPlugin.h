@@ -102,6 +102,22 @@ public:
     // Human-readable one-liner for a blocked entry, so the UI can state exactly
     // what the game will stop seeing.
     static std::string DescribeBlockedInputTarget(int bindableKeyCode);
+
+    // ── Parkour Mode: measured, not assumed, controller mapping ─────────────
+    // The game resolves controller buttons into actions through one of two
+    // paths, depending on the device id it assigned to the pad - and that id is
+    // NOT the same for a raw controller and for an emulator such as DS4Windows
+    // (which is exactly the variability this feature exists to absorb). So a
+    // blocked controller button is not resolved from a hard-coded table: the
+    // plugin watches the game's own pad state and learns which snapshot slot a
+    // button occupies at the moment the player assigns it.
+    void NoteGamePadState(const uint8_t* padState);   // the 0x110-byte DirectInput state
+    void LearnPadSlotWhileWaiting();
+    int GetLearnedPadSlot(int bindablePadCode) const;
+    void RememberLearnedPadSlot(int bindablePadCode, int gameSlot);
+    // True while the player is assigning a blocked button, which is when the
+    // pad seams have to run even with nothing to block (see LearnPadSlotWhileWaiting).
+    bool IsBlockedKeyCapturePending() const { return m_WaitingForBlockedKey; }
 private:
     void UpdateKeyState(int bindableKeyCode);
     void UpdateAllKeyStates();
@@ -145,6 +161,19 @@ private:
     std::vector<int> m_UserBlockedKeys{ VK_LBUTTON, VK_RBUTTON, VK_LCONTROL };
     bool m_WaitingForBlockedKey = false;   // UI rebind target, false = none
 
+    // Parkour Mode controller-slot learning. Slot -1 means the built-in table
+    // is all we have; a measured value always wins. Kept per controller code,
+    // so a keyboard-only player pays nothing and a pad player can move between
+    // DS4Windows and a raw connection without re-assigning anything.
+    std::vector<std::pair<int, int>> m_LearnedPadSlots;
+    // The game's own pad state, as observed this frame and last frame by
+    // whichever pad seam executed (the poll's destination, the device-9
+    // snapshot at InputContainerBig+0x864, or the per-device mapper's own
+    // buffer). Powers the UI's "what the game sees" readout and the learning.
+    std::array<uint8_t, 0x110> m_GamePadSnapshot{};
+    std::array<uint8_t, 0x110> m_GamePadSnapshotPrev{};
+    bool m_GamePadObservedThisFrame = false;
+
     // Wall-to-Hang (ported from ACUFixes-0.9.3 Parkour Helpers / dive helper).
     // While the dive hotkey is held, wall-eject-to-hang candidates are created
     // by hooking the ClimbFacade/BackEject scanners, the climbFacade tester's
@@ -183,6 +212,8 @@ private:
     // nothing left to do.
     bool m_KbmFillSuppressActive = false;
     bool m_PadPollSanitizeActive = false;
+    bool m_PadSnapshotSuppressActive = false;
+    bool m_PadMapperSuppressActive = false;
     bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
     bool m_OverrideFallbackRefused = false;

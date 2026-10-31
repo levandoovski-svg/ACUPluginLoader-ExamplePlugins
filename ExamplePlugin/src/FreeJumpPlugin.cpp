@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -28,6 +29,7 @@
 
 // ACU 1.5.0 / ACUFixes-0.9.3 verified SmallArray POD-removal entry point.
 DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
+
 
 
 namespace
@@ -499,10 +501,32 @@ namespace
     // pressed state for a button the game never received.
     FreeJumpPlugin* g_ParkourModeInstance = nullptr;
 
+    // Per-seam execution counters since Parkour Mode was last turned on. They
+    // answer the one question static analysis cannot: is this seam on the
+    // player's input path at all. Zero while controller buttons are pressed
+    // means that seam never runs on this install, which is exactly what the
+    // manual test needs to know (and why all three pad seams are installed).
+    uint32_t g_PadPollHits = 0;
+    uint32_t g_PadSnapshotHits = 0;
+    uint32_t g_PadMapperHits = 0;
+    uint32_t g_KbmFillHits = 0;
+
     bool IsParkourBlockingActive()
     {
         const FreeJumpPlugin* owner = g_ParkourModeInstance;
         return owner && !owner->GetBlockedKeys().empty();
+    }
+
+    // True while the player is assigning a button. The pad seams have to run
+    // then even though nothing is being blocked yet: assigning a controller
+    // button IS a measurement of the game's pad state, and we cannot know
+    // before the capture whether the player will press a pad button or a key.
+    // The seams only observe when they are not blocking (see
+    // ClearBlockedPadButtons), so watching is harmless.
+    bool IsBlockedKeyCapturePending()
+    {
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        return owner && owner->IsBlockedKeyCapturePending();
     }
 
     // The one mapping both blockers use: bindable code -> the byte(s) of the
@@ -536,6 +560,7 @@ namespace
     // the entire frame — see the seam documentation above.
     void SanitizeKbmKeymapFillSource(AllRegisters* params)
     {
+        ++g_KbmFillHits;
         if (!IsParkourBlockingActive())
             return;
         const FreeJumpPlugin* owner = g_ParkourModeInstance;
@@ -586,57 +611,126 @@ namespace
         }
     }
 
-    // ── Parkour Mode, gamepad: hide the button at ITS SOURCE ────────────────
-    // 0x1427289A0 is the game's pad poll, and it is the ONE function both
-    // gamepad paths go through:
-    //   0x14273BEA1  call 0x1427289A0   device id 9  -> writes InputContainerBig+0x864
-    //   0x142739EA6  call 0x1427289A0   every other id -> writes a stack copy at rsp+0x20
-    // Both are a 0x110-byte DirectInput state whose digital buttons live at
-    // +0x30+code (bit 7 = pressed) and whose hat dwords start at +0x20. Inside
-    // the poll the destination buffer is rsi (set at 0x142728B8 from the
-    // caller's rdx) and rbx is the InputContainerBig*.
+    // ── Parkour Mode, gamepad: hide the assigned buttons ─────────────────
+    // A full-image rel32 scan over .text shows the game's pad poll
+    // (0x1427289A0) is called from EXACTLY two places:
+    //   0x14273BEA1  - device id 9: fills InputContainerBig+0x864
+    //   0x142739EA6  - every other id: fills the per-device mapper's stack buffer
+    // Both callers therefore converge on the poll, so hooking the poll covers
+    // both paths with one seam. Two more mid-function seams are installed so
+    // the UI can prove which path a given install actually takes, and so that
+    // clearing still happens if one is unexpectedly absent:
+    //   0x14273BEB3 - `lea rdx,[rbx+0x864]`, 7 whole position-independent bytes
+    //                 inside the device-9 path, before the pad keymap fill.
+    //   0x14273A726 - `mov r14,[rsp+0x148]`, 8 whole bytes inside the mapper.
+    // All three are mid-function seams: they re-execute their stolen bytes and
+    // jump straight back, so nothing about the game's control flow or its
+    // `test al,al` on the poll's result can be disturbed. (Stealing a `call`
+    // instead is not an option here - this hooking framework restores RAX from
+    // the stack, so a callback cannot supply a return value for the game to
+    // test, and the pad would be treated as disconnected.)
     //
-    // Hooking at 0x142728A1F - the instruction right after GetDeviceState
-    // returned and filled the buffer - therefore lets one site clear the
-    // buttons for BOTH paths, before the keymap fill (0x14273B390) or the
-    // per-device mapper (0x142739E40) can turn them into actions. The game is
-    // never handed the button at all: no action, no press edge, no hold.
-    //
-    // The rest of the poll function only reads the container's own analog
-    // fields (+0x380) and the stack scratch area, never the buffer we clear,
-    // so the force-feedback / vibration tail still works; and only the bytes
-    // the player assigned are touched, so every other button and the sticks
-    // stay fully alive.
-    void SanitizePadPollSnapshot(AllRegisters* params)
+    // Every seam only ever clears the bytes the player assigned, so movement,
+    // sticks and every other button stay fully alive, and the plugin's own
+    // XInput polling (a different DLL reading the real device) is untouched —
+    // which is what lets the very same button drive a parkour override.
+    enum class PadSeam
     {
-        if (!IsParkourBlockingActive())
+        Poll,       // the game's own pad poll, both paths converge on it
+        Snapshot,   // the device-9 path's snapshot at InputContainerBig+0x864
+        Mapper,     // the per-device mapper's own stack copy
+    };
+
+    void ObserveGamePadState(FreeJumpPlugin* owner, const uint8_t* padState, PadSeam seam)
+    {
+        if (!owner || !padState)
             return;
-        const FreeJumpPlugin* owner = g_ParkourModeInstance;
-        auto* padState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rsi_));
-        if (!padState)
+        switch (seam)
+        {
+        case PadSeam::Poll:     ++g_PadPollHits; break;
+        case PadSeam::Snapshot: ++g_PadSnapshotHits; break;
+        case PadSeam::Mapper:   ++g_PadMapperHits; break;
+        }
+        owner->NoteGamePadState(padState);
+    }
+
+    // Clears every blocked controller entry from a 0x110-byte DirectInput pad
+    // state. A controller code whose slot was MEASURED uses that slot; anything
+    // else falls back to the built-in table. A slot that cannot be resolved is
+    // skipped rather than guessed at.
+    void ClearBlockedPadButtons(const FreeJumpPlugin* owner, AllRegisters* params,
+                                uint8_t* padState)
+    {
+        if (!owner || !padState || !IsParkourBlockingActive())
             return;
         for (const int bindableKeyCode : owner->GetBlockedKeys())
         {
             const BlockedInputSlot slot = ComputeBlockedInputSlot(bindableKeyCode);
-            switch (slot.kind)
+            if (slot.kind == BlockedInputKind::PadSnapshotButton)
             {
-            case BlockedInputKind::PadSnapshotButton:
-                // Clear the whole byte, not just bit 7, so the button is not
-                // merely unpressed but indistinguishable from "not touched".
-                padState[0x30 + slot.slot] = 0;
-                break;
-            case BlockedInputKind::PadSnapshotHat:
+                const int gameSlot = owner->GetLearnedPadSlot(bindableKeyCode);
+                const int effectiveSlot = gameSlot >= 0 ? gameSlot : slot.slot;
+                if (effectiveSlot >= 0 && effectiveSlot < 0xE0)
+                {
+                    // Clear the whole byte, not just bit 7, so the button is
+                    // not merely unpressed but indistinguishable from "not
+                    // touched this frame".
+                    padState[0x30 + effectiveSlot] = 0;
+                }
+            }
+            else if (slot.kind == BlockedInputKind::PadSnapshotHat)
             {
                 // DirectInput's "hat centered": every direction compare in the
-                // mapper (0/9000/18000/27000) fails against it, which is what
-                // frees all four d-pad directions in one write.
+                // keymap fill and the mapper (0/9000/18000/27000) fails against
+                // it, which is what frees all four d-pad directions at once.
                 *reinterpret_cast<uint32_t*>(padState + 0x20) = 0xFFFFFFFFu;
-                break;
-            }
-            default:
-                break;
             }
         }
+    }
+
+    void SanitizePadPollSnapshot(AllRegisters* params)
+    {
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        if (!owner)
+            return;
+        auto* padState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rsi_));
+        if (!padState)
+            return;
+        // Observed and counted: this seam sees the state the game's own device
+        // layer just produced - the input that actually decides whether a
+        // button reaches the game - and is therefore the right place both to
+        // learn from and to clear from.
+        ObserveGamePadState(g_ParkourModeInstance, padState, PadSeam::Poll);
+        ClearBlockedPadButtons(owner, params, padState);
+    }
+
+    // The device-9 path. rbx is the InputContainerBig* at this site, and the
+    // snapshot is its own field at +0x864 - both proven by the site's byte
+    // pattern, so there is no pointer guesswork. This seam also gives the UI an
+    // independent signal that the device-9 path is the one running.
+    void SanitizePadSnapshotKeymapPath(AllRegisters* params)
+    {
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        if (!owner)
+            return;
+        auto* padState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_)) + 0x864;
+        if (!padState)
+            return;
+        ++g_PadSnapshotHits;
+        ObserveGamePadState(g_ParkourModeInstance, padState, PadSeam::Snapshot);
+        ClearBlockedPadButtons(owner, params, padState);
+    }
+
+    // The per-device mapper. rbx is the container and r14/rsi are reloaded by
+    // the game right after this site, and the mapper's own poll buffer is
+    // reachable only through rsp - which this framework's saved-RSP
+    // representation does not map to reliably - so this seam stays silent and
+    // only counts. It exists to TELL US whether the mapper path is the one
+    // running: zero hits here while pad buttons are pressed means the mapper
+    // path never ran, and the in-poll seam is the only one that can be clearing.
+    void SanitizePadMapperBuffer(AllRegisters* params)
+    {
+        ++g_PadMapperHits;
     }
 
     // ── Parkour Mode, keyboard/mouse: clear the blocked key before the
@@ -672,13 +766,6 @@ namespace
         return s_hook;
     }
 
-    // The single site that covers both gamepad paths: 0x142728A1F is
-    // `movzx edi,dil; test eax,eax` (40 0F B6 FF | 85 C0) - 6 whole,
-    // position-independent bytes immediately after `call [rax+0x48]`
-    // (GetDeviceState, 0x110 bytes into rsi). rsi is this frame's pad
-    // snapshot and rbx the InputContainerBig; both are callee-saved and used
-    // again right after the site, so the interposed C call cannot have
-    // clobbered them.
     struct ParkourModePadPollHook : AutoAssemblerCodeHolder_Base
     {
         ParkourModePadPollHook()
@@ -697,6 +784,51 @@ namespace
         return s_hook;
     }
 
+    // The device-9 path: 0x14273BEB3 is `lea rdx,[rbx+0x864]` - 7 whole,
+    // position-independent bytes, running after the poll at 0x14273BEA1 filled
+    // InputContainerBig+0x864 and before the pad keymap fill at 0x14273BEC0
+    // consumes it. rbx is the InputContainerBig*.
+    struct ParkourModePadSnapshotHook : AutoAssemblerCodeHolder_Base
+    {
+        ParkourModePadSnapshotHook()
+        {
+            PresetScript_CCodeInTheMiddle(
+                0x14273BEB3, 7,
+                SanitizePadSnapshotKeymapPath,
+                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
+                true);
+        }
+    };
+
+    AutoAssembleWrapper<ParkourModePadSnapshotHook>& GetParkourModePadSnapshotHook()
+    {
+        static AutoAssembleWrapper<ParkourModePadSnapshotHook> s_hook;
+        return s_hook;
+    }
+
+    // The per-device mapper's tail: 0x14273A726 is `mov r14,[rsp+0x148]` - 8
+    // whole, position-independent bytes, after the mapper's poll wrote its stack
+    // copy and after its last keyStates write. It only counts, so ALL of the
+    // stolen bytes are re-executed and the game's own state is untouched; the
+    // point is to know whether this path runs at all (see the callback).
+    struct ParkourModePadMapperHook : AutoAssemblerCodeHolder_Base
+    {
+        ParkourModePadMapperHook()
+        {
+            PresetScript_CCodeInTheMiddle(
+                0x14273A726, 8,
+                SanitizePadMapperBuffer,
+                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
+                true);
+        }
+    };
+
+    AutoAssembleWrapper<ParkourModePadMapperHook>& GetParkourModePadMapperHook()
+    {
+        static AutoAssembleWrapper<ParkourModePadMapperHook> s_hook;
+        return s_hook;
+    }
+
     // ── Parkour Mode: detach the game's pad device (fallback, off by default) ──
     // 0x1427289A0 is the frame poll of the game's DirectInput/HID pad state
     // (vtable slot 0x48 of the device at InputContainerBig+0x838, 0x110 bytes
@@ -712,11 +844,12 @@ namespace
     // pad-bound override triggers keep working.
     //
     // Kept only as a fallback for builds whose pad input does not go through
-    // the pad-poll site above (e.g. the UI reports that site as owned by
-    // another plugin, and blocked pad buttons still reach the game). It
-    // disables the ENTIRE controller, sticks included, so the character
-    // cannot move while Parkour Mode is on — which is why it is off by
-    // default instead of being the primary mechanism.
+    // any of the pad seams above (the UI reports every seam as owned by another
+    // plugin, or all of them show zero hits while pad buttons are pressed and
+    // blocked buttons still reach the game). It disables the ENTIRE
+    // controller, sticks included, so the character cannot move while Parkour
+    // Mode is on — which is why it is off by default instead of being the
+    // primary mechanism.
     // The whole function is replaced (no return path needed), and the original
     // prologue is restored on deactivate.
     struct ParkourModePadBlockHook : AutoAssemblerCodeHolder_Base
@@ -1041,6 +1174,22 @@ namespace
             && site[3] == 0xFF && site[4] == 0x85 && site[5] == 0xC0);
     }
 
+    bool IsPadSnapshotSitePatched()
+    {
+        // Vanilla: lea rdx,[rbx+0x864]  (0x14273BEB3, 7 bytes).
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273BEB3);
+        return !(site[0] == 0x48 && site[1] == 0x8D && site[2] == 0x93
+            && site[3] == 0x64 && site[4] == 0x08 && site[5] == 0x00 && site[6] == 0x00);
+    }
+
+    bool IsPadMapperSitePatched()
+    {
+        // Vanilla: mov r14,[rsp+0x148]  (0x14273A726, 8 bytes).
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x14273A726);
+        return !(site[0] == 0x4C && site[1] == 0x8B && site[2] == 0xB4 && site[3] == 0x24
+            && site[4] == 0x48 && site[5] == 0x01 && site[6] == 0x00 && site[7] == 0x00);
+    }
+
     bool IsParkourPadPollSitePatched()
     {
         // Pad poll header: push rbx; push rsi; push rdi; sub rsp,0x90.
@@ -1109,6 +1258,90 @@ static std::string GetIniPath()
 // Shown next to every entry of the blocked list, so the player can see that
 // "Mouse Left" really is the game's button 0 and "Left Ctrl" really is
 // scancode 0x1D rather than having to take the suppression on trust.
+// ── Parkour Mode: the game's own pad state, and what it teaches us ───────
+// Every pad seam records the 0x110-byte DirectInput state it just saw. That
+// single observation powers two things:
+//   * the UI's "what the game currently sees" readout, so a player can confirm
+//     that a blocked button really is invisible to the game;
+//   * the measured controller mapping below.
+// Only the FIRST seam to run in a frame records, because it is the one that
+// still sees the game's untouched state (the seams after it have cleared the
+// blocked bytes). The observation is only ever read, never used to block.
+void FreeJumpPlugin::NoteGamePadState(const uint8_t* padState)
+{
+    if (!padState)
+        return;
+    if (!m_GamePadObservedThisFrame)
+    {
+        m_GamePadSnapshotPrev = m_GamePadSnapshot;
+        std::memcpy(m_GamePadSnapshot.data(), padState, m_GamePadSnapshot.size());
+        m_GamePadObservedThisFrame = true;
+    }
+}
+
+void FreeJumpPlugin::LearnPadSlotWhileWaiting()
+{
+    if (!m_WaitingForBlockedKey || !m_GamePadObservedThisFrame)
+        return;
+    // The button the PLAYER pressed this frame, and the button the GAME saw:
+    // both are rising edges over the same physical press. So the game's slot
+    // that went from released to pressed in this very frame is the slot that
+    // button occupies on this controller - measured, not assumed, which is
+    // exactly what makes this survive DS4Windows being on or off (or any other
+    // emulator renumbering the buttons the game is handed).
+    // m_PadDown is refreshed before this runs and m_KeyPressedThisFrame holds
+    // this frame's rising edges for every bindable code (updated for pad codes
+    // by UpdateAllKeyStates, which any pending rebind triggers). Prefer that
+    // over m_PadPreviousDown, which is never written.
+    int pressedPadCode = 0;
+    for (int padCode = 0; padCode < PadCode_COUNT && !pressedPadCode; ++padCode)
+    {
+        if (m_KeyPressedThisFrame[kPadKeyBase + padCode])
+            pressedPadCode = kPadKeyBase + padCode;
+    }
+    if (!pressedPadCode)
+        return;
+    for (int slot = 0x30; slot < 0xE0; ++slot)
+    {
+        const bool pressedNow = (m_GamePadSnapshot[slot] & 0x80) != 0;
+        const bool pressedLast = (m_GamePadSnapshotPrev[slot] & 0x80) != 0;
+        if (!pressedNow || pressedLast)
+            continue;
+        RememberLearnedPadSlot(pressedPadCode, slot - 0x30);
+        break;   // one press, one button: the first rising slot is the one
+    }
+}
+
+int FreeJumpPlugin::GetLearnedPadSlot(int bindablePadCode) const
+{
+    for (const std::pair<int, int>& learned : m_LearnedPadSlots)
+    {
+        if (learned.first == bindablePadCode)
+            return learned.second;
+    }
+    return -1;
+}
+
+void FreeJumpPlugin::RememberLearnedPadSlot(int bindablePadCode, int gameSlot)
+{
+    if (gameSlot < 0 || gameSlot >= 0xE0)
+        return;
+    for (std::pair<int, int>& learned : m_LearnedPadSlots)
+    {
+        if (learned.first == bindablePadCode)
+        {
+            if (learned.second != gameSlot)
+            {
+                learned.second = gameSlot;
+                SaveSettings();
+            }
+            return;
+        }
+    }
+    m_LearnedPadSlots.push_back({ bindablePadCode, gameSlot });
+    SaveSettings();
+}
+
 std::string FreeJumpPlugin::DescribeBlockedInputTarget(int bindableKeyCode)
 {
     const BlockedInputSlot slot = ComputeBlockedInputSlot(bindableKeyCode);
@@ -1134,9 +1367,20 @@ std::string FreeJumpPlugin::DescribeBlockedInputTarget(int bindableKeyCode)
         break;
     }
     case BlockedInputKind::PadSnapshotButton:
-        where << "controller button " << slot.slot
+    {
+        char detail[64] = {};
+        if (const FreeJumpPlugin* self = g_ParkourModeInstance)
+        {
+            const int measured = self->GetLearnedPadSlot(bindableKeyCode);
+            if (measured >= 0)
+                snprintf(detail, sizeof(detail), "game slot %d (measured)", measured);
+        }
+        if (!*detail)
+            snprintf(detail, sizeof(detail), "game slot %d", slot.slot);
+        where << "controller button " << detail
               << " (" << PadCodeName(bindableKeyCode) << ")";
         break;
+    }
     case BlockedInputKind::PadSnapshotHat:
         where << "controller d-pad (all four directions)";
         break;
@@ -1154,7 +1398,9 @@ void FreeJumpPlugin::LoadSettings()
 
     std::vector<ParkourActionOverride> loadedOverrides;
     std::vector<int> loadedBlockedKeys;
+    std::vector<std::pair<int, int>> loadedLearnedPadSlots;
     bool hasBlockedKeys = false;   // distinguishes "list cleared" from "key absent"
+    bool hasLearnedPadSlots = false;
     bool hasOverrideCount = false;
     bool hasOverrideData = false;
     std::string line;
@@ -1253,6 +1499,27 @@ void FreeJumpPlugin::LoadSettings()
             }
             hasBlockedKeys = true;
         }
+        else if (TryGetValue(trimmedLine, "ParkourLearnedPadSlots=", value))
+        {
+            // "padCode:gameSlot" pairs - the MEASURED controller mapping, so
+            // blocking never has to assume where a button sits in the game's
+            // pad state. Malformed pairs are skipped, keeping the rest.
+            for (const std::string_view pairToken : Split(value, '|'))
+            {
+                const size_t colon = pairToken.find(':');
+                if (colon == std::string_view::npos)
+                    continue;
+                int padCode = 0, gameSlot = 0;
+                if (TryParseInteger(pairToken.substr(0, colon), 10, padCode)
+                    && TryParseInteger(pairToken.substr(colon + 1), 10, gameSlot)
+                    && padCode >= kPadKeyBase && padCode < kMaxBindableKey
+                    && gameSlot >= 0 && gameSlot < 0xE0)
+                {
+                    loadedLearnedPadSlots.push_back({ padCode, gameSlot });
+                }
+            }
+            hasLearnedPadSlots = true;
+        }
         else if (TryGetValue(trimmedLine, "NumOverrides=", value))
         {
             int count = 0;
@@ -1291,6 +1558,8 @@ void FreeJumpPlugin::LoadSettings()
 
     if (hasBlockedKeys)
         m_UserBlockedKeys = std::move(loadedBlockedKeys);
+    if (hasLearnedPadSlots)
+        m_LearnedPadSlots = std::move(loadedLearnedPadSlots);
     if (hasOverrideCount || hasOverrideData)
         m_Overrides = std::move(loadedOverrides);
 }
@@ -1327,6 +1596,24 @@ void FreeJumpPlugin::SaveSettings()
                 file << "|";
             file << code;
             firstKey = false;
+        }
+    }
+    file << "\n";
+    // The MEASURED controller mapping: which slot each assigned controller
+    // button occupies in the game's own pad state. Persisted so a learned
+    // mapping survives a restart and a switch between DS4Windows and a raw
+    // connection without the player re-measuring anything.
+    file << "ParkourLearnedPadSlots=";
+    {
+        bool firstPair = true;
+        for (const std::pair<int, int>& learned : m_LearnedPadSlots)
+        {
+            if (learned.second < 0)
+                continue;
+            if (!firstPair)
+                file << "|";
+            file << learned.first << ":" << learned.second;
+            firstPair = false;
         }
     }
     file << "\n";
@@ -1454,9 +1741,22 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         // only the other family's site installs.
         g_ParkourModeInstance = this;
 
-        // Two independent sites, one per device family. A site another plugin
-        // already patched is skipped (never fought over) and costs only its own
-        // family; the UI reports which are live, and the retry in OnUpdate
+        // Fresh activation: the seam counters then describe this ON period, so
+        // "0 hits" means "never ran here" rather than "ran before this turn".
+        const bool wasSomethingActive = m_KbmFillSuppressActive
+            || m_PadPollSanitizeActive || m_PadSnapshotSuppressActive
+            || m_PadMapperSuppressActive;
+        if (!wasSomethingActive)
+        {
+            g_PadPollHits = 0;
+            g_PadSnapshotHits = 0;
+            g_PadMapperHits = 0;
+            g_KbmFillHits = 0;
+        }
+
+        // Independent sites. A site another plugin already patched is skipped
+        // (never fought over) and costs only its own seam; the UI reports which
+        // are live and how often each has run, and the retry in OnUpdate
         // installs one that was refused earlier.
         bool anyRefused = false;
         if (!m_KbmFillSuppressActive)
@@ -1469,8 +1769,8 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
                 m_KbmFillSuppressActive = true;
             }
         }
-        // The pad path: one site at the poll covers both of the game's pad
-        // stages, so the buttons themselves never reach the game.
+        // Three pad seams, because which one carries this install's controller
+        // input is a runtime fact (device id), not a static one.
         if (!m_PadPollSanitizeActive)
         {
             if (IsPadPollSitePatched())
@@ -1479,6 +1779,26 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
             {
                 GetParkourModePadPollHook().Activate();
                 m_PadPollSanitizeActive = true;
+            }
+        }
+        if (!m_PadSnapshotSuppressActive)
+        {
+            if (IsPadSnapshotSitePatched())
+                anyRefused = true;
+            else
+            {
+                GetParkourModePadSnapshotHook().Activate();
+                m_PadSnapshotSuppressActive = true;
+            }
+        }
+        if (!m_PadMapperSuppressActive)
+        {
+            if (IsPadMapperSitePatched())
+                anyRefused = true;
+            else
+            {
+                GetParkourModePadMapperHook().Activate();
+                m_PadMapperSuppressActive = true;
             }
         }
         m_ParkourHookRefused = anyRefused;
@@ -1510,6 +1830,16 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         {
             GetParkourModePadPollHook().Deactivate();
             m_PadPollSanitizeActive = false;
+        }
+        if (m_PadSnapshotSuppressActive)
+        {
+            GetParkourModePadSnapshotHook().Deactivate();
+            m_PadSnapshotSuppressActive = false;
+        }
+        if (m_PadMapperSuppressActive)
+        {
+            GetParkourModePadMapperHook().Deactivate();
+            m_PadMapperSuppressActive = false;
         }
         if (g_ParkourModeInstance == this)
             g_ParkourModeInstance = nullptr;
@@ -1770,6 +2100,10 @@ void FreeJumpPlugin::OnUpdate()
 {
     m_KeyStateUpdatedThisFrame.fill(false);
     m_JustCapturedKey = 0;
+    // The pad seams run during the game's own update, i.e. AFTER our previous
+    // frame's OnUpdate, so "this frame" for them is "the next" for us. Roll
+    // the observed state forward here, once, at the start of the frame.
+    m_GamePadObservedThisFrame = false;
     UpdatePadStates();
 
     // Every binding exists in two profiles (keyboard/mouse + controller).
@@ -1802,7 +2136,13 @@ void FreeJumpPlugin::OnUpdate()
         || m_WaitingForParkourKey || waitingForOverrideKey
         || m_WaitingForBlockedKey;
     if (anyRebindWaiting)
+    {
         UpdateAllKeyStates();
+        // Only now are this frame's rising edges valid, so this is the first
+        // point where a controller press can be matched against the game's own
+        // pad state for the same frame.
+        LearnPadSlotWhileWaiting();
+    }
 
     // A rebind is always started by clicking a UI button, i.e. with a mouse
     // button. The starting click itself must not be captured as the new
@@ -1974,20 +2314,27 @@ void FreeJumpPlugin::OnUpdate()
     // assigned at least one; adding the first button (or toggling the mode on)
     // installs the sites, and the hooks come off the moment either stops being
     // true, so the game's input is untouched whenever the feature is unused.
+    // Parkour Mode's seams are installed while it blocks anything, and also
+    // while the player is assigning a controller button: measuring which game
+    // slot that button occupies requires watching the game's pad state, which
+    // is exactly what these hooks observe.
     const bool wantParkourHook = m_ParkourModeOn && !m_UserBlockedKeys.empty();
+    const bool wantPadWatch = m_WaitingForBlockedKey;
+    const bool wantParkourSeams = wantParkourHook || wantPadWatch;
     const bool anyParkourSuppressActive =
-        m_KbmFillSuppressActive || m_PadPollSanitizeActive;
+        m_KbmFillSuppressActive || m_PadPollSanitizeActive
+        || m_PadSnapshotSuppressActive || m_PadMapperSuppressActive;
     // Re-run while anything is still missing, so a site that was refused once
     // (plugin loaded later, or a transient mismatch) is retried instead of
     // staying refused for the whole session.
-    if (wantParkourHook
+    if (wantParkourSeams
         && (!anyParkourSuppressActive
             || m_ParkourHookRefused
             || (m_BlockPadWhileParkour && !m_PadBlockHookActive)))
     {
         ApplyParkourMode(true);
     }
-    else if (!wantParkourHook && (anyParkourSuppressActive || m_PadBlockHookActive))
+    else if (!wantParkourSeams && (anyParkourSuppressActive || m_PadBlockHookActive))
     {
         ApplyParkourMode(false);
     }
@@ -2138,12 +2485,67 @@ void FreeJumpPlugin::OnImGuiRender()
         if (m_ParkourModeOn)
         {
             ImGui::SameLine();
-            ImGui::TextDisabled("(hides the blocked buttons below from the game)");
+            ImGui::TextDisabled("(hides the blocked buttons below from the game; see seams below)");
         }
         if (m_ParkourModeOn && m_UserBlockedKeys.empty())
         {
             ImGui::SameLine();
             ImGui::TextColored(inactiveColor, "- nothing assigned yet");
+        }
+        // ── Diagnostics ────────────────────────────────────────────────
+        // Which seams actually run on THIS install, and what the game currently
+        // sees from the controller. This is the answer to "why isn't my
+        // button blocked": a seam whose counter stays at 0 while pad buttons
+        // are pressed is simply not on this build's input path.
+        if (m_KbmFillSuppressActive || m_PadPollSanitizeActive
+            || m_PadSnapshotSuppressActive || m_PadMapperSuppressActive)
+        {
+            auto hitText = [](const char* label, bool active, uint32_t hits)
+            {
+                return active
+                    ? std::string(label) + ": on (" + std::to_string(hits) + " hits)"
+                    : std::string(label) + ": site owned by another plugin";
+            };
+            ImGui::TextDisabled("seams:");
+            ImGui::TextDisabled("   %s", hitText("keyboard/mouse keymap fill", m_KbmFillSuppressActive, g_KbmFillHits).c_str());
+            ImGui::TextDisabled("   %s", hitText("pad poll (covers both pad paths)", m_PadPollSanitizeActive, g_PadPollHits).c_str());
+            ImGui::TextDisabled("   %s", hitText("pad path: keymap/snapshot (device 9)", m_PadSnapshotSuppressActive, g_PadSnapshotHits).c_str());
+            ImGui::TextDisabled("   %s", hitText("pad path: per-device mapper", m_PadMapperSuppressActive, g_PadMapperHits).c_str());
+            if (m_GamePadObservedThisFrame)
+            {
+                std::string pressed;
+                for (int slot = 0x30; slot < 0xE0; ++slot)
+                {
+                    if (!(m_GamePadSnapshot[slot] & 0x80))
+                        continue;
+                    if (!pressed.empty())
+                        pressed += ",";
+                    pressed += std::to_string(slot - 0x30);
+                }
+                const uint32_t hat = *reinterpret_cast<const uint32_t*>(m_GamePadSnapshot.data() + 0x20);
+                const char* hatName = "centered";
+                if (hat == 0) hatName = "up";
+                else if (hat == 9000) hatName = "right";
+                else if (hat == 18000) hatName = "down";
+                else if (hat == 27000) hatName = "left";
+                if (pressed.empty())
+                    ImGui::TextDisabled("   game sees: no buttons, d-pad %s", hatName);
+                else
+                    ImGui::TextDisabled("   game sees: buttons %s, d-pad %s", pressed.c_str(), hatName);
+            }
+            else
+            {
+                ImGui::TextDisabled("   game sees: no pad state observed this frame");
+            }
+        }
+        if (!m_LearnedPadSlots.empty())
+        {
+            ImGui::TextDisabled("   measured controller mapping:");
+            for (const std::pair<int, int>& learned : m_LearnedPadSlots)
+            {
+                ImGui::TextDisabled("      %s -> game slot %d",
+                                    KeyCodeLabel(learned.first).c_str(), learned.second);
+            }
         }
         ImGui::Text("  Toggle key: %s", KeyCodeLabel(EffectiveParkourModeKey()).c_str());
         if (m_WaitingForParkourKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key or pad button to bind..."); }
