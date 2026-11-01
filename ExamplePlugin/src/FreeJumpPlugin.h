@@ -124,7 +124,13 @@ public:
     // blocked controller button is not resolved from a hard-coded table: the
     // plugin watches the game's own pad state and learns which snapshot slot a
     // button occupies at the moment the player assigns it.
-    void NoteGamePadState(const uint8_t* padState);   // the 0x110-byte DirectInput state
+    void NoteGamePadState(const uint8_t* padState);
+    void LearnPadSlotWhileWaiting();
+    void LearnPadSlotsFromHeldButtons();
+    int GetRisingGamePadSlot() const;
+    int GetLearnedPadSlot(int bindablePadCode) const;
+    std::vector<int> GetLearnedPadSlots(int blockedKeyCode) const;
+    void RememberLearnedPadSlot(int bindablePadCode, int gameSlot);   // the 0x110-byte DirectInput state
     // Simple controller blocking: capture exactly what DirectInput reports.
     bool RememberBlockedKey(int blockedKeyCode);
     bool IsBlockedKeyCapturePending() const { return m_WaitingForBlockedKey; }

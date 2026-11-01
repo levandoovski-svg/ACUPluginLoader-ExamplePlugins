@@ -787,7 +787,7 @@ namespace
             const BlockedInputSlot candidate = ComputeBlockedInputSlot(blockedKeyCode);
             if (candidate.kind != BlockedInputKind::PadSnapshotButton)
                 continue;
-            std::vector<int> measured; measured.push_back(slot.slot); // SIMPLE: exact DirectInput button
+            std::vector<int> measured; measured.push_back(slot.slot); // exact DirectInput button
             const bool matches = measured.empty()
                 ? candidate.slot == padSlot
                 : std::find(measured.begin(), measured.end(), padSlot) != measured.end();
@@ -849,7 +849,7 @@ namespace
             case BlockedInputKind::PadSnapshotButton:
             {
                 // SIMPLE: direct DirectInput button clearing - no measured slots.
-                std::vector<int> measured; measured.push_back(slot.slot); // SIMPLE: exact DirectInput button
+                std::vector<int> measured; measured.push_back(slot.slot); // exact DirectInput button
                 if (measured.empty())
                     blockedPadSlots.push_back(slot.slot);
                 else
@@ -1091,7 +1091,7 @@ namespace
             {
                 // Every measured slot first ...
                 bool clearedAnyMeasured = false;
-                for (int gameSlot : owner->std::vector<int>{})
+                for (int gameSlot : std::vector<int>{0})
                 {
                     ClearPadSnapshotSlot(padState, gameSlot);
                     clearedAnyMeasured = true;
