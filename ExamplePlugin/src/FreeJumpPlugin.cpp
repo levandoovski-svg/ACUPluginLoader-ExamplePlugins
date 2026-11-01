@@ -2,6 +2,7 @@
 #include "FreeJumpPlugin.h"
 #include "ACU/ACUPlayerCameraComponent.h"
 #include "ACU/Parkour_WhileOnWallSystem.h"
+#include "ACU/InputContainer.h"
 #include "ACU/Memory/ACUAllocs.h"
 #include "ParkourDebugging/AvailableParkourAction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
@@ -553,6 +554,12 @@ namespace
     uint32_t g_PadSnapshotHits = 0;
     uint32_t g_PadMapperHits = 0;
     uint32_t g_KbmFillHits = 0;
+    // The aggregate seam (0x142739DBC): detour executions, and how many of
+    // those had a validated container ([rcx+0x200] matching the singleton
+    // chain). Hits-but-no-container means the site runs but this frame's
+    // context is not what HybridInput's RE described.
+    uint32_t g_InputMergeHits = 0;
+    uint32_t g_InputMergeContainerHits = 0;
 
     bool IsParkourBlockingActive()
     {
@@ -594,6 +601,362 @@ namespace
         return {};
     }
 
+    // ── Parkour Mode, action level: the game's own containers and keymaps ──
+    // The raw seams hide a blocked BUTTON from the game; this layer suppresses
+    // the ACTIONS that button drives, at the point where the game has already
+    // aggregated every device's contribution. It exists for two reasons:
+    //
+    //   1. On an install where a raw seam does not run (unknown device id, a
+    //      site owned by another plugin, a pad path this build has not mapped),
+    //      a blocked button could previously still reach the game.
+    //   2. HybridInput.dll - whose simultaneous keyboard/mouse + gamepad merge
+    //      many players run - re-fills zeroed action bytes from secondary
+    //      devices at its own detour (its merge copies a secondary device's
+    //      nonzero action byte into every zero destination byte).
+    //
+    // Everything this layer needs was proven by the HybridInput.dll RE and by
+    // this plugin's own earlier dumps:
+    //
+    //   * The container singleton chain (matches CommonLibACU's
+    //     HasInputContainers and HybridInput's FUN_180001760):
+    //       hic = *(void**)0x14525BEC8            (HasInputContainers*)
+    //       p10 = *(void**)(hic + 0x10)           (HasInputContainers_10*)
+    //       ic  = *(void**)(p10 + 0x8)            (InputContainer, 0x870 bytes)
+    //       big = *(void**)(p10 + 0x10)           (InputContainerBig)
+    //
+    //   * Layout (CommonLibACU ACU/InputContainer.h + the offsets the
+    //     HybridInput merge writes):
+    //       ic+0x030 keyStates_thisFrame - 32 bytes, one per ActionKeyCode;
+    //                exactly the 32 bytes HybridInput's merge copies.
+    //       ic+0x270 float action mirrors (LMB +0x274, RMB +0x29C, reload
+    //                +0x2A8), 32 floats indexed by ActionKeyCode.
+    //       ic+0x830 pendingFrame_mb - the InputContainerBig*.
+    //       ic+0x838/+0x83C/+0x846 active device index / device-entry table /
+    //                device count (HybridInput RE: entries of stride 0x238,
+    //                first pointer = the device's resolved state, a 0x310+-byte
+    //                structure in the same layout as the container).
+    //       big+0x864 this frame's 0x110-byte pad snapshot (buttons at +0x30,
+    //                hat at +0x20) - what the pad seams already sanitize.
+    //
+    //   * The player's keymaps, readable at seams this plugin already hooks:
+    //       KBM fill 0x14273B2B0: r9 = 32 entries, stride 0x214, type at +4,
+    //                code at +8; type 1 = keyboard scancode, 2 = mouse button.
+    //       pad snapshot site 0x14273BEB3: rdi = the pad keymap, same stride;
+    //                type 1 = digital pad button (code = the snapshot SLOT the
+    //                button occupies), 2 = axis/hat comparison.
+    //     With them, WHICH actions a blocked button drives comes from the
+    //     game's own bindings - no more guessing (which is what killed the old
+    //     action-mask approach in earlier builds).
+    //
+    //   * The aggregate seam 0x142739DBC (HybridInput's exact detour site,
+    //     fingerprint 48 8B 43 58 48 89 43 50): inside the input path with
+    //     [context(rcx)+0x200] = the InputContainer, executing after the
+    //     keymap fills and the bool-to-float conversions. HybridInput's own
+    //     production merge proves the device-table states are current-frame
+    //     valid at this point.
+    //
+    // The blocked-button to action mapping is recomputed every frame from the
+    // CURRENT blocked list and keymaps; the seams consume the resulting mask.
+    // Every pointer is validated (VirtualQuery walks, mirroring HybridInput's
+    // own readability checks) before a single byte is written: an unexpected
+    // layout makes the layer decline silently instead of corrupting anything.
+
+    // VirtualQuery walk, same checks as HybridInput's FUN_180001760 /
+    // FUN_1800016b0: committed, not guarded, not no-access.
+    bool IsRangeReadable(const void* address, size_t length)
+    {
+        if (!address || length == 0)
+            return false;
+        const uint8_t* cursor = static_cast<const uint8_t*>(address);
+        const uint8_t* end = cursor + length;
+        MEMORY_BASIC_INFORMATION mbi{};
+        while (cursor < end)
+        {
+            if (!VirtualQuery(cursor, &mbi, sizeof(mbi)))
+                return false;
+            if (mbi.State != MEM_COMMIT)
+                return false;
+            constexpr DWORD kUnreadable = PAGE_NOACCESS | PAGE_GUARD;
+            if (mbi.Protect & kUnreadable)
+                return false;
+            const uint8_t* regionEnd =
+                static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+            if (regionEnd <= cursor)
+                return false;
+            cursor = regionEnd;
+        }
+        return true;
+    }
+
+    // The game's InputContainer (0x870 bytes) through the singleton chain.
+    uintptr_t ResolveInputContainer()
+    {
+        // The game's own .data global - always mapped, the same trust every
+        // other absolute game address in this plugin has.
+        const uintptr_t hic = *reinterpret_cast<const uintptr_t*>(0x14525BEC8);
+        if (!hic)
+            return 0;
+        const uintptr_t p10 = *reinterpret_cast<const uintptr_t*>(hic + 0x10);
+        if (!p10 || !IsRangeReadable(reinterpret_cast<const void*>(p10), 0x18))
+            return 0;
+        const uintptr_t container = *reinterpret_cast<const uintptr_t*>(p10 + 0x8);
+        if (!container || !IsRangeReadable(reinterpret_cast<const void*>(container), 0x870))
+            return 0;
+        return container;
+    }
+
+    // The InputContainerBig through the same chain (for the pad snapshot at
+    // +0x864).
+    uintptr_t ResolveInputContainerBig()
+    {
+        const uintptr_t hic = *reinterpret_cast<const uintptr_t*>(0x14525BEC8);
+        if (!hic)
+            return 0;
+        const uintptr_t p10 = *reinterpret_cast<const uintptr_t*>(hic + 0x10);
+        if (!p10 || !IsRangeReadable(reinterpret_cast<const void*>(p10), 0x20))
+            return 0;
+        const uintptr_t big = *reinterpret_cast<const uintptr_t*>(p10 + 0x10);
+        // Covers the pad snapshot at +0x864 (0x110 bytes).
+        if (!big || !IsRangeReadable(reinterpret_cast<const void*>(big), 0x980))
+            return 0;
+        return big;
+    }
+
+    // Container-based observation fallback for the pad snapshot, so the slot
+    // learning and the UI's game-sees readout work even when NO pad seam runs
+    // on an install. NoteGamePadState's first-wins gate means a fresher seam
+    // observation always wins over this one. Self-consistent with blocking:
+    // when no seam runs, nothing was cleared either, so the raw state (and its
+    // rising edges) is exactly what the learning needs.
+    void NoteGamePadStateFromContainer(FreeJumpPlugin* owner)
+    {
+        if (!owner)
+            return;
+        const uintptr_t big = ResolveInputContainerBig();
+        if (!big)
+            return;
+        owner->NoteGamePadState(reinterpret_cast<const uint8_t*>(big + 0x864));
+    }
+
+    // ── The player's keymaps, captured at already-installed seams ──────────
+    constexpr size_t kKeymapEntryStride = 0x214;
+    constexpr size_t kKeymapEntryCount = 0x20;
+    constexpr size_t kKeymapBytes = kKeymapEntryCount * kKeymapEntryStride;
+    uintptr_t g_KbmKeymap = 0;   // r9 at the KBM keymap fill 0x14273B2B0
+    uintptr_t g_PadKeymap = 0;   // rdi at the pad snapshot site 0x14273BEB3
+
+    struct KeymapEntry
+    {
+        int32_t type = -1;
+        int32_t code = -1;
+    };
+    bool ReadKeymapEntry(uintptr_t keymap, int actionIndex, KeymapEntry& out)
+    {
+        if (!keymap || actionIndex < 0 || static_cast<size_t>(actionIndex) >= kKeymapEntryCount)
+            return false;
+        if (!IsRangeReadable(reinterpret_cast<const void*>(keymap), kKeymapBytes))
+            return false;
+        const uint8_t* entry = reinterpret_cast<const uint8_t*>(keymap)
+            + static_cast<size_t>(actionIndex) * kKeymapEntryStride;
+        out.type = *reinterpret_cast<const int32_t*>(entry + 4);
+        out.code = *reinterpret_cast<const int32_t*>(entry + 8);
+        return true;
+    }
+
+    // Which blocked entry produced a keymap match - for the UI's readout only.
+    int FindBlockedKeyWithSlot(const FreeJumpPlugin* owner, BlockedInputKind kind, int slot)
+    {
+        for (const int blockedKeyCode : owner->GetBlockedKeys())
+        {
+            const BlockedInputSlot candidate = ComputeBlockedInputSlot(blockedKeyCode);
+            if (candidate.kind == kind && candidate.slot == slot)
+                return blockedKeyCode;
+        }
+        return 0;
+    }
+
+    int FindBlockedKeyWithPadSlot(const FreeJumpPlugin* owner, int padSlot)
+    {
+        // Same precedence the raw clearing uses: measured slots first, then
+        // the built-in table (only when nothing was measured), then raw-slot
+        // entries.
+        for (const int blockedKeyCode : owner->GetBlockedKeys())
+        {
+            if (const int raw = PadSlotOf(blockedKeyCode); raw == padSlot)
+                return blockedKeyCode;
+            const BlockedInputSlot candidate = ComputeBlockedInputSlot(blockedKeyCode);
+            if (candidate.kind != BlockedInputKind::PadSnapshotButton)
+                continue;
+            const std::vector<int> measured = owner->GetLearnedPadSlots(blockedKeyCode);
+            const bool matches = measured.empty()
+                ? candidate.slot == padSlot
+                : std::find(measured.begin(), measured.end(), padSlot) != measured.end();
+            if (matches)
+                return blockedKeyCode;
+        }
+        return 0;
+    }
+
+    // ── The suppressed-action mask: which ActionKeyCode entries a blocked
+    //    button drives, per the game's own keymaps ──────────────────────────
+    struct SuppressedActions
+    {
+        bool suppressed[kActionKeyCount] = {};
+        int reasonKey[kActionKeyCount] = {};   // the blocked bindable code, 0 = none
+        bool kbmKeymapUsed = false;
+        bool padKeymapUsed = false;
+        bool any() const
+        {
+            for (bool s : suppressed)
+                if (s) return true;
+            return false;
+        }
+    };
+    SuppressedActions g_SuppressedActions;
+    uint32_t g_DeviceStatesSanitized = 0;   // device-table states touched, last run
+
+    void SuppressAction(SuppressedActions& out, int actionIndex, int blockedKey)
+    {
+        if (actionIndex < 0 || actionIndex >= kActionKeyCount)
+            return;
+        if (!out.suppressed[actionIndex])
+            out.reasonKey[actionIndex] = blockedKey;
+        out.suppressed[actionIndex] = true;
+    }
+
+    void ComputeSuppressedActions(const FreeJumpPlugin* owner)
+    {
+        g_SuppressedActions = SuppressedActions{};
+        g_DeviceStatesSanitized = 0;
+        if (!owner || !IsParkourBlockingActive())
+            return;
+
+        // The blocked entries, grouped the way the keymaps encode them.
+        std::vector<int> blockedScancodes;
+        std::vector<int> blockedMouseButtons;
+        std::vector<int> blockedPadSlots;
+        for (const int blockedKeyCode : owner->GetBlockedKeys())
+        {
+            const BlockedInputSlot slot = ComputeBlockedInputSlot(blockedKeyCode);
+            switch (slot.kind)
+            {
+            case BlockedInputKind::KeyboardScancode:
+                blockedScancodes.push_back(slot.slot);
+                break;
+            case BlockedInputKind::MouseButton:
+                blockedMouseButtons.push_back(slot.slot);
+                break;
+            case BlockedInputKind::PadSnapshotButton:
+            {
+                // Every measured slot first, the built-in table only when
+                // nothing was ever measured - the same precedence the raw
+                // clearing uses.
+                const std::vector<int> measured = owner->GetLearnedPadSlots(blockedKeyCode);
+                if (measured.empty())
+                    blockedPadSlots.push_back(slot.slot);
+                else
+                    blockedPadSlots.insert(blockedPadSlots.end(), measured.begin(), measured.end());
+                break;
+            }
+            default:
+                break;
+            }
+            if (const int rawSlot = PadSlotOf(blockedKeyCode); rawSlot >= 0)
+                blockedPadSlots.push_back(rawSlot);
+        }
+
+        g_SuppressedActions.kbmKeymapUsed = g_KbmKeymap != 0;
+        g_SuppressedActions.padKeymapUsed = g_PadKeymap != 0;
+        const auto contains = [](const std::vector<int>& list, int value)
+        {
+            return std::find(list.begin(), list.end(), value) != list.end();
+        };
+        for (int action = 0; action < kActionKeyCount; ++action)
+        {
+            KeymapEntry entry;
+            if (g_SuppressedActions.kbmKeymapUsed
+                && ReadKeymapEntry(g_KbmKeymap, action, entry))
+            {
+                // KBM keymap: type 1 = keyboard scancode, 2 = mouse button.
+                if (entry.type == 1 && contains(blockedScancodes, entry.code))
+                    SuppressAction(g_SuppressedActions, action,
+                        FindBlockedKeyWithSlot(owner, BlockedInputKind::KeyboardScancode, entry.code));
+                else if (entry.type == 2 && contains(blockedMouseButtons, entry.code))
+                    SuppressAction(g_SuppressedActions, action,
+                        FindBlockedKeyWithSlot(owner, BlockedInputKind::MouseButton, entry.code));
+            }
+            if (!g_SuppressedActions.suppressed[action]
+                && g_SuppressedActions.padKeymapUsed
+                && ReadKeymapEntry(g_PadKeymap, action, entry))
+            {
+                // Pad keymap: type 1 = digital pad button, code = the SLOT in
+                // the game's 0x110 snapshot. Axis/hat bindings (type 2) stay
+                // with the raw hat clearing at the pad seams.
+                if (entry.type == 1 && entry.code >= 0 && entry.code < kMaxPadSlot
+                    && contains(blockedPadSlots, entry.code))
+                {
+                    SuppressAction(g_SuppressedActions, action,
+                        FindBlockedKeyWithPadSlot(owner, entry.code));
+                }
+            }
+        }
+    }
+
+    // Zeroes every suppressed action in the game's aggregated input state:
+    //   * container keyStates_thisFrame (+0x30) - what IsPressed(ActionKeyCode)
+    //     reads (CommonLibACU ACU_InputUtils.cpp);
+    //   * container float action mirrors (+0x270 + 4*action);
+    //   * every device-table state's copy of both - the SOURCES HybridInput's
+    //     simultaneous-input merge reads, so a blocked action cannot be
+    //     re-merged in from a secondary device after we cleared the container.
+    // Safe to call from any post-fill seam; every pointer is validated and an
+    // unexpected layout simply skips the layer.
+    void SanitizeSuppressedActionsInContainer(uint8_t* container)
+    {
+        if (!container || !g_SuppressedActions.any())
+            return;
+        if (!IsRangeReadable(container, 0x310))
+            return;
+
+        uint8_t* keyStates = container + 0x30;              // keyStates_thisFrame
+        float* mirrors = reinterpret_cast<float*>(container + 0x270);
+        for (int action = 0; action < kActionKeyCount; ++action)
+        {
+            if (!g_SuppressedActions.suppressed[action])
+                continue;
+            keyStates[action] = 0;
+            mirrors[action] = 0.0f;
+        }
+
+        // The device table (HybridInput's RE: +0x838 active index, +0x83C
+        // table, +0x846 count, stride 0x238, state pointer at entry+0).
+        const uintptr_t table = *reinterpret_cast<const uintptr_t*>(container + 0x83C);
+        const uint16_t count = *reinterpret_cast<const uint16_t*>(container + 0x846);
+        if (!table || count == 0 || count > 0x10)
+            return;
+        if (!IsRangeReadable(reinterpret_cast<const void*>(table), static_cast<size_t>(count) * 0x238))
+            return;
+        int sanitized = 0;
+        for (uint16_t i = 0; i < count; ++i)
+        {
+            const uintptr_t state = *reinterpret_cast<const uintptr_t*>(
+                table + static_cast<size_t>(i) * 0x238);
+            if (!state || !IsRangeReadable(reinterpret_cast<const void*>(state), 0x310))
+                continue;
+            uint8_t* stateKeyStates = reinterpret_cast<uint8_t*>(state + 0x30);
+            float* stateMirrors = reinterpret_cast<float*>(state + 0x270);
+            for (int action = 0; action < kActionKeyCount; ++action)
+            {
+                if (!g_SuppressedActions.suppressed[action])
+                    continue;
+                stateKeyStates[action] = 0;
+                stateMirrors[action] = 0.0f;
+            }
+            ++sanitized;
+        }
+        g_DeviceStatesSanitized = static_cast<uint32_t>(sanitized);
+    }
+
     // Keyboard/mouse blocker. Runs at the keymap fill's entry, with the
     // fill's own argument registers live: r8 = the keyboard state buffer the
     // keyboard poll just wrote (256 bytes, one byte per DirectInput scancode,
@@ -604,6 +967,11 @@ namespace
     void SanitizeKbmKeymapFillSource(AllRegisters* params)
     {
         ++g_KbmFillHits;
+        // The player's keymap (r9 at this site) feeds the action-level layer:
+        // capture it regardless of whether anything is blocked right now, so
+        // the mask is ready the moment a key is assigned.
+        if (params->r9_)
+            g_KbmKeymap = static_cast<uintptr_t>(params->r9_);
         if (!IsParkourBlockingActive())
             return;
         const FreeJumpPlugin* owner = g_ParkourModeInstance;
@@ -766,31 +1134,50 @@ namespace
 
     // The device-9 path. rbx is the InputContainerBig* at this site, and the
     // snapshot is its own field at +0x864 - both proven by the site's byte
-    // pattern, so there is no pointer guesswork. This seam also gives the UI an
-    // independent signal that the device-9 path is the one running.
+    // pattern, so there is no pointer guesswork. rdi is the PAD KEYMAP the
+    // fill about to run will consume (proven by the earlier action-mask
+    // builds) - captured here for the action-level layer. This seam also gives
+    // the UI an independent signal that the device-9 path is the one running.
     void SanitizePadSnapshotKeymapPath(AllRegisters* params)
     {
         const FreeJumpPlugin* owner = g_ParkourModeInstance;
         if (!owner)
             return;
+        if (params->rdi_)
+            g_PadKeymap = static_cast<uintptr_t>(params->rdi_);
         auto* padState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_)) + 0x864;
         if (!padState)
             return;
         ++g_PadSnapshotHits;
         ObserveGamePadState(g_ParkourModeInstance, padState, PadSeam::Snapshot);
         ClearBlockedPadButtons(owner, params, padState);
+        // Post-fill action suppression: the pad keymap fill has just written
+        // keyStates_thisFrame from the (sanitized) snapshot, and this path's
+        // bool-to-float conversion runs later, so zeroing the suppressed
+        // actions here also zeroes their float mirrors for free.
+        SanitizeSuppressedActionsInContainer(
+            reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_)));
     }
 
     // The per-device mapper. rbx is the container and r14/rsi are reloaded by
     // the game right after this site, and the mapper's own poll buffer is
     // reachable only through rsp - which this framework's saved-RSP
-    // representation does not map to reliably - so this seam stays silent and
-    // only counts. It exists to TELL US whether the mapper path is the one
-    // running: zero hits here while pad buttons are pressed means the mapper
-    // path never ran, and the in-poll seam is the only one that can be clearing.
+    // representation does not map to reliably - so the raw stack copy cannot
+    // be cleared here. But this site is the mapper path's LAST keyStates write
+    // convergence point (proven by the earlier action-mask builds: all case
+    // bodies converge at 0x14273A71E, this site follows, the bool-to-float
+    // conversion at 0x14273A736 follows it), and rbx is the InputContainerBig*,
+    // so suppressed actions are zeroed here - which also zeroes this path's
+    // float mirrors for free. The hit counter tells us whether the mapper path
+    // is the one running on this install.
     void SanitizePadMapperBuffer(AllRegisters* params)
     {
         ++g_PadMapperHits;
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        if (!owner)
+            return;
+        SanitizeSuppressedActionsInContainer(
+            reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rbx_)));
     }
 
     // ── Parkour Mode, keyboard/mouse: clear the blocked key before the
@@ -886,6 +1273,88 @@ namespace
     AutoAssembleWrapper<ParkourModePadMapperHook>& GetParkourModePadMapperHook()
     {
         static AutoAssembleWrapper<ParkourModePadMapperHook> s_hook;
+        return s_hook;
+    }
+
+    // ── Parkour Mode, aggregate seam: 0x142739DBC (HybridInput's own site) ──
+    // This instruction pair (48 8B 43 58 / 48 89 43 50) sits inside the game's
+    // input path at a point where [context(rcx)+0x200] is the game's
+    // InputContainer, executing after the keymap fills and the bool-to-float
+    // conversions - it is exactly where HybridInput.dll installs its
+    // simultaneous-input merge, and its production use proves the site runs
+    // every frame with current-frame device states.
+    //
+    // Here the plugin makes its FINAL pass over the aggregated state:
+    //   * suppressed actions are zeroed in keyStates_thisFrame AND the float
+    //     mirrors (this site is past the conversions, so the mirrors must be
+    //     cleared explicitly here);
+    //   * every device-table state is sanitized (the sources of any later
+    //     re-read);
+    //   * the pad snapshot at InputContainerBig+0x864 is observed (learning)
+    //     and cleared (raw blocking) once more, via the container's own
+    //     pendingFrame_mb - independent of the pad poll seam running.
+    //
+    // Ownership: if HybridInput.dll is loaded first, this site is E9-patched
+    // and the seam refuses - the UI says so. In that case blocked actions can
+    // in principle be re-merged from secondary devices, but the device-table
+    // sanitization at the pad seams above already removes those sources, and
+    // the raw poll seam hides the button from every device in the first place.
+    void SanitizeMergedInputStates(AllRegisters* params)
+    {
+        ++g_InputMergeHits;
+        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        if (!owner)
+            return;
+        // [context+0x200] = the InputContainer, HybridInput's proven access
+        // pattern at this exact site. Validate rcx before dereferencing it.
+        const uintptr_t context = static_cast<uintptr_t>(params->rcx_);
+        if (!context || !IsRangeReadable(reinterpret_cast<const void*>(context), 0x208))
+            return;
+        const uintptr_t candidate =
+            *reinterpret_cast<const uintptr_t*>(context + 0x200);
+        if (!candidate || !IsRangeReadable(reinterpret_cast<const void*>(candidate), 0x870))
+            return;
+        // Cross-check against the singleton chain, exactly like HybridInput's
+        // detour does (FUN_180001760): a mismatch means this frame's context
+        // is not the container the game consumes, so decline.
+        const uintptr_t viaChain = ResolveInputContainer();
+        if (viaChain != 0 && candidate != viaChain)
+            return;
+        ++g_InputMergeContainerHits;
+
+        auto* container = reinterpret_cast<uint8_t*>(candidate);
+
+        // Observe + clear the raw pad snapshot through the container's own
+        // pointer to the big container. First-wins: the poll seam has already
+        // observed it when it runs, and this is the safety net for installs
+        // where it does not.
+        const uintptr_t big = *reinterpret_cast<const uintptr_t*>(container + 0x830);
+        if (big && IsRangeReadable(reinterpret_cast<const void*>(big + 0x864), 0x110))
+        {
+            auto* padState = reinterpret_cast<uint8_t*>(big + 0x864);
+            owner->NoteGamePadState(padState);
+            ClearBlockedPadButtons(owner, params, padState);
+        }
+
+        // Final action-level pass, including every device-table state.
+        SanitizeSuppressedActionsInContainer(container);
+    }
+
+    struct ParkourModeInputMergeHook : AutoAssemblerCodeHolder_Base
+    {
+        ParkourModeInputMergeHook()
+        {
+            PresetScript_CCodeInTheMiddle(
+                0x142739DBC, 8,
+                SanitizeMergedInputStates,
+                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
+                true);
+        }
+    };
+
+    AutoAssembleWrapper<ParkourModeInputMergeHook>& GetParkourModeInputMergeHook()
+    {
+        static AutoAssembleWrapper<ParkourModeInputMergeHook> s_hook;
         return s_hook;
     }
 
@@ -1256,6 +1725,16 @@ namespace
         const uint8_t* site = reinterpret_cast<const uint8_t*>(0x1427289A0);
         return !(site[0] == 0x40 && site[1] == 0x53 && site[2] == 0x56 && site[3] == 0x57
             && site[4] == 0x48 && site[5] == 0x81 && site[6] == 0xEC && site[7] == 0x90);
+    }
+
+    bool IsInputMergeSitePatched()
+    {
+        // Vanilla: mov rax,[rbx+0x58] ; mov [rbx+0x50],rax
+        // (0x142739DBC, 8 bytes - the same fingerprint HybridInput.dll
+        // verifies before installing its simultaneous-input detour).
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x142739DBC);
+        return !(site[0] == 0x48 && site[1] == 0x8B && site[2] == 0x43 && site[3] == 0x58
+            && site[4] == 0x48 && site[5] == 0x89 && site[6] == 0x43 && site[7] == 0x50);
     }
 }
 
@@ -1921,13 +2400,15 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         // "0 hits" means "never ran here" rather than "ran before this turn".
         const bool wasSomethingActive = m_KbmFillSuppressActive
             || m_PadPollSanitizeActive || m_PadSnapshotSuppressActive
-            || m_PadMapperSuppressActive;
+            || m_PadMapperSuppressActive || m_InputMergeSeamActive;
         if (!wasSomethingActive)
         {
             g_PadPollHits = 0;
             g_PadSnapshotHits = 0;
             g_PadMapperHits = 0;
             g_KbmFillHits = 0;
+            g_InputMergeHits = 0;
+            g_InputMergeContainerHits = 0;
         }
 
         // Independent sites. A site another plugin already patched is skipped
@@ -1977,6 +2458,20 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
                 m_PadMapperSuppressActive = true;
             }
         }
+        // The aggregate seam - HybridInput's own detour site. When HybridInput
+        // is loaded first, the site is E9-patched and we refuse it; the UI
+        // reports that, and the device-table sanitization at the pad seams
+        // keeps the merge sources clean anyway.
+        if (!m_InputMergeSeamActive)
+        {
+            if (IsInputMergeSitePatched())
+                anyRefused = true;
+            else
+            {
+                GetParkourModeInputMergeHook().Activate();
+                m_InputMergeSeamActive = true;
+            }
+        }
         m_ParkourHookRefused = anyRefused;
 
         // Optional fallback, off by default: detach the pad device. It hides
@@ -2016,6 +2511,11 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         {
             GetParkourModePadMapperHook().Deactivate();
             m_PadMapperSuppressActive = false;
+        }
+        if (m_InputMergeSeamActive)
+        {
+            GetParkourModeInputMergeHook().Deactivate();
+            m_InputMergeSeamActive = false;
         }
         if (g_ParkourModeInstance == this)
             g_ParkourModeInstance = nullptr;
@@ -2277,10 +2777,20 @@ void FreeJumpPlugin::OnUpdate()
     m_KeyStateUpdatedThisFrame.fill(false);
     m_JustCapturedKey = 0;
     // The pad seams run during the game's own update, i.e. AFTER our previous
-    // frame's OnUpdate, so "this frame" for them is "the next" for us. Roll
-    // the observed state forward here, once, at the start of the frame.
-    m_GamePadObservedThisFrame = false;
+    // frame's OnUpdate. Everything observed since the last OnUpdate (seams or
+    // the container read below) is "this frame" for the slot learning further
+    // down, which is why the observed flag is rolled at the END of OnUpdate,
+    // AFTER the learning consumed it. (Resetting it here - before the learning
+    // - made the learning dead code: no observation can arrive between the
+    // reset and the learning calls, so GetRisingGamePadSlot never fired and no
+    // controller slot was ever measured.)
     UpdatePadStates();
+    // Container-based observation fallback: the game itself keeps the pad
+    // snapshot at InputContainerBig+0x864, reachable through the
+    // HasInputContainers chain the HybridInput RE proved - with NO pad seam
+    // installed at all. NoteGamePadState's first-wins gate means a fresher
+    // seam observation always wins over this read.
+    NoteGamePadStateFromContainer(this);
 
     // Every binding exists in two profiles (keyboard/mouse + controller).
     // Both profiles' states are refreshed every frame so that switching
@@ -2503,7 +3013,8 @@ void FreeJumpPlugin::OnUpdate()
     const bool wantParkourSeams = wantParkourHook || wantPadWatch;
     const bool anyParkourSuppressActive =
         m_KbmFillSuppressActive || m_PadPollSanitizeActive
-        || m_PadSnapshotSuppressActive || m_PadMapperSuppressActive;
+        || m_PadSnapshotSuppressActive || m_PadMapperSuppressActive
+        || m_InputMergeSeamActive;
     // Re-run while anything is still missing, so a site that was refused once
     // (plugin loaded later, or a transient mismatch) is retried instead of
     // staying refused for the whole session.
@@ -2518,6 +3029,13 @@ void FreeJumpPlugin::OnUpdate()
     {
         ApplyParkourMode(false);
     }
+
+    // The action-level suppression mask: which ActionKeyCode entries the
+    // blocked buttons drive, derived from the game's own keymaps (captured at
+    // the KBM fill and pad snapshot seams). Recomputed every frame the seams
+    // are alive; the aggregate/pad seams consume it after the game's fills.
+    if (wantParkourSeams || anyParkourSuppressActive)
+        ComputeSuppressedActions(this);
 
     const bool needHook = freeJumpHeld || anyOverrideActive || (m_WallToHangEnabled && IsKeyHeld(EffectiveDiveHotkey()));
 
@@ -2570,6 +3088,12 @@ void FreeJumpPlugin::OnUpdate()
         GetParkourOverrideFallbackHook().Deactivate();
         ApplyOverrideFallback(false);
     }
+
+    // Roll the observed-pad-state window forward AFTER the learning consumed
+    // it (see the comment at the top of this function). The UI reads the
+    // LastFrame half, so its "game sees" readout stays correct.
+    m_GamePadObservedLastFrame = m_GamePadObservedThisFrame;
+    m_GamePadObservedThisFrame = false;
 }
 
 void FreeJumpPlugin::OnImGuiRender()

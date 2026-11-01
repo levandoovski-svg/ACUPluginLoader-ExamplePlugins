@@ -200,7 +200,15 @@ private:
     // buffer). Powers the UI's "what the game sees" readout and the learning.
     std::array<uint8_t, 0x110> m_GamePadSnapshot{};
     std::array<uint8_t, 0x110> m_GamePadSnapshotPrev{};
+    // Set by NoteGamePadState (seams + the container fallback read), consumed
+    // by the slot learning INSIDE OnUpdate, and rolled into ...LastFrame at the
+    // END of OnUpdate - AFTER the learning. Resetting this flag at the start of
+    // OnUpdate made the learning dead code: no observation can arrive between
+    // the reset and the learning calls, so no slot was ever measured.
     bool m_GamePadObservedThisFrame = false;
+    // What OnImGuiRender reads: whether anything was observed in the window
+    // between the previous OnUpdate and this one.
+    bool m_GamePadObservedLastFrame = false;
 
     // Wall-to-Hang (ported from ACUFixes-0.9.3 Parkour Helpers / dive helper).
     // While the dive hotkey is held, wall-eject-to-hang candidates are created
@@ -242,6 +250,11 @@ private:
     bool m_PadPollSanitizeActive = false;
     bool m_PadSnapshotSuppressActive = false;
     bool m_PadMapperSuppressActive = false;
+    // The input-aggregate seam at 0x142739DBC - the exact site HybridInput.dll
+    // detours to merge secondary device states into the container. Runs after
+    // every keyStates writer, so suppressed actions are zeroed there one last
+    // time (and HybridInput's own merge cannot resurrect them while we own it).
+    bool m_InputMergeSeamActive = false;
     bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
     bool m_OverrideFallbackRefused = false;
