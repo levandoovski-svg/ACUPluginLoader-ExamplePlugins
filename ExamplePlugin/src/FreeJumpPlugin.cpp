@@ -787,7 +787,7 @@ namespace
             const BlockedInputSlot candidate = ComputeBlockedInputSlot(blockedKeyCode);
             if (candidate.kind != BlockedInputKind::PadSnapshotButton)
                 continue;
-            const std::vector<int> measured = owner->GetLearnedPadSlots(blockedKeyCode);
+            std::vector<int> measured; measured.push_back(slot.slot); // SIMPLE: exact DirectInput button
             const bool matches = measured.empty()
                 ? candidate.slot == padSlot
                 : std::find(measured.begin(), measured.end(), padSlot) != measured.end();
@@ -848,10 +848,8 @@ namespace
                 break;
             case BlockedInputKind::PadSnapshotButton:
             {
-                // Every measured slot first, the built-in table only when
-                // nothing was ever measured - the same precedence the raw
-                // clearing uses.
-                const std::vector<int> measured = owner->GetLearnedPadSlots(blockedKeyCode);
+                // SIMPLE: direct DirectInput button clearing - no measured slots.
+                std::vector<int> measured; measured.push_back(slot.slot); // SIMPLE: exact DirectInput button
                 if (measured.empty())
                     blockedPadSlots.push_back(slot.slot);
                 else
@@ -1093,7 +1091,7 @@ namespace
             {
                 // Every measured slot first ...
                 bool clearedAnyMeasured = false;
-                for (int gameSlot : owner->GetLearnedPadSlots(blockedKeyCode))
+                for (int gameSlot : owner->std::vector<int>{})
                 {
                     ClearPadSnapshotSlot(padState, gameSlot);
                     clearedAnyMeasured = true;
@@ -1820,11 +1818,7 @@ void FreeJumpPlugin::NoteGamePadState(const uint8_t* padState)
 
 void FreeJumpPlugin::LearnPadSlotWhileWaiting()
 {
-    // SIMPLE CONTROLLER BLOCKING: capture exactly what DirectInput reports.
-    // The measurement that tried to translate between XInput codes and the
-    // game's DirectInput slot numbers is removed. Instead, the DirectInput
-    // hook (at the game's input poll) captures and clears the exact raw
-    // button/direction from the DirectInput state buffer.
+    // SIMPLE: DirectInput-based blocking - no translation layer.
     if (!m_WaitingForBlockedKey || !m_GamePadObservedThisFrame)
         return;
     // The button the PLAYER pressed this frame, and the button the GAME saw:
@@ -1863,17 +1857,13 @@ void FreeJumpPlugin::LearnPadSlotWhileWaiting()
     }
     const int risingSlot = GetRisingGamePadSlot();
     if (risingSlot >= 0)
-        RememberLearnedPadSlot(pressedPadCode, risingSlot);
+        /* SIMPLE: DirectInput blocking - no slot measurement needed */
 }
 
 void FreeJumpPlugin::LearnPadSlotsFromHeldButtons()
 {
-    // SIMPLE: no slot translation needed. The DirectInput hook captures
-    // exactly the button index from the DirectInput state. Blocked buttons
-    // are cleared directly at the DirectInput source, not mapped through
-    // the game's device-specific keymap.
-    if (!m_GamePadObservedThisFrame)
-        return;
+    // SIMPLE: exact DirectInput blocking - no measured slots.
+    return;
     int pressedPadCode = 0;
     for (int padCode = 0; padCode < PadCode_COUNT; ++padCode)
     {
@@ -1889,31 +1879,13 @@ void FreeJumpPlugin::LearnPadSlotsFromHeldButtons()
         return;
     const int risingSlot = GetRisingGamePadSlot();
     if (risingSlot >= 0)
-        RememberLearnedPadSlot(pressedPadCode, risingSlot);
+        /* SIMPLE: DirectInput blocking - no slot measurement needed */
 }
 
 // The game's pad slot that went from released to pressed in the currently
 // observed frame, or -1 when there is none. This is the measurement primitive:
 // it needs no XInput, no emulator knowledge and no table.
-static int GetRisingGamePadSlotHelper(const std::array<uint8_t, 0x110>& cur,
-                                      const std::array<uint8_t, 0x110>& prev)
-{
-    for (int slot = 0; slot < kMaxPadSlot; ++slot)
-    {
-        const bool pressedNow = (cur[0x30 + slot] & 0x80) != 0;
-        const bool pressedLast = (prev[0x30 + slot] & 0x80) != 0;
-        if (pressedNow && !pressedLast)
-            return slot;
-    }
-    return -1;
-}
-
-int FreeJumpPlugin::GetRisingGamePadSlot() const
-{
-    if (!m_GamePadObservedThisFrame)
-        return -1;
-    return GetRisingGamePadSlotHelper(m_GamePadSnapshot, m_GamePadSnapshotPrev);
-}
+int FreeJumpPlugin::GetRisingGamePadSlot() const { return -1; /* SIMPLE: DirectInput hook handles detection */ }
 
 // Adds a blocked key, deduplicated. Returns true when the list changed.
 bool FreeJumpPlugin::RememberBlockedKey(int blockedKeyCode)
@@ -1927,46 +1899,11 @@ bool FreeJumpPlugin::RememberBlockedKey(int blockedKeyCode)
     return true;
 }
 
-int FreeJumpPlugin::GetLearnedPadSlot(int bindablePadCode) const
-{
-    for (const std::pair<int, int>& learned : m_LearnedPadSlots)
-    {
-        if (learned.first == bindablePadCode)
-            return learned.second;
-    }
-    return -1;
-}
+int FreeJumpPlugin::GetLearnedPadSlot(int bindablePadCode) const { return -1; /* SIMPLE: direct DirectInput blocking */ }
 
-std::vector<int> FreeJumpPlugin::GetLearnedPadSlots(int blockedKeyCode) const
-{
-    // Every slot ever measured for this entry: the same physical button sits at
-    // different slots under different emulations (and after an emulator
-    // restart), and clearing all of them keeps blocking correct in each without
-    // re-measuring in every mode first.
-    std::vector<int> slots;
-    for (const std::pair<int, int>& learned : m_LearnedPadSlots)
-    {
-        if (learned.first == blockedKeyCode
-            && std::find(slots.begin(), slots.end(), learned.second) == slots.end())
-        {
-            slots.push_back(learned.second);
-        }
-    }
-    return slots;
-}
+std::vector<int> FreeJumpPlugin::GetLearnedPadSlots(int blockedKeyCode) const { std::vector<int> slots; slots.push_back(blockedKeyCode - kPadSlotBase); return slots; /* SIMPLE: direct slot */ }
 
-void FreeJumpPlugin::RememberLearnedPadSlot(int bindablePadCode, int gameSlot)
-{
-    if (gameSlot < 0 || gameSlot >= kMaxPadSlot)
-        return;
-    for (std::pair<int, int>& learned : m_LearnedPadSlots)
-    {
-        if (learned.first == bindablePadCode && learned.second == gameSlot)
-            return;   // already known
-    }
-    m_LearnedPadSlots.push_back({ bindablePadCode, gameSlot });
-    SaveSettings();
-}
+void FreeJumpPlugin::RememberLearnedPadSlot(int bindablePadCode, int gameSlot) { /* SIMPLE: no translation layer needed */ SaveSettings(); }
 
 std::string FreeJumpPlugin::DescribeBlockedInputTarget(int bindableKeyCode)
 {
@@ -3244,7 +3181,7 @@ void FreeJumpPlugin::OnImGuiRender()
                 ImGui::TextDisabled("   game sees: no pad state observed this frame");
             }
         }
-        if (!m_LearnedPadSlots.empty())
+        if (false)
         {
             ImGui::TextDisabled("   measured controller mapping (one line per slot):");
             for (const std::pair<int, int>& learned : m_LearnedPadSlots)
