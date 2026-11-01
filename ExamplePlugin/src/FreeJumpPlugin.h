@@ -125,18 +125,9 @@ public:
     // plugin watches the game's own pad state and learns which snapshot slot a
     // button occupies at the moment the player assigns it.
     void NoteGamePadState(const uint8_t* padState);   // the 0x110-byte DirectInput state
-    void LearnPadSlotWhileWaiting();
-    void LearnPadSlotsFromHeldButtons();
-    int GetRisingGamePadSlot() const;
-    int GetLearnedPadSlot(int bindablePadCode) const;
-    std::vector<int> GetLearnedPadSlots(int blockedKeyCode) const;
-    void RememberLearnedPadSlot(int bindablePadCode, int gameSlot);
+    // Simple controller blocking: capture exactly what DirectInput reports.
     bool RememberBlockedKey(int blockedKeyCode);
-    // True while the player is assigning a blocked button, which is when the
-    // pad seams have to run even with nothing to block (see LearnPadSlotWhileWaiting).
     bool IsBlockedKeyCapturePending() const { return m_WaitingForBlockedKey; }
-    // Installs the observation seams with nothing to block, i.e. the
-    // diagnostics switch above.
     bool IsWatchingGamePadInput() const { return m_WatchGamePadInput; }
 private:
     void UpdateKeyState(int bindableKeyCode);

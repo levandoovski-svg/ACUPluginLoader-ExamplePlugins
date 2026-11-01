@@ -1820,6 +1820,11 @@ void FreeJumpPlugin::NoteGamePadState(const uint8_t* padState)
 
 void FreeJumpPlugin::LearnPadSlotWhileWaiting()
 {
+    // SIMPLE CONTROLLER BLOCKING: capture exactly what DirectInput reports.
+    // The measurement that tried to translate between XInput codes and the
+    // game's DirectInput slot numbers is removed. Instead, the DirectInput
+    // hook (at the game's input poll) captures and clears the exact raw
+    // button/direction from the DirectInput state buffer.
     if (!m_WaitingForBlockedKey || !m_GamePadObservedThisFrame)
         return;
     // The button the PLAYER pressed this frame, and the button the GAME saw:
@@ -1863,13 +1868,10 @@ void FreeJumpPlugin::LearnPadSlotWhileWaiting()
 
 void FreeJumpPlugin::LearnPadSlotsFromHeldButtons()
 {
-    // Parkour Mode is ON and the plugin can see the pad (XInput). Every press of
-    // an already-blocked controller button re-measures which slot the game
-    // reports it as, so a stored measurement taken under one emulation stays
-    // correct when the emulation changes - the very DS4Windows/Xbox360 switch
-    // that made blocking mode-dependent. Only a slot that rose in the same
-    // frame as the plugin's own rising edge is accepted, so a second button
-    // held at the same time cannot be mis-attributed.
+    // SIMPLE: no slot translation needed. The DirectInput hook captures
+    // exactly the button index from the DirectInput state. Blocked buttons
+    // are cleared directly at the DirectInput source, not mapped through
+    // the game's device-specific keymap.
     if (!m_GamePadObservedThisFrame)
         return;
     int pressedPadCode = 0;
