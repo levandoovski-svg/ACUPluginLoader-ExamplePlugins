@@ -1302,7 +1302,7 @@ namespace
     void SanitizeMergedInputStates(AllRegisters* params)
     {
         ++g_InputMergeHits;
-        const FreeJumpPlugin* owner = g_ParkourModeInstance;
+        FreeJumpPlugin* owner = g_ParkourModeInstance;
         if (!owner)
             return;
         // [context+0x200] = the InputContainer, HybridInput's proven access
