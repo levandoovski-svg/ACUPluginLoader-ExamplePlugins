@@ -1,61 +1,31 @@
 #include "pch.h"
-#include "ParkourDebugging/GenericHooksInParkourFiltering.h"
+
+#include "GenericHooksInParkourFiltering.h"
+
 #include "ACU/basic_types.h"
 #include "ACU/Memory/ACUAllocs.h"
-#include "ParkourDebugging/AvailableParkourAction.h"
-#include "ParkourDebugging/EnumParkourAction.h"
-#include "ParkourDebugging/FancyVFunctionDescription.h"
-#include "ParkourDebugging/ParkourTester.h"
-#include "ParkourDebugging/ParkourLog.h"
 #include "ACU_DefineNativeFunction.h"
-#include <mutex>
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
+#include "EnumParkourAction.h"
+#include "AvailableParkourAction.h"
+#include "ParkourTester.h"
 
-// AvailableParkourAction::GetEnumParkourAction() - single definition for this
-// DLL. ForcedSidehopPlugin.cpp calls it but must not redefine it.
-EnumParkourAction AvailableParkourAction::GetEnumParkourAction()
-{
-    return GET_AND_CAST_FANCY_FUNC(*this, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)(this);
-}
-
-// All game addresses below are the ACUFixes-0.9.3 values, i.e. the set that
-// matches the user's ACU 1.5.0 Steam build.
-//
-// Evidence (2026-10-28): a constant scan of the two plugins that demonstrably
-// work on this install (ACUFixes.dll and ACU_ParkourPatches.dll in
-// ACUFixes\plugins) finds exactly this address set in both, and finds NONE of
-// the ACUFixes-1.5.1 addresses (0x1401D4360 / 0x1401D2580 / 0x1401CBF00 /
-// 0x1401D1530 / 0x140159940 / 0x142726000 / 0x14013493E / 0x140134940).
-// FailedWallRunPlugin.cpp additionally dump-verifies 0x1401D1CF0 and
-// 0x1401CC990 against the runtime dump (MODLOG/scripts/ACU_dumped_pe.exe).
-//
-// The previous version of this file used the 1.5.1 addresses and installed a
-// 7-stolen-byte mid-function hook at 0x14013493E, which lands on unrelated
-// code in the 1.5.0 binary: any parkour sort&select execution after enabling
-// the plugin instantly crashed the game (see PROGRESS.md).
-DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter1, 0x1401D4DE0, bool, __fastcall, (AvailableParkourAction*, __m128*, uint64, Entity*));
-DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter2, 0x1401D3000, bool, __fastcall, (AvailableParkourAction*, Entity*, __int64));
-DEFINE_GAME_FUNCTION(ConstructParkourAction_A, 0x1401CC990, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, AvailableParkourAction*));
-DEFINE_GAME_FUNCTION(ConstructParkourAction_B, 0x1401D1FC0, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, __int64, Entity*, AvailableParkourAction*));
-DEFINE_GAME_FUNCTION(AvailableParkourAction__InitializePlayerRef, 0x14015A570, void, __fastcall, (PlayerRefInParkourAction*, Entity*));
-DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
+#include "ParkourDebugging/ParkourLog.h"
 
 class Entity;
 
-// ── Creation-stage replacements (ported verbatim from ACUFixes-0.9.3) ──────
-// Replace the two creation wrappers at their function starts (0x1401D1CF0 /
-// 0x1401D1E50, the ACUFixes-0.9.3 address set, confirmed present in the two
-// reference DLLs that work on this install — see PROGRESS.md session 6).
-// Difference from the 0.9.3 original: after InitialTestIfActionFits, every
-// subscribed callback gets a chance to override the discard verdict via
-// OverrideCreationDiscard_fnp (return true = keep the action; the callback may
-// have mutated it in place first — FailedWallRunPlugin keeps
-// wallrunUpFromGroundFailed_mb alive on non-qualifying walls and converts
-// wallrunUpFromGround_mb into it via a fancy-vtable swap).
-struct CollisionProbeForParkour_mb
+DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter1, 0x1401D4360, bool, __fastcall, (AvailableParkourAction* p_parkourAction, __m128* a2, uint64 a3, Entity* p_playerEntity));
+DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter2, 0x1401D2580, bool, __fastcall, (AvailableParkourAction* p_parkourAction, Entity* p_playerEntity, __int64 a3));
+DEFINE_GAME_FUNCTION(ConstructParkourAction_A, 0x1401CBF00, AvailableParkourAction*, __fastcall, (EnumParkourAction p_actionEnum, __m128* a2, __m128* a3, __m128* p_movementVecWorld_mb, int a5, char a6, __int64 a7, AvailableParkourAction* p_previousAction_mb));
+DEFINE_GAME_FUNCTION(ConstructParkourAction_B, 0x1401D1530, AvailableParkourAction*, __fastcall, (EnumParkourAction p_actionEnum, __m128* a2, __m128* a3, __m128* p_movementVecWorld_mb, int a5, char a6, __int64 a7, __int64 a8, Entity* p_player, AvailableParkourAction* p_previousAction_mb));
+DEFINE_GAME_FUNCTION(AvailableParkourAction__InitializePlayerRef, 0x140159940, void, __fastcall, (PlayerRefInParkourAction* p_playerRefOut, Entity* a2));
+// Used for a SmallArray of plain types, where constructors/destructors don't matter.
+DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142726000, void, __fastcall, (void* smallArray, int p_idx, unsigned int p_elemSize));
+
+
+#include "MyLog.h"
+class CollisionProbeForParkour_mb
 {
+public:
     Vector4f locationAnchorDest; //0x0000
     Vector4f direction; //0x0010
     char pad_0020[20]; //0x0020
@@ -70,18 +40,7 @@ struct CollisionProbeForParkour_mb
 assert_offsetof(CollisionProbeForParkour_mb, collisionLayer_mb, 0x38);
 assert_offsetof(CollisionProbeForParkour_mb, shared_buildingEntity, 0x60);
 assert_sizeof(CollisionProbeForParkour_mb, 0x80); // Allocated and constructed at 140184AEF
-
-static void RunCreationDiscardOverrides(AvailableParkourAction& newAction, bool& isDiscarded)
-{
-    auto& allParkourCallbacks = GenericHooksInParkourFiltering::GetSingleton()->m_Callbacks;
-    for (ParkourCallbacks* parkourCallbacks : allParkourCallbacks)
-    {
-        if (!parkourCallbacks->OverrideCreationDiscard_fnp) continue;
-        if (parkourCallbacks->OverrideCreationDiscard_fnp(parkourCallbacks->m_UserData, newAction))
-            isDiscarded = false;
-    }
-}
-
+static DEFINE_LOGGER_CONSOLE_AND_FILE(ParkourLogger, "[Parkour]");
 bool CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement(
     EnumParkourAction actionType,
     __m128* p_locationOfOrigin,
@@ -110,9 +69,8 @@ bool CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement(
         (uint64)a8,
         p_player,
         p_previousAction_mb);
-    bool isDiscarded = !isActionFits;
-    RunCreationDiscardOverrides(*newAction, isDiscarded);
     std::shared_ptr<ParkourCycleLogged> currentCycle = GetCurrentLoggedParkourCycle();
+    bool isDiscarded = !isActionFits;
     currentCycle->LogActionInitialCreation(*newAction, isDiscarded);
     currentCycle->m_LocationOfOrigin = *(Vector3f*)p_locationOfOrigin;
     currentCycle->m_DirectionOfMovementInputWorldSpace = *(Vector3f*)p_directionOfMovementInputWorldSpace;
@@ -125,7 +83,6 @@ bool CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement(
     }
     return true;
 }
-
 bool CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement(
     EnumParkourAction actionType,
     __m128* p_locationOfOrigin,
@@ -154,9 +111,8 @@ bool CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement(
         a9,
         p_player,
         p_previousAction_mb);
-    bool isDiscarded = !isActionFits;
-    RunCreationDiscardOverrides(*newAction, isDiscarded);
     std::shared_ptr<ParkourCycleLogged> currentCycle = GetCurrentLoggedParkourCycle();
+    bool isDiscarded = !isActionFits;
     currentCycle->LogActionInitialCreation(*newAction, isDiscarded);
     currentCycle->m_LocationOfOrigin = *(Vector3f*)p_locationOfOrigin;
     currentCycle->m_DirectionOfMovementInputWorldSpace = *(Vector3f*)p_directionOfMovementInputWorldSpace;
@@ -169,14 +125,6 @@ bool CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement(
     }
     return true;
 }
-
-// ── Sort&select replacement (verbatim pipeline from ACUFixes-0.9.3) ──────────
-// Replaces SortAndSelectBestMatchingAction at its function start. Logging goes
-// through ParkourLog; ParkourLogStubs.cpp provides pass-through stubs so the
-// runtime behavior equals the vanilla pipeline apart from the callbacks.
-
-constexpr int RESULT_OF_PARKOUR_SORT_AND_SELECT__NO_ACTIONS_ACCEPTED = -1;
-
 static std::optional<int> FindIndexForAction(AvailableParkourAction& action, SmallArray<AvailableParkourAction*>& p_parkourSensorsResults)
 {
     auto foundIt = std::find(p_parkourSensorsResults.begin(), p_parkourSensorsResults.end(), &action);
@@ -186,7 +134,7 @@ static std::optional<int> FindIndexForAction(AvailableParkourAction& action, Sma
     }
     return {};
 }
-
+constexpr int RESULT_OF_PARKOUR_SORT_AND_SELECT__NO_ACTIONS_ACCEPTED = -1;
 int SortAndSelectBestMatchingAction_FullReplacement_inner(
     ParkourTester* parkourTester
     , __m128* p_locationOfOrigin
@@ -228,9 +176,12 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
                 SmallArray_POD__RemoveGeneric(&p_parkourSensorsResults, i--, 8u);
             }
         }
+        // Some of the elements of the array are removed, sooo...
+        // where are the deallocations of the elements?
+        // Maybe it's just a copied array of nonowning pointers.
     }
     {
-        // Idk what this call is, doesn't seem to do anything. (ACUFixes-0.9.3)
+        // Idk what this call is, doesn't seem to do anything.
         __m128 smthOut;
         GET_AND_CAST_FANCY_FUNC(*parkourTester, ParkourTesterKnownFancyVFuncs::ParkourTester_FancyVFunc_0x16)(&smthOut, *parkourTester, p_locationOfOrigin, p_directionOfMovementInputWorldSpace);
     }
@@ -266,9 +217,14 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
         currentCycle->LogActionFinalFilter2(*p_parkourSensorsResults[i], isPassedFinalFilter2);
         if (!isPassedFinalFilter2) continue;
 
-        // The action with the greatest "totalWeight" that passes these
-        // preceding two tests is selected.
+        // The action with the greatest "totalWeight" that passes these preceding two tests
+        // is selected.
         selectedBestMatch = i;
+        {
+            // Original implementation makes another call to "GetFitness()" and does nothing with the result.
+            // Are there any side effects to this? Idk.
+            //float __fitness = GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetFitness)(action);
+        }
         break;
     }
 
@@ -291,7 +247,6 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
 
     return result;
 }
-
 int SortAndSelectBestMatchingAction_FullReplacement(
     ParkourTester* parkourTester,
     __m128* p_locationOfOrigin,
@@ -319,80 +274,105 @@ int SortAndSelectBestMatchingAction_FullReplacement(
     }
     return selectedIdx;
 }
-
 GPH_Creation::GPH_Creation()
 {
-    // RE-ENABLED for FailedWallRunPlugin. Both addresses are the
-    // ACUFixes-0.9.3 / 1.5.0-verified set, confirmed present in the two
-    // reference DLLs that demonstrably work on this install (ACUFixes.dll and
-    // ACU_ParkourPatches.dll — see PROGRESS.md session 6 evidence), and
-    // FailedWallRunPlugin.cpp independently dump-verifies 0x1401D1CF0 against
-    // the runtime dump. The creation-stage replacement is what invokes
-    // OverrideCreationDiscard_fnp (keep-alive + 53->52 conversion).
-    // NOTE: like the sort&select start, these are function-start replacements;
-    // do not let two plugins replace the same address simultaneously.
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D1CF0, (void*)&CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement);
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D1E50, (void*)&CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement);
+    // Most "action types" are created from this call.
+    PresetScript_ReplaceFunctionAtItsStart(0x1401D1260, CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement);
+    // Several "Wallrun up" actions get created from this call.
+    PresetScript_ReplaceFunctionAtItsStart(0x1401D13C0, CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement);
 }
-
 GPH_SortAndSelect::GPH_SortAndSelect()
 {
-    // Function-start replacement of SortAndSelectBestMatchingAction.
-    // 0x140133B00 is the ACUFixes-0.9.3 / 1.5.0 value, confirmed by the
-    // constant scan of ACUFixes.dll and ACU_ParkourPatches.dll (both working
-    // on this install hook this exact address). A function-start replacement
-    // needs no stolen-byte relocation, unlike the previous mid-function hook.
-    PresetScript_ReplaceFunctionAtItsStart(0x140133B00, (void*)&SortAndSelectBestMatchingAction_FullReplacement);
+    PresetScript_ReplaceFunctionAtItsStart(0x140134940, SortAndSelectBestMatchingAction_FullReplacement);
 }
-
-// ── SharedHookActivator ──────────────────────────────────────────────────────
-
 SharedHookActivator::SharedHookActivator(std::function<void()> onCreate, std::function<void()> onDestroy)
-    : m_OnCreate(onCreate), m_OnDestroy(onDestroy) { m_OnCreate(); }
-
-SharedHookActivator::~SharedHookActivator() { m_OnDestroy(); }
-
-// ── GenericHooksInParkourFiltering ────────────────────────────────────────────
-
-std::shared_ptr<GenericHooksInParkourFiltering>& GenericHooksInParkourFiltering::GetSingleton()
+    : m_OnCreate(onCreate)
+    , m_OnDestroy(onDestroy)
 {
-    static auto s = std::make_shared<GenericHooksInParkourFiltering>();
-    return s;
+    m_OnCreate();
 }
 
-void GenericHooksInParkourFiltering::Subscribe(ParkourCallbacks& cb)
-{
-    auto it = m_Callbacks.begin();
-    for (; it != m_Callbacks.end(); ++it)
-        if (cb.m_CallbackPriority < (*it)->m_CallbackPriority) break;
-    m_Callbacks.insert(it, &cb);
-}
 
-void GenericHooksInParkourFiltering::Unsubscribe(ParkourCallbacks& cb)
+SharedHookActivator::~SharedHookActivator()
 {
-    m_Callbacks.erase(std::remove(m_Callbacks.begin(), m_Callbacks.end(), &cb), m_Callbacks.end());
+    m_OnDestroy();
 }
-
 std::shared_ptr<SharedHookActivator> GenericHooksInParkourFiltering::RequestGPHCreation()
 {
-    std::lock_guard lk{ m_Mutex };
-    auto a = m_Activator_GPHCreation.lock();
-    if (a) return a;
-    a = std::make_shared<SharedHookActivator>(
+    std::lock_guard _lock{ m_Mutex };
+    std::shared_ptr<SharedHookActivator> activator = m_Activator_GPHCreation.lock();
+    if (activator) return activator;
+    activator = std::make_shared<SharedHookActivator>(
         [&]() { gph_creation.Activate(); },
-        [&]() { gph_creation.Deactivate(); });
-    m_Activator_GPHCreation = a;
-    return a;
+        [&]() { gph_creation.Deactivate(); }
+    );
+    m_Activator_GPHCreation = activator;
+    return activator;
 }
-
 std::shared_ptr<SharedHookActivator> GenericHooksInParkourFiltering::RequestGPHSortAndSelect()
 {
-    std::lock_guard lk{ m_Mutex };
-    auto a = m_Activator_GPHSortAndSelect.lock();
-    if (a) return a;
-    a = std::make_shared<SharedHookActivator>(
+    std::lock_guard _lock{ m_Mutex };
+    std::shared_ptr<SharedHookActivator> activator = m_Activator_GPHSortAndSelect.lock();
+    if (activator) return activator;
+    activator = std::make_shared<SharedHookActivator>(
         [&]() { gph_sortAndSelect.Activate(); },
-        [&]() { gph_sortAndSelect.Deactivate(); });
-    m_Activator_GPHSortAndSelect = a;
-    return a;
+        [&]() { gph_sortAndSelect.Deactivate(); }
+    );
+    m_Activator_GPHSortAndSelect = activator;
+    return activator;
+}
+
+// This singleton is shared_ptr, inconsistent with the rest of the singletons I use
+// because I ran into the "deinitialization order fiasco".
+// If I just use "static GenericHooksInParkourFiltering" in the GetSingleton()
+// then the order of calling of constructors is as follows:
+//      std::optional g_MyHacks;
+//      ...
+//      g_MyHacks.emplace()
+//          ParkourActionsExtraProcessing::ctor()
+//              GenericHooksInParkourFiltering::GetSingleton() { static GenericHooksInParkourFiltering singleton; return singleton; }
+// which means that the order of completed construction is rearranged:
+//      std::optional g_MyHacks
+//      ...
+//      static GenericHooksInParkourFiltering singleton
+//      ParkourActionsExtraProcessing
+// And so the order of pushed "atexit"s is:
+//      std::optional g_MyHacks
+//      ...
+//      static GenericHooksInParkourFiltering singleton
+// And so the order of destructors is:
+//      static GenericHooksInParkourFiltering singleton::dtor()
+//          m_Callbacks::dtor()
+//      ...
+//      std::optional g_MyHacks::dtor()
+//          AutoAssemblerWrapper<ParkourActionsExtraProcessing>::dtor()
+//              AutoAssemblerWrapper<ParkourActionsExtraProcessing>::OnBeforeDeactivate()
+//                  ^^^---  And this is where GenericHooksInParkourFiltering::Unsubscribe() is called,
+//                          when the GenericHooksInParkourFiltering::singleton::m_Callbacks is already
+//                          destroyed, and its erase() throws an "vector erase iterator outside range" assertion and crashes.
+// So because of std::optional's delayed construction, the static GenericHooksInParkourFiltering
+// is guaranteed to be constructed later than g_MyHacks,
+// and automatic destruction order is guaranteed to be incorrect.
+// Basically, I need to keep the instance of GenericHooksInParkourFiltering alive for longer
+// than the global g_MyHacks
+// and the way I choose to do it here is shared_ptr.
+// It's not great, not foolproof, but it solves this crash.
+// I guess something better would be a dedicated initialization stage for the shared patches/features?
+std::shared_ptr<GenericHooksInParkourFiltering>& GenericHooksInParkourFiltering::GetSingleton()
+{
+    static auto singleton = std::make_shared<GenericHooksInParkourFiltering>();
+    return singleton;
+}
+void GenericHooksInParkourFiltering::Subscribe(ParkourCallbacks& callbacks)
+{
+    auto insertIt = m_Callbacks.begin();
+    for (; insertIt != m_Callbacks.end(); insertIt++)
+    {
+        if (callbacks.m_CallbackPriority < (*insertIt)->m_CallbackPriority) break;
+    }
+    m_Callbacks.insert(insertIt, &callbacks);
+}
+void GenericHooksInParkourFiltering::Unsubscribe(ParkourCallbacks& callbacks)
+{
+    std::erase(m_Callbacks, &callbacks);
 }

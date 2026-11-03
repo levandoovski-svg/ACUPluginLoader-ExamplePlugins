@@ -1,5 +1,5 @@
 #include "pch.h"
-#include "FreeJumpPlugin.h"
+#include "FreeJumpPlugin_151.h"
 #include "Common_Plugins/Common_PluginSide.h"
 
 // FreeJumpPlugin is the only gameplay plugin in this DLL. All other *Plugin.cpp
@@ -32,5 +32,5 @@ public:
         return true;
     }
 
-    FreeJumpPlugin g_freeJump;
+    FreeJumpPlugin_151 g_freeJump;
 } g_thisPlugin;
