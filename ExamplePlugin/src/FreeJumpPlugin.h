@@ -26,11 +26,9 @@ constexpr int kKeyboardKeyMax = 0xFE;
 
 // One entry per XInput button pair / digital stick direction / digital trigger.
 // Codes are persisted as decimal integers (like override keyCodes always were).
-// These are the SAME codes the whole plugin uses: feature bindings (Free Jump,
-// overrides, dive hotkey, Parkour Mode's own toggle) AND the Parkour Mode BLOCK
-// LIST (see the controller hook in FreeJumpPlugin.cpp: the game reads pads
-// through XInputGetState, so blocking one of these clears that button in the
-// state the game is about to receive). One capture path for every device.
+// These are the codes of the plugin's own feature bindings (Free Jump,
+// overrides, dive hotkey, Parkour Mode's own toggle). Parkour Mode does not
+// touch controller input: its block list is keyboard/mouse only.
 enum ParkourPadCode
 {
     PadCode_DPAD_UP = 0,
@@ -98,21 +96,19 @@ public:
     bool ShouldForceWallToHang() const;
 
     // Parkour Mode no longer has per-action checkboxes. The player lists the
-    // physical buttons (keyboard keys, mouse buttons, controller buttons) the
-    // game must not see while the mode is ON; those same buttons stay readable
-    // by the plugin itself, so they can drive override/parkour bindings at the
-    // same time. See `DescribeBlockedInputTarget` in FreeJumpPlugin.cpp for what
-    // each entry clears in the game's own raw input buffers.
+    // physical keyboard keys and mouse buttons the game must not see while the
+    // mode is ON; those same buttons stay readable by the plugin itself, so
+    // they can drive override/parkour bindings at the same time. Controller
+    // blocking is not supported. See `DescribeBlockedInputTarget` in
+    // FreeJumpPlugin.cpp for what each entry clears in the game's own raw
+    // input buffers.
     const std::vector<int>& GetBlockedKeys() const { return m_UserBlockedKeys; }
     // Human-readable one-liner for a blocked entry, so the UI can state exactly
     // what the game will stop seeing.
     static std::string DescribeBlockedInputTarget(int bindableKeyCode);
 
-    // Binding a controller button and blocking it use the SAME codes: a
-    // blocked controller entry is a PadCode_*, captured with the same
-    // captureKey lambda as every other binding, and cleared from the XInput
-    // state the game is about to receive (see the controller hook in
-    // FreeJumpPlugin.cpp).
+    // The blocked-key capture is the keyboard/mouse part of the same capture
+    // path every other binding uses; controller codes are not accepted.
     bool RememberBlockedKey(int blockedKeyCode);
     bool IsBlockedKeyCapturePending() const { return m_WaitingForBlockedKey; }
 private:
@@ -148,11 +144,10 @@ private:
     bool m_ParkourModeOn     = false;
     bool m_WaitingForParkourKey = false;
 
-    // Parkour Mode: the physical buttons the game must not see while the mode is
-    // ON. Keyboard/mouse Win32 virtual keys (0x01..0xFE, mouse buttons
-    // included) plus the same PadCode_* controller codes every other feature
-    // uses (see the controller hook in FreeJumpPlugin.cpp). One capture path
-    // for every device.
+    // Parkour Mode: the physical keyboard keys and mouse buttons the game must
+    // not see while the mode is ON. Keyboard/mouse Win32 virtual keys
+    // (0x01..0xFE, mouse buttons included); controller blocking is not
+    // supported.
     // Persisted as decimal codes separated by `|` in `ParkourBlockedKeys=`.
     // Defaults are the physical keys the game binds attack/aim/crouch to by
     // default (left and right mouse button + Left Ctrl), so a fresh install
@@ -183,16 +178,14 @@ private:
     //                a blocked key there means the fill can never turn it into
     //                an ActionKeyCode, an analog mirror (+0x274/+0x29C/+0x2A8)
     //                or a press edge.
-    //   controller  the game's XInputGetState import (xinput1_3.dll), detoured
-    //                so the state the game is about to receive has the blocked
-    //                buttons cleared (see FreeJumpPlugin.cpp).
+    // Parkour Mode does not touch controller input; its block list holds
+    // keyboard/mouse codes only.
     bool m_KbmFillSuppressActive = false;
     // The input-aggregate seam at 0x142739DBC - the exact site HybridInput.dll
     // detours to merge secondary device states into the container. Runs after
     // every keyStates writer, so suppressed actions are zeroed there one last
     // time (and HybridInput's own merge cannot resurrect them while we own it).
-    // Keyboard/mouse only: controller buttons never reach this layer, they are
-    // already gone from the XInput state the game reads.
+    // Keyboard/mouse only: the block list holds no controller entries.
     bool m_InputMergeSeamActive = false;
     bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
@@ -224,7 +217,7 @@ private:
     std::vector<ParkourActionOverride> m_Overrides;
 
     // Parkour mode suppression hooks (active only while the mode is enabled):
-    // the KBM keymap stage and the controller's XInputGetState detour (see
+    // the KBM keymap stage and the aggregate merge stage (see
     // FreeJumpPlugin.cpp).
     void ApplyParkourMode(bool enable);
     // Wall-to-Hang site hooks (see FreeJumpPlugin.cpp).
