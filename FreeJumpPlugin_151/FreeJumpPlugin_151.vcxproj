@@ -209,6 +209,9 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
          and main.parryassassin.cpp remain in src/ as inactive examples but are
          NOT part of this project. -->
     <ClCompile Include="src\FreeJumpPlugin_151.cpp" />
+    <ClCompile Include="src\GenericHooksInParkourFiltering.cpp" />
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\ParkourLogStubs.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
