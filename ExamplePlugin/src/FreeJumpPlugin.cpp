@@ -10,6 +10,7 @@
 #include "ACU_DefineNativeFunction.h"
 #include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include <Windows.h>
+#include <XInput.h>
 #include <shlobj.h>
 #include <algorithm>
 #include <cctype>
@@ -128,78 +129,15 @@ namespace
         return bindableKeyCode >= kPadKeyBase && bindableKeyCode < kPadKeyBase + PadCode_COUNT;
     }
 
-    // ── The game's own pad state: one buffer, one description ───────────────
-    // The game's pad poll (0x1427289A0, hooked at 0x142728A1F right after the
-    // device read) is the ONLY source of controller state for both of the game's
-    // pad paths, and the 0x110-byte DirectInput state it writes is the one
-    // buffer every consumer reads. Its layout is DirectInput's DIJOYSTATE as
-    // the game reads it:
-    //
-    //   +0x00 .. +0x1F  analog axes (lX/lY/lZ/lRx/lRy/lRz, 2 sliders). NOT
-    //                   blockable as buttons: a stick direction is a range, not
-    //                   an edge, so it needs its own axis-range binding. The
-    //                   triggers live here too.
-    //   +0x20           POV/"hat" dword, in DirectInput hundredths of a degree:
-    //                   0 = up, 9000 = right, 18000 = down, 27000 = left,
-    //                   0xFFFFFFFF = centered. A d-pad direction is exactly one
-    //                   of those values, so blocking one direction can clear
-    //                   the dword ONLY while it reports that direction - which
-    //                   leaves the other three live.
-    //   +0x30 ..        digital buttons, one byte each, bit 7 = pressed
-    //                   (DirectInput's rgbButtons). The last byte the state has
-    //                   room for is at 0x30 + kMaxPadSlot.
-    // Capturing a control from this buffer and clearing it from this buffer are
-    // the same operation on the same data, which is the whole point of the
-    // design: there is no second numbering to translate into.
-    constexpr int kPadHatOffset = 0x20;
-    constexpr int kPadButtonsOffset = 0x30;
-    constexpr int kPadStateSize = 0x110;
-    constexpr int kPadHatCentered = static_cast<int>(0xFFFFFFFFu);
-    constexpr int kPadHatHundredthsPerDegree = 100;
-
-    // A blocked entry that names a digital button of the game's pad state.
-    bool IsPadSlotCode(int blockedKeyCode)
-    {
-        // Inclusive: 0x30 + kMaxPadSlot is the last byte inside the state.
-        return blockedKeyCode >= kPadSlotBase && blockedKeyCode <= kPadSlotBase + kMaxPadSlot;
-    }
-
-    int PadSlotOf(int blockedKeyCode)
-    {
-        return IsPadSlotCode(blockedKeyCode) ? blockedKeyCode - kPadSlotBase : -1;
-    }
-
-    // A blocked entry that names one d-pad direction of the game's pad state.
-    bool IsPadHatCode(int blockedKeyCode)
-    {
-        return blockedKeyCode >= kPadHatBase && blockedKeyCode <= kPadHatBase + kMaxPadHatDegrees;
-    }
-
-    int PadHatDegreesOf(int blockedKeyCode)
-    {
-        return IsPadHatCode(blockedKeyCode) ? blockedKeyCode - kPadHatBase : -1;
-    }
-
     // Valid entries for the Parkour Mode block list: keyboard/mouse virtual
-    // keys, and the GAME's own controller controls. Deliberately NOT the
-    // kPadKeyBase range - a physical button name says nothing about which byte
-    // of the game's pad state the game fills for it, so it is not a blockable
-    // target. Feature bindings (Free Jump, overrides, ...) still use
-    // kPadKeyBase; only the block list is game-side.
+    // keys and the SAME PadCode_* controller codes the rest of the plugin
+    // uses. One capture path for every device.
     bool IsValidBlockedKey(int blockedKeyCode)
     {
         if (blockedKeyCode >= kKeyboardKeyMin && blockedKeyCode <= kKeyboardKeyMax)
             return true;
-        return IsPadSlotCode(blockedKeyCode) || IsPadHatCode(blockedKeyCode);
+        return IsPadCode(blockedKeyCode);
     }
-
-    // A HINT NAME only. On the game's own device-6 mapper table slot 0 is A,
-    // 1 = B, 2 = X, 3 = Y, 4 = RB, 5 = LB, 6 = Start, 7 = Back, so a captured
-    // slot in that range can be announced as "usually A". On a pad whose
-    // physical layout differs - or under an emulator that reorders the state -
-    // the name is the game's numbering, not the physical label, which is why it
-    // is decoration: the captured byte is what actually gets cleared.
-    const char* PadSlotName(int gameSlot);   // defined after PadCodeName
 
     // XInput is loaded dynamically: the loader environment may predate
     // xinput1_4.dll, and no XInput import library is linked into the plugin.
@@ -240,25 +178,20 @@ namespace
     }
 
     // ── Parkour Mode: how a blocked control maps onto the game's raw input ──
-    // Parkour Mode blocks *controls*, not in-game actions, so a blocked entry
-    // is described as "which byte of the game's own this-frame input buffer is
-    // cleared". Both blockers act the moment their buffer has just been filled
-    // and before any consumer reads it, so nothing downstream (the keymap
-    // fills, the pad mapper, the bool→float mirrors, edge and hold detection)
-    // can observe the control at all.
+    // Parkour Mode blocks *controls*, not in-game actions. Keyboard/mouse
+    // entries are cleared from the game's keymap-fill buffers; controller
+    // entries are cleared from the XInput state the game's own XInputGetState
+    // is about to return (see the controller hook further down).
     enum class BlockedInputKind
     {
         KeyboardScancode,   // DirectInput keyboard state byte, bit 7 = pressed
         MouseButton,        // DIMOUSESTATE rgbButtons[i] at mouseState + 0xC
-        PadButton,          // the game's pad state byte at kPadButtonsOffset + slot
-        PadHat,             // the game's pad state POV dword at kPadHatOffset
         Unsupported,        // no known location in the game's buffers; nothing cleared
     };
     struct BlockedInputSlot
     {
         BlockedInputKind kind = BlockedInputKind::Unsupported;
-        int slot = -1;        // PadButton: the digital button index
-        int hatDegrees = -1;  // PadHat: the one direction that is cleared
+        int slot = -1;        // the byte index that is cleared
     };
 
     // Keyboard: the keymap fill indexes the DirectInput keyboard state (the
@@ -293,23 +226,6 @@ namespace
         return {};
     }
 
-    // Controller: the GAME's own identifier -> the byte of the game's pad state
-    // that must be cleared for it. There is deliberately no table and no
-    // ParkourPadCode case here: the identifier was captured from that very
-    // state at assignment time (see FreeJumpPlugin::GetRisingGamePadControl),
-    // so it names a byte that exists in the buffer the blocker owns. Anything
-    // else - a physical button name, an analog axis - has no byte to clear and
-    // is reported as unsupported rather than guessed at.
-    BlockedInputSlot ComputePadControlSlot(int blockedKeyCode)
-    {
-        using K = BlockedInputKind;
-        if (const int slot = PadSlotOf(blockedKeyCode); slot >= 0)
-            return { K::PadButton, slot, -1 };
-        if (const int degrees = PadHatDegreesOf(blockedKeyCode); degrees >= 0)
-            return { K::PadHat, -1, degrees };
-        return {};
-    }
-
     const char* PadCodeName(int bindableKeyCode)
     {
         static const char* names[PadCode_COUNT] = {
@@ -327,44 +243,8 @@ namespace
         return names[bindableKeyCode - kPadKeyBase];
     }
 
-    // The d-pad direction a blocked hat entry names, by the POV value in
-    // hundredths of a degree. Off-cardinal values are formatted as an angle so
-    // an unusual d-pad or a diagonal still reads sensibly.
-    const char* PadHatDirectionName(int blockedDegrees)
-    {
-        switch (blockedDegrees)
-        {
-        case 0:    return "up";
-        case 90:   return "right";
-        case 180:  return "down";
-        case 270:  return "left";
-        default:   return "";
-        }
-    }
-
     std::string KeyCodeLabel(int bindableKeyCode)
     {
-        // Blocked-list entries are the GAME's own controls, so they are labelled
-        // by what the game reports rather than by a physical button name.
-        if (const int slot = PadSlotOf(bindableKeyCode); slot >= 0)
-        {
-            std::ostringstream label;
-            label << "Game pad button " << slot;
-            if (const char* slotName = PadSlotName(slot); *slotName)
-                label << " (usually " << slotName << ")";
-            return label.str();
-        }
-        if (const int degrees = PadHatDegreesOf(bindableKeyCode); degrees >= 0)
-        {
-            const char* direction = PadHatDirectionName(degrees);
-            std::ostringstream label;
-            label << "Game pad d-pad ";
-            if (*direction)
-                label << direction;
-            else
-                label << degrees << " degrees";
-            return label.str();
-        }
         if (IsPadCode(bindableKeyCode))
         {
             std::ostringstream label;
@@ -387,17 +267,6 @@ namespace
         if (mouseName)
             label << " (" << mouseName << ")";
         return label.str();
-    }
-
-    const char* PadSlotName(int gameSlot)
-    {
-        static constexpr ParkourPadCode kSlotToPadCode[] = {
-            PadCode_A, PadCode_B, PadCode_X, PadCode_Y, PadCode_RB, PadCode_LB,
-            PadCode_START, PadCode_BACK,
-        };
-        if (gameSlot < 0 || gameSlot >= 8)
-            return "";
-        return PadCodeName(kPadKeyBase + kSlotToPadCode[gameSlot]);
     }
 
     // LMB/RMB (and the other mouse buttons) are bindable. While the loader
@@ -582,14 +451,13 @@ namespace
     //     bookkeeping are derived. Clearing a byte there therefore removes the
     //     button from the whole frame in one place.
     //
-    //   gamepad — the game's pad poll at 0x142728A1F, immediately after
-    //     GetDeviceState has filled the 0x110-byte DirectInput state in rsi.
-    //     This one function is the ONLY source of pad state on both of the
-    //     game's pad paths (the device-9 keymap fill at 0x14273B390 writes
-    //     InputContainerBig+0x864, the hard-coded per-device mapper at
-    //     0x142739E40 reads a stack copy at rsp+0x20 — in both cases the very
-    //     buffer rsi points at), so clearing a button here hides it from the
-    //     keymap and the mapper alike: no action, no press edge, no hold.
+    //   gamepad — the game's own XInputGetState import (xinput1_3.dll's IAT,
+    //     and an inline hook on the DLL export when the game resolves it with
+    //     GetProcAddress instead). The detour calls the original, then clears
+    //     the blocked buttons from the state the game is about to receive. The
+    //     plugin's own pad reader polls through xinput1_4.dll - a different
+    //     module with its own code - so it is never hooked and stays untouched:
+    //     the same button can drive a parkour override at the very same moment.
     //
     // Previous sessions' approach — zeroing keyStates_thisFrame for selected
     // ActionKeyCode entries at three post-hoc sites (0x14273BC7B / 0x14273BEC5
@@ -606,7 +474,7 @@ namespace
     // player's input path at all. Zero while the matching device is being used
     // means that seam never runs on this install - which is exactly what the
     // manual test needs to know.
-    uint32_t g_PadPollHits = 0;
+    uint32_t g_ControllerHookHits = 0;
     uint32_t g_KbmFillHits = 0;
     // The aggregate seam (0x142739DBC): detour executions, and how many of
     // those had a validated container ([rcx+0x200] matching the singleton
@@ -621,17 +489,9 @@ namespace
         return owner && !owner->GetBlockedKeys().empty();
     }
 
-    // Note the pad seam runs while the player is assigning a button even though
-    // nothing is being blocked yet: assigning a controller button IS a
-    // measurement of the game's pad state (see GetRisingGamePadControl), so the
-    // observation seam is installed for the capture too (wantPadWatch in
-    // OnUpdate). Observation happens BEFORE any clearing, so watching can never
-    // disturb the measurement.
-
     // The one mapping both blockers use: blocked entry -> the byte(s) of the
     // game's own input buffers that must be cleared for it. Keyboard/mouse and
-    // controller entries are resolved independently; the pad entry is the
-    // game-side capture, resolved with no translation.
+    // controller entries are resolved independently.
     BlockedInputSlot ComputeBlockedInputSlot(int blockedKeyCode)
     {
         switch (blockedKeyCode)
@@ -645,11 +505,6 @@ namespace
         default:
             break;
         }
-        if (const BlockedInputSlot pad = ComputePadControlSlot(blockedKeyCode);
-            pad.kind != BlockedInputKind::Unsupported)
-        {
-            return pad;
-        }
         if (blockedKeyCode >= kKeyboardKeyMin && blockedKeyCode <= kKeyboardKeyMax)
             return ComputeKeyboardSlot(blockedKeyCode);
         return {};
@@ -660,9 +515,9 @@ namespace
     // the ACTIONS that button drives, at the point where the game has already
     // aggregated every device's contribution. It exists for two reasons:
     //
-    //   1. On an install where a raw seam does not run (unknown device id, a
-    //      site owned by another plugin, a pad path this build has not mapped),
-    //      a blocked button could previously still reach the game.
+    //   1. On an install where a raw seam does not run (a site owned by
+    //      another plugin), a blocked button could previously still reach the
+    //      game.
     //   2. HybridInput.dll - whose simultaneous keyboard/mouse + gamepad merge
     //      many players run - re-fills zeroed action bytes from secondary
     //      devices at its own detour (its merge copies a secondary device's
@@ -689,16 +544,12 @@ namespace
     //                device count (HybridInput RE: entries of stride 0x238,
     //                first pointer = the device's resolved state, a 0x310+-byte
     //                structure in the same layout as the container).
-    //       big+0x864 this frame's 0x110-byte pad snapshot (buttons at +0x30,
-    //                hat at +0x20) - what the pad seams already sanitize.
     //
-    //   * The player's keymaps, readable at seams this plugin already hooks:
+    //   * The player's KBM keymap, readable at a seam this plugin already
+    //     hooks:
     //       KBM fill 0x14273B2B0: r9 = 32 entries, stride 0x214, type at +4,
     //                code at +8; type 1 = keyboard scancode, 2 = mouse button.
-    //       pad snapshot site 0x14273BEB3: rdi = the pad keymap, same stride;
-    //                type 1 = digital pad button (code = the snapshot SLOT the
-    //                button occupies), 2 = axis/hat comparison.
-    //     With them, WHICH actions a blocked button drives comes from the
+    //     With it, WHICH actions a blocked button drives comes from the
     //     game's own bindings - no more guessing (which is what killed the old
     //     action-mask approach in earlier builds).
     //
@@ -759,41 +610,7 @@ namespace
         return container;
     }
 
-    // The InputContainerBig through the same chain (for the pad snapshot at
-    // +0x864).
-    uintptr_t ResolveInputContainerBig()
-    {
-        const uintptr_t hic = *reinterpret_cast<const uintptr_t*>(0x14525BEC8);
-        if (!hic)
-            return 0;
-        const uintptr_t p10 = *reinterpret_cast<const uintptr_t*>(hic + 0x10);
-        if (!p10 || !IsRangeReadable(reinterpret_cast<const void*>(p10), 0x20))
-            return 0;
-        const uintptr_t big = *reinterpret_cast<const uintptr_t*>(p10 + 0x10);
-        // Covers the pad snapshot at +0x864 (0x110 bytes).
-        if (!big || !IsRangeReadable(reinterpret_cast<const void*>(big), 0x980))
-            return 0;
-        return big;
-    }
-
-    // Container-based observation fallback for the pad snapshot, so a binding
-    // capture and the UI's game-sees readout work even when NO pad seam runs
-    // on an install (e.g. the pad poll site is owned by another plugin).
-    // NoteGamePadState's first-wins gate means a fresher seam observation
-    // always wins over this one. Self-consistent with blocking: when no seam
-    // runs, nothing was cleared either, so the raw state (and its rising
-    // edges) is exactly what the capture needs.
-    void NoteGamePadStateFromContainer(FreeJumpPlugin* owner)
-    {
-        if (!owner)
-            return;
-        const uintptr_t big = ResolveInputContainerBig();
-        if (!big)
-            return;
-        owner->NoteGamePadState(reinterpret_cast<const uint8_t*>(big + 0x864));
-    }
-
-    // ── The player's keymaps, captured at already-installed seams ──────────
+    // ── The player's KBM keymap, captured at an already-installed seam ─────
     constexpr size_t kKeymapEntryStride = 0x214;
     constexpr size_t kKeymapEntryCount = 0x20;
     constexpr size_t kKeymapBytes = kKeymapEntryCount * kKeymapEntryStride;
@@ -850,7 +667,6 @@ namespace
         }
     };
     SuppressedActions g_SuppressedActions;
-    uint32_t g_DeviceStatesSanitized = 0;   // device-table states touched, last run
 
     void SuppressAction(SuppressedActions& out, int actionIndex, int blockedKey)
     {
@@ -864,7 +680,6 @@ namespace
     void ComputeSuppressedActions(const FreeJumpPlugin* owner)
     {
         g_SuppressedActions = SuppressedActions{};
-        g_DeviceStatesSanitized = 0;
         if (!owner || !IsParkourBlockingActive())
             return;
 
@@ -883,9 +698,9 @@ namespace
                 blockedMouseButtons.push_back(slot.slot);
                 break;
             default:
-                // Controller entries are cleared at the pad poll and never
-                // become an action here, so they contribute nothing to this
-                // keyboard/mouse mask.
+                // Controller entries are cleared from the XInput state by the
+                // controller hook and never become an action here, so they
+                // contribute nothing to this keyboard/mouse mask.
                 break;
             }
         }
@@ -946,7 +761,6 @@ namespace
             return;
         if (!IsRangeReadable(reinterpret_cast<const void*>(table), static_cast<size_t>(count) * 0x238))
             return;
-        int sanitized = 0;
         for (uint16_t i = 0; i < count; ++i)
         {
             const uintptr_t state = *reinterpret_cast<const uintptr_t*>(
@@ -962,9 +776,7 @@ namespace
                 stateKeyStates[action] = 0;
                 stateMirrors[action] = 0.0f;
             }
-            ++sanitized;
         }
-        g_DeviceStatesSanitized = static_cast<uint32_t>(sanitized);
     }
 
     // Keyboard/mouse blocker. Runs at the keymap fill's entry, with the
@@ -1032,114 +844,6 @@ namespace
         }
     }
 
-    // ── Parkour Mode, controller: what a blocked entry clears ───────────────
-    // A blocked controller entry IS a location in the game's own pad state, so
-    // blocking is a byte write and nothing else. There is no mapping to look
-    // up, no emulator to recognise and no table to drift out of date.
-
-    // Clears one digital button of the game's 0x110-byte DirectInput pad state.
-    void ClearPadButton(uint8_t* padState, int slot)
-    {
-        const size_t offset = static_cast<size_t>(kPadButtonsOffset) + static_cast<size_t>(slot);
-        if (offset >= kPadStateSize)
-            return;
-        // Clear the whole byte, not just bit 7, so the button is not merely
-        // unpressed but indistinguishable from "never touched this frame".
-        padState[offset] = 0;
-    }
-
-    // Clears ONE recorded d-pad direction, and only that one. The POV dword is
-    // set to DirectInput's "centered" value only while it currently reports the
-    // blocked direction, so blocking LEFT leaves UP/DOWN/RIGHT fully live -
-    // the whole hat is never neutralised for one direction.
-    void ClearPadHatDirection(uint8_t* padState, int blockedDegrees)
-    {
-        uint32_t& pov = *reinterpret_cast<uint32_t*>(padState + kPadHatOffset);
-        if (pov == static_cast<uint32_t>(kPadHatCentered))
-            return;
-        if (static_cast<int>(pov) != blockedDegrees * kPadHatHundredthsPerDegree)
-            return;
-        pov = static_cast<uint32_t>(kPadHatCentered);
-    }
-
-    // Erases every blocked controller entry from the game's pad state. An entry
-    // that names no location in that state (an analog axis, or a legacy
-    // physical-button name) is skipped rather than guessed at.
-    void ClearBlockedPadControls(const FreeJumpPlugin* owner, uint8_t* padState)
-    {
-        if (!owner || !padState || !IsParkourBlockingActive())
-            return;
-        for (const int blockedKeyCode : owner->GetBlockedKeys())
-        {
-            const BlockedInputSlot slot = ComputeBlockedInputSlot(blockedKeyCode);
-            switch (slot.kind)
-            {
-            case BlockedInputKind::PadButton:
-                ClearPadButton(padState, slot.slot);
-                break;
-            case BlockedInputKind::PadHat:
-                ClearPadHatDirection(padState, slot.hatDegrees);
-                break;
-            default:
-                // Keyboard/mouse entries are cleared at their own seam, and
-                // unsupported entries clear nothing.
-                break;
-            }
-        }
-    }
-
-    // ── Parkour Mode, controller: ONE seam, both jobs ───────────────
-    // The interception point is the game's own pad poll, at 0x142728A1F - the
-    // instruction right after the device read has filled the 0x110-byte
-    // DirectInput state in rsi. In DirectInput terms this is the
-    // IDirectInputDevice8::GetDeviceState boundary of this game's own pipeline:
-    // the buffer is what the game is about to receive, and it is the ONLY copy
-    // it ever reads. A full-image rel32 scan over .text shows the poll
-    // (0x1427289A0) is called from EXACTLY two places:
-    //   0x14273BEA1  - device id 9: fills InputContainerBig+0x864
-    //   0x142739EA6  - every other id: fills the per-device mapper's stack buffer
-    // Both callers converge on the poll and both consume the very buffer rsi
-    // points at, so this single seam observes and clears for BOTH pad paths.
-    // There is deliberately no second, device-specific hook: the earlier
-    // device-9 snapshot seam (0x14273BEB3), the mapper seam (0x14273A726) and
-    // the pad action-level suppression they fed existed only to translate an
-    // assumed button mapping, and with the control cleared at its source there
-    // is nothing left for them to do.
-    //
-    // One seam does both jobs on the same data:
-    //   OBSERVE (before clearing) - the untouched state the game just produced.
-    //     This is what a binding capture measures (the exact control that went
-    //     from released to pressed) and what the UI's "game sees" readout
-    //     reports.
-    //   CLEAR - for every blocked entry, erase exactly the control it names:
-    //     a digital button's byte, or that one d-pad direction's POV value.
-    //
-    // Mid-function seam: the stolen bytes are re-executed and control returns
-    // to the next instruction, so neither the game's control flow nor its
-    // "test al,al" on the poll's result is disturbed. (Stealing the "call" to
-    // the poll instead is not an option - this framework restores RAX from the
-    // stack, so a callback cannot supply the return value the game tests, and
-    // the pad would look disconnected.)
-    //
-    // Only the bytes the player assigned are ever touched, so movement, sticks
-    // and every other button stay fully alive, and the plugin's own XInput
-    // polling (a different DLL reading the real device) is untouched - which is
-    // what lets the very same button drive a parkour override.
-    void SanitizePadPollSnapshot(AllRegisters* params)
-    {
-        FreeJumpPlugin* owner = g_ParkourModeInstance;
-        if (!owner)
-            return;
-        auto* padState = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params->rsi_));
-        if (!padState)
-            return;
-        ++g_PadPollHits;
-        // Observe FIRST, so the readout and any binding capture see the state
-        // the game itself produced rather than our own clearing of it.
-        owner->NoteGamePadState(padState);
-        ClearBlockedPadControls(owner, padState);
-    }
-
     // ── Parkour Mode, keyboard/mouse: clear the blocked key before the
     //    game's keymap fill can resolve it ─────────────────────────────
     // 0x14273B2B0 is that fill, entered once per frame from the input update
@@ -1173,22 +877,441 @@ namespace
         return s_hook;
     }
 
-    struct ParkourModePadPollHook : AutoAssemblerCodeHolder_Base
+    // ── Parkour Mode, controller: ONE hook on the game's own pad source ─────
+    // The game imports xinput1_3.dll, so it most likely reads pads with
+    // XInputGetState. The hook replaces the game's IAT entries for
+    // XInputGetState (and XInputGetStateEx, ordinal 100, when imported) with a
+    // detour. If the IAT has no entry (the game resolved the function with
+    // GetProcAddress instead), the fallback is an inline hook on xinput1_3.dll's
+    // XInputGetState export. That is still safe here: the plugin's own pad
+    // reader polls through xinput1_4.dll — a different module with its own
+    // code — so the one rule holds: nothing in the module the plugin polls
+    // through is ever hooked.
+    //
+    // The detour calls the original first; if the game is being handed a
+    // connected-pad state (ERROR_SUCCESS) while Parkour Mode is active, the
+    // blocked controls are cleared from that state. dwPacketNumber is left
+    // alone so edge detectors keep their view of packet progression. The
+    // detour is allocation-free: the blocked mask/axis set is a POD rebuilt
+    // in place on the stack.
+    struct BlockedPadControls
     {
-        ParkourModePadPollHook()
+        // buttons -> wButtons &= ~mask
+        uint16_t buttonMask = 0;
+        bool leftTrigger = false;
+        bool rightTrigger = false;
+        // sticks -> zero only the blocked half-axis
+        bool lStickUp = false, lStickDown = false, lStickLeft = false, lStickRight = false;
+        bool rStickUp = false, rStickDown = false, rStickLeft = false, rStickRight = false;
+
+        void ClearFromState(XINPUT_STATE& state) const
         {
-            PresetScript_CCodeInTheMiddle(
-                0x142728A1F, 6,
-                SanitizePadPollSnapshot,
-                RETURN_TO_RIGHT_AFTER_STOLEN_BYTES,
-                true);
+            if (buttonMask)
+                state.Gamepad.wButtons &= static_cast<WORD>(~buttonMask);
+            if (leftTrigger)
+                state.Gamepad.bLeftTrigger = 0;
+            if (rightTrigger)
+                state.Gamepad.bRightTrigger = 0;
+            if (lStickUp && state.Gamepad.sThumbLY > 0)
+                state.Gamepad.sThumbLY = 0;
+            if (lStickDown && state.Gamepad.sThumbLY < 0)
+                state.Gamepad.sThumbLY = 0;
+            if (lStickLeft && state.Gamepad.sThumbLX < 0)
+                state.Gamepad.sThumbLX = 0;
+            if (lStickRight && state.Gamepad.sThumbLX > 0)
+                state.Gamepad.sThumbLX = 0;
+            if (rStickUp && state.Gamepad.sThumbRY > 0)
+                state.Gamepad.sThumbRY = 0;
+            if (rStickDown && state.Gamepad.sThumbRY < 0)
+                state.Gamepad.sThumbRY = 0;
+            if (rStickLeft && state.Gamepad.sThumbRX < 0)
+                state.Gamepad.sThumbRX = 0;
+            if (rStickRight && state.Gamepad.sThumbRX > 0)
+                state.Gamepad.sThumbRX = 0;
         }
     };
 
-    AutoAssembleWrapper<ParkourModePadPollHook>& GetParkourModePadPollHook()
+    // Blocked entry (kPadKeyBase + PadCode_*) -> what the detour must clear in
+    // XINPUT_STATE. Triggers and stick directions ARE blockable now: the detour
+    // zeroes the blocked half-axis/trigger directly in the state the game
+    // receives.
+    void AccumulateBlockedPadCode(BlockedPadControls& out, int blockedKeyCode)
     {
-        static AutoAssembleWrapper<ParkourModePadPollHook> s_hook;
-        return s_hook;
+        if (!IsPadCode(blockedKeyCode))
+            return;
+        switch (static_cast<ParkourPadCode>(blockedKeyCode - kPadKeyBase))
+        {
+        case PadCode_DPAD_UP:    out.buttonMask |= 0x0001; break;
+        case PadCode_DPAD_DOWN:  out.buttonMask |= 0x0002; break;
+        case PadCode_DPAD_LEFT:  out.buttonMask |= 0x0004; break;
+        case PadCode_DPAD_RIGHT: out.buttonMask |= 0x0008; break;
+        case PadCode_START:      out.buttonMask |= 0x0010; break;
+        case PadCode_BACK:       out.buttonMask |= 0x0020; break;
+        case PadCode_L3:         out.buttonMask |= 0x0040; break;
+        case PadCode_R3:         out.buttonMask |= 0x0080; break;
+        case PadCode_LB:         out.buttonMask |= 0x0100; break;
+        case PadCode_RB:         out.buttonMask |= 0x0200; break;
+        case PadCode_A:          out.buttonMask |= 0x1000; break;
+        case PadCode_B:          out.buttonMask |= 0x2000; break;
+        case PadCode_X:          out.buttonMask |= 0x4000; break;
+        case PadCode_Y:          out.buttonMask |= 0x8000; break;
+        case PadCode_LT:         out.leftTrigger = true; break;
+        case PadCode_RT:         out.rightTrigger = true; break;
+        case PadCode_LSTICK_UP:    out.lStickUp = true; break;
+        case PadCode_LSTICK_DOWN:  out.lStickDown = true; break;
+        case PadCode_LSTICK_LEFT:  out.lStickLeft = true; break;
+        case PadCode_LSTICK_RIGHT: out.lStickRight = true; break;
+        case PadCode_RSTICK_UP:    out.rStickUp = true; break;
+        case PadCode_RSTICK_DOWN:  out.rStickDown = true; break;
+        case PadCode_RSTICK_LEFT:  out.rStickLeft = true; break;
+        case PadCode_RSTICK_RIGHT: out.rStickRight = true; break;
+        default: break;
+        }
+    }
+
+    BlockedPadControls ComputeBlockedPadControls(const FreeJumpPlugin* owner)
+    {
+        BlockedPadControls out;
+        if (!owner)
+            return out;
+        for (const int blockedKeyCode : owner->GetBlockedKeys())
+            AccumulateBlockedPadCode(out, blockedKeyCode);
+        return out;
+    }
+
+    // The original XInputGetState/XInputGetStateEx pointer, captured from the
+    // IAT (or the trampoline) before the first patch. Same function for both
+    // entry points; XInputGetStateEx differs only in the extra guide button
+    // bit, which this detour never touches.
+    XInputGetState_t g_XInputGetState_Original = nullptr;
+
+    // Set by UpdatePadStates around its own getState calls. The plugin prefers
+    // xinput1_4.dll (which the controller hook NEVER touches), but on systems
+    // without xinput1_4 the plugin's reader falls back to xinput1_3.dll - and
+    // the inline-hook fallback detours that export. The detour must never feed
+    // CLEARED state back to the plugin: the whole feature is that the plugin
+    // keeps reading the real pad while the game sees the blocked buttons
+    // removed. With this flag up, the detour only passes the call through.
+    thread_local bool tls_PluginPadPollInProgress = false;
+
+    DWORD WINAPI Detour_XInputGetState(DWORD userIndex, XInputPadState* padState)
+    {
+        // Single shared trampoline. (xinput1_3.dll's XInputGetState and
+        // XInputGetStateEx resolve to the same entry code path; the guide-bit
+        // difference lives in the caller's handling, not in the entry point.)
+        const XInputGetState_t original = g_XInputGetState_Original;
+        if (!original || !padState)
+            return ERROR_DEVICE_NOT_CONNECTED;
+        const DWORD result = original(userIndex, padState);
+        if (result != ERROR_SUCCESS)
+            return result;
+        if (tls_PluginPadPollInProgress)
+            return result;   // the plugin's own reader: always the real state
+        // The hook is only installed while Parkour Mode blocks something, so
+        // every successful call here is a time the game read its pad through
+        // this seam - which is what the hit counter exists to prove.
+        ++g_ControllerHookHits;
+        if (!IsParkourBlockingActive())
+            return result;
+        if (const BlockedPadControls blocked = ComputeBlockedPadControls(g_ParkourModeInstance);
+            blocked.buttonMask || blocked.leftTrigger || blocked.rightTrigger
+            || blocked.lStickUp || blocked.lStickDown || blocked.lStickLeft || blocked.lStickRight
+            || blocked.rStickUp || blocked.rStickDown || blocked.rStickLeft || blocked.rStickRight)
+        {
+            // The plugin's own XINPUT_STATE layout is byte-identical to
+            // xinput1_3.dll's (the win32 structure), so the same pointer works
+            // for both.
+            blocked.ClearFromState(*reinterpret_cast<XINPUT_STATE*>(padState));
+        }
+        return result;
+    }
+
+    // Resolved once at activate-time: the xinput1_3.dll module the game's own
+    // pad state comes from. LoadLibraryA on an already-loaded name just
+    // increments the refcount, so this cannot load a second copy.
+    HMODULE GetXInput13Module()
+    {
+        return GetModuleHandleA("xinput1_3.dll");
+    }
+
+    // Walks the main module's IMAGE_IMPORT_DESCRIPTORs and returns the IAT
+    // slot (FirstThunk entry, i.e. what the game actually calls) for the given
+    // import of the given DLL. Returns nullptr when the import is absent -
+    // which is the signal for the GetProcAddress/inline-hook fallback.
+    void** FindIATEntry(const char* dllName, const char* functionName, uint16_t ordinalHint = 0)
+    {
+        const HMODULE mainModule = GetModuleHandleA(nullptr);
+        if (!mainModule)
+            return nullptr;
+        const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(mainModule);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+            return nullptr;
+        const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+            reinterpret_cast<const uint8_t*>(mainModule) + dosHeader->e_lfanew);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
+            return nullptr;
+        const IMAGE_DATA_DIRECTORY& importDir =
+            ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!importDir.VirtualAddress || !importDir.Size)
+            return nullptr;
+
+        const HMODULE dllModule = GetModuleHandleA(dllName);
+
+        auto* importDescriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+            reinterpret_cast<const uint8_t*>(mainModule) + importDir.VirtualAddress);
+        for (; importDescriptor->Name; ++importDescriptor)
+        {
+            const char* importedDll = reinterpret_cast<const char*>(
+                reinterpret_cast<const uint8_t*>(mainModule) + importDescriptor->Name);
+            if (_stricmp(importedDll, dllName) != 0)
+                continue;
+            uintptr_t iatThunkAddr = reinterpret_cast<uintptr_t>(
+                reinterpret_cast<const uint8_t*>(mainModule) + importDescriptor->FirstThunk);
+            if (importDescriptor->OriginalFirstThunk)
+            {
+                // OriginalFirstThunk (import names) and FirstThunk (the IAT the
+                // game calls through) run in parallel; patch the FirstThunk
+                // entry that the name/ordinal identifies.
+                const uint8_t* nameThunk = reinterpret_cast<const uint8_t*>(mainModule)
+                    + importDescriptor->OriginalFirstThunk;
+                for (;; nameThunk += sizeof(IMAGE_THUNK_DATA), iatThunkAddr += sizeof(IMAGE_THUNK_DATA))
+                {
+                    const uintptr_t importName = reinterpret_cast<const IMAGE_THUNK_DATA*>(nameThunk)->u1.AddressOfData;
+                    if (!importName)
+                        break;
+                    if (importName & IMAGE_ORDINAL_FLAG)
+                    {
+                        // Import by ordinal.
+                        if (ordinalHint && (importName & 0xFFFF) == ordinalHint)
+                            return reinterpret_cast<void**>(iatThunkAddr);
+                        continue;
+                    }
+                    const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(importName);
+                    if (functionName && strcmp(reinterpret_cast<const char*>(importByName->Name), functionName) == 0)
+                        return reinterpret_cast<void**>(iatThunkAddr);
+                }
+            }
+            else if (dllModule)
+            {
+                // Bound import table (no original-thunk names left): identify
+                // the slot by its already-resolved value instead.
+                void* expected = functionName
+                    ? reinterpret_cast<void*>(GetProcAddress(dllModule, functionName))
+                    : (ordinalHint
+                        ? reinterpret_cast<void*>(GetProcAddress(dllModule, (const char*)(uintptr_t)ordinalHint))
+                        : nullptr);
+                if (expected)
+                {
+                    for (;; iatThunkAddr += sizeof(IMAGE_THUNK_DATA))
+                    {
+                        void* current = *reinterpret_cast<void**>(iatThunkAddr);
+                        if (!current)
+                            break;
+                        if (current == expected)
+                            return reinterpret_cast<void**>(iatThunkAddr);
+                    }
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    // Replaces one IAT slot with the detour and returns the previous value.
+    // VirtualProtect around the write; the IAT is data, so its page is
+    // typically read-only.
+    bool WriteIATEntry(void** iatSlot, void* newValue, void*& previousValue)
+    {
+        if (!iatSlot)
+            return false;
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(iatSlot, sizeof(void*), PAGE_READWRITE, &oldProtect))
+            return false;
+        previousValue = *iatSlot;
+        *iatSlot = newValue;
+        VirtualProtect(iatSlot, sizeof(void*), oldProtect, &oldProtect);
+        return true;
+    }
+
+    // Raw byte writer with VirtualProtect around it (used by the inline hook
+    // on the DLL export; the IAT itself goes through WriteIATEntry).
+    bool WriteProcessBytes(void* dst, const void* src, size_t size)
+    {
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(dst, size, PAGE_EXECUTE_READWRITE, &oldProtect))
+            return false;
+        memcpy(dst, src, size);
+        VirtualProtect(dst, size, oldProtect, &oldProtect);
+        return true;
+    }
+
+    // Inline-hook fallback state (used only when the IAT carries no import for
+    // XInputGetState, i.e. the game resolves it with GetProcAddress).
+    //
+    // A detour that calls "the original" needs a trampoline, otherwise calling
+    // it re-enters the hook forever. The trampoline is one VirtualAlloc'd
+    // executable page holding the stolen prologue bytes followed by a jmp back
+    // to the instruction after them. This is only safe because the verified
+    // xinput1_3.dll prologue is 13 bytes of position-independent mov/push/sub
+    // (48 89 54 24 10 | 89 4C 24 08 | 48 83 EC 58) - no RIP-relative operand -
+    // so a byte copy executes identically from anywhere. Anything else in the
+    // prologue and the fallback REFUSES (it does not guess).
+    bool g_InlineHookInstalled = false;
+    uint8_t g_InlineHookSavedBytes[13] = {};
+    void* g_InlineHookTarget = nullptr;
+    void* g_InlineTrampoline = nullptr;
+
+    constexpr size_t kInlineHookStolenBytes = 13;
+
+    bool InstallInlineXInputHook()
+    {
+        const HMODULE xinput13 = GetXInput13Module();
+        if (!xinput13)
+            return false;
+        // Only the named export: xinput1_3.dll has no separate XInputGetStateEx
+        // code path (its export table ends at ordinal 8), so hooking
+        // XInputGetState covers everything the game can import or resolve.
+        void* target = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(GetProcAddress(xinput13, "XInputGetState")));
+        if (!target)
+            return false;
+        static const uint8_t kKnownPrologue[kInlineHookStolenBytes] = {
+            0x48, 0x89, 0x54, 0x24, 0x10, 0x89, 0x4C, 0x24, 0x08, 0x48, 0x83, 0xEC, 0x58,
+        };
+        if (memcmp(target, kKnownPrologue, kInlineHookStolenBytes) != 0)
+            return false;   // unknown prologue: refuse rather than corrupt
+
+        void* detour = reinterpret_cast<void*>(&Detour_XInputGetState);
+
+        // Trampoline: stolen bytes + jmp rel32 back to target+13.
+        uint8_t* trampoline = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+        if (!trampoline)
+            return false;
+        size_t trampolineSize = 0;
+        memcpy(trampoline + trampolineSize, kKnownPrologue, kInlineHookStolenBytes);
+        trampolineSize += kInlineHookStolenBytes;
+        const int32_t relJump = static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(target) + kInlineHookStolenBytes
+            - (reinterpret_cast<uintptr_t>(trampoline) + trampolineSize + 5));
+        trampoline[trampolineSize++] = 0xE9;
+        memcpy(trampoline + trampolineSize, &relJump, sizeof(relJump));
+        trampolineSize += sizeof(relJump);
+
+        // Patch: mov rax, detour ; jmp rax ; nops to the full stolen length.
+        uint8_t patch[kInlineHookStolenBytes];
+        size_t patchSize = 0;
+        patch[patchSize++] = 0x48; patch[patchSize++] = 0xB8;             // mov rax, imm64
+        memcpy(patch + patchSize, &detour, sizeof(detour));
+        patchSize += sizeof(detour);
+        patch[patchSize++] = 0xFF; patch[patchSize++] = 0xE0;             // jmp rax
+        while (patchSize < kInlineHookStolenBytes)
+            patch[patchSize++] = 0x90;                                    // nop the remainder
+
+        uint8_t savedBytes[kInlineHookStolenBytes];
+        memcpy(savedBytes, target, kInlineHookStolenBytes);
+        if (!WriteProcessBytes(target, patch, kInlineHookStolenBytes))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            return false;
+        }
+        memcpy(g_InlineHookSavedBytes, savedBytes, kInlineHookStolenBytes);
+        g_InlineHookTarget = target;
+        g_InlineTrampoline = trampoline;
+        g_InlineHookInstalled = true;
+        // The detour's "call the original" goes through the trampoline.
+        g_XInputGetState_Original = reinterpret_cast<XInputGetState_t>(trampoline);
+        return true;
+    }
+
+    void RemoveInlineXInputHook()
+    {
+        if (!g_InlineHookInstalled || !g_InlineHookTarget)
+            return;
+        WriteProcessBytes(g_InlineHookTarget, g_InlineHookSavedBytes, kInlineHookStolenBytes);
+        if (g_XInputGetState_Original == reinterpret_cast<XInputGetState_t>(g_InlineTrampoline))
+            g_XInputGetState_Original = nullptr;
+        if (g_InlineTrampoline)
+        {
+            VirtualFree(g_InlineTrampoline, 0, MEM_RELEASE);
+            g_InlineTrampoline = nullptr;
+        }
+        g_InlineHookInstalled = false;
+        g_InlineHookTarget = nullptr;
+    }
+
+    // IAT-hook state: the slots that were patched and their original values,
+    // so deactivate writes back exactly what was there (no re-walk races).
+    bool g_ControllerIATHooked = false;
+    void** g_IATSlotGetState = nullptr;
+    void* g_IATOriginalGetState = nullptr;
+    void** g_IATSlotGetStateEx = nullptr;
+    void* g_IATOriginalGetStateEx = nullptr;
+
+    bool IsControllerHookActive()
+    {
+        return g_ControllerIATHooked || g_InlineHookInstalled;
+    }
+
+    bool ActivateControllerHook()
+    {
+        if (IsControllerHookActive())
+            return true;
+
+        // 1) The game's own import table: patch XInputGetState and, when
+        //    imported, XInputGetStateEx (ordinal 100).
+        bool hookedAny = false;
+        void* previous = nullptr;
+        if (void** iat = FindIATEntry("xinput1_3.dll", "XInputGetState"); iat)
+        {
+            if (WriteIATEntry(iat, reinterpret_cast<void*>(&Detour_XInputGetState), previous))
+            {
+                g_IATSlotGetState = iat;
+                g_IATOriginalGetState = previous;
+                if (!g_XInputGetState_Original)
+                    g_XInputGetState_Original = reinterpret_cast<XInputGetState_t>(previous);
+                hookedAny = true;
+            }
+        }
+        if (void** iatEx = FindIATEntry("xinput1_3.dll", nullptr, 100); iatEx)
+        {
+            if (WriteIATEntry(iatEx, reinterpret_cast<void*>(&Detour_XInputGetState), previous))
+            {
+                g_IATSlotGetStateEx = iatEx;
+                g_IATOriginalGetStateEx = previous;
+                if (!g_XInputGetState_Original)
+                    g_XInputGetState_Original = reinterpret_cast<XInputGetState_t>(previous);
+                hookedAny = true;
+            }
+        }
+        if (hookedAny)
+        {
+            g_ControllerIATHooked = true;
+            return true;
+        }
+
+        // 2) The game resolves XInputGetState with GetProcAddress: inline-hook
+        //    xinput1_3.dll's export. The plugin's own reader (xinput1_4.dll) is
+        //    a different module and is never touched.
+        return InstallInlineXInputHook();
+    }
+
+    void DeactivateControllerHook()
+    {
+        if (g_ControllerIATHooked)
+        {
+            // Write back exactly what was in each slot when it was patched.
+            void* ignored = nullptr;
+            if (g_IATSlotGetState && g_IATOriginalGetState)
+                WriteIATEntry(g_IATSlotGetState, g_IATOriginalGetState, ignored);
+            if (g_IATSlotGetStateEx && g_IATOriginalGetStateEx)
+                WriteIATEntry(g_IATSlotGetStateEx, g_IATOriginalGetStateEx, ignored);
+            g_IATSlotGetState = nullptr;
+            g_IATOriginalGetState = nullptr;
+            g_IATSlotGetStateEx = nullptr;
+            g_IATOriginalGetStateEx = nullptr;
+            g_ControllerIATHooked = false;
+        }
+        RemoveInlineXInputHook();
     }
 
     // ── Parkour Mode, aggregate seam: 0x142739DBC (HybridInput's own site) ──
@@ -1199,21 +1322,22 @@ namespace
     // simultaneous-input merge, and its production use proves the site runs
     // every frame with current-frame device states.
     //
-    // Here the plugin makes its FINAL pass over the aggregated state:
+    // Here the plugin makes its FINAL pass over the aggregated keyboard/mouse
+    // state:
     //   * suppressed actions are zeroed in keyStates_thisFrame AND the float
     //     mirrors (this site is past the conversions, so the mirrors must be
     //     cleared explicitly here);
     //   * every device-table state is sanitized (the sources of any later
-    //     re-read);
-    //   * the pad snapshot at InputContainerBig+0x864 is observed (learning)
-    //     and cleared (raw blocking) once more, via the container's own
-    //     pendingFrame_mb - independent of the pad poll seam running.
+    //     re-read).
+    // Controller controls are not this seam's business: they are cleared from
+    // the XInput state the game is about to receive, so no pad ActionKeyCode
+    // is ever written for them.
     //
     // Ownership: if HybridInput.dll is loaded first, this site is E9-patched
-    // and the seam refuses - the UI says so. In that case blocked actions can
-    // in principle be re-merged from secondary devices, but the device-table
-    // sanitization at the pad seams above already removes those sources, and
-    // the raw poll seam hides the button from every device in the first place.
+    // and the seam refuses - the UI says so. In that case a blocked
+    // keyboard/mouse action can in principle be re-merged from a secondary
+    // device; the raw KBM seam (the keymap fill) hides the button from the
+    // fill's buffers in the first place, which leaves nothing to merge.
     void SanitizeMergedInputStates(AllRegisters* params)
     {
         ++g_InputMergeHits;
@@ -1257,52 +1381,6 @@ namespace
     AutoAssembleWrapper<ParkourModeInputMergeHook>& GetParkourModeInputMergeHook()
     {
         static AutoAssembleWrapper<ParkourModeInputMergeHook> s_hook;
-        return s_hook;
-    }
-
-    // ── Parkour Mode: detach the game's pad device (fallback, off by default) ──
-    // 0x1427289A0 is the frame poll of the game's DirectInput/HID pad state
-    // (vtable slot 0x48 of the device at InputContainerBig+0x838, 0x110 bytes
-    // into the caller's stack buffer). Both pad paths gate on its result:
-    // returning 0 makes the device-9 keymap stage (0x14273BE6D) and the
-    // hard-coded per-device-type mapper (0x142739E40, reached via jmp @
-    // 0x14273BE68 for every device id != 9) bail out before they write a
-    // single ActionKeyCode. Only the pad is affected: this function is the pad
-    // stage's own device read (device object at InputContainerBig+0x838,
-    // vtable slot 0x48, 0x110 bytes into the +0x864 buffer), while keyboard and
-    // mouse come from the earlier KBM stage 0x14273B2B0, and the plugin's own
-    // XInput polling (UpdatePadStates) is independent of the game's device, so
-    // pad-bound override triggers keep working.
-    //
-    // Kept only as a fallback for builds whose pad input does not go through
-    // any of the pad seams above (the UI reports every seam as owned by another
-    // plugin, or all of them show zero hits while pad buttons are pressed and
-    // blocked buttons still reach the game). It disables the ENTIRE
-    // controller, sticks included, so the character cannot move while Parkour
-    // Mode is on — which is why it is off by default instead of being the
-    // primary mechanism.
-    // The whole function is replaced (no return path needed), and the original
-    // prologue is restored on deactivate.
-    struct ParkourModePadBlockHook : AutoAssemblerCodeHolder_Base
-    {
-        ParkourModePadBlockHook()
-        {
-            DEFINE_ADDR_NAMED(padPollAt, "ParkourModePadBlock", 0x1427289A0);
-            ALLOC_NAMED(padBlockCave, "ParkourModePadBlockCave", 0x20, 0x1427289A0);
-            padPollAt = {
-                db(0xE9), RIP(padBlockCave),   // jmp cave
-                nop(14 - 5),                   // overwrite the rest of the replaced prologue
-            };
-            padBlockCave = {
-                "31 C0",                       // xor eax,eax  (looks like "no device")
-                "C3",                          // ret
-            };
-        }
-    };
-
-    AutoAssembleWrapper<ParkourModePadBlockHook>& GetParkourModePadBlockHook()
-    {
-        static AutoAssembleWrapper<ParkourModePadBlockHook> s_hook;
         return s_hook;
     }
 
@@ -1597,22 +1675,6 @@ namespace
             && site[4] == 0x49 && site[5] == 0x83 && site[6] == 0xC1 && site[7] == 0x08);
     }
 
-    bool IsPadPollSitePatched()
-    {
-        // Vanilla: movzx edi,dil ; test eax,eax  (0x142728A1F, 6 bytes).
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x142728A1F);
-        return !(site[0] == 0x40 && site[1] == 0x0F && site[2] == 0xB6
-            && site[3] == 0xFF && site[4] == 0x85 && site[5] == 0xC0);
-    }
-
-    bool IsParkourPadPollSitePatched()
-    {
-        // Pad poll header: push rbx; push rsi; push rdi; sub rsp,0x90.
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x1427289A0);
-        return !(site[0] == 0x40 && site[1] == 0x53 && site[2] == 0x56 && site[3] == 0x57
-            && site[4] == 0x48 && site[5] == 0x81 && site[6] == 0xEC && site[7] == 0x90);
-    }
-
     bool IsInputMergeSitePatched()
     {
         // Vanilla: mov rax,[rbx+0x58] ; mov [rbx+0x50],rax
@@ -1683,64 +1745,6 @@ static std::string GetIniPath()
 // Shown next to every entry of the blocked list, so the player can see that
 // "Mouse Left" really is the game's button 0 and "Left Ctrl" really is
 // scancode 0x1D rather than having to take the suppression on trust.
-// ── Parkour Mode: the game's own pad state, and what it teaches us ───────
-// The one pad seam records the 0x110-byte DirectInput state it just saw. That
-// single observation powers two things:
-//   * the UI's "what the game currently sees" readout, so a player can confirm
-//     that a blocked button really is invisible to the game;
-//   * the binding capture below - the exact control that went from released
-//     to pressed between this snapshot and the previous one.
-// Only the FIRST observation in a frame records, because that is the one that
-// still sees the game's untouched state (later readings have had the blocked
-// bytes cleared out of them). The observation is only ever read, never used to
-// block: blocking is done directly on the live buffer by the seam itself.
-void FreeJumpPlugin::NoteGamePadState(const uint8_t* padState)
-{
-    if (!padState)
-        return;
-    if (!m_GamePadObservedThisFrame)
-    {
-        m_GamePadSnapshotPrev = m_GamePadSnapshot;
-        std::memcpy(m_GamePadSnapshot.data(), padState, m_GamePadSnapshot.size());
-        m_GamePadObservedThisFrame = true;
-    }
-}
-
-int FreeJumpPlugin::GetRisingGamePadControl() const
-{
-    if (!m_GamePadObservedThisFrame)
-        return 0;
-
-    // Digital buttons first: a byte that had bit 7 clear last frame and has it
-    // set this frame. The lowest such slot wins, so pressing several buttons at once
-    // resolves deterministically. This is the capture primitive: it needs no
-    // XInput, no emulator knowledge and no table, because it reads the very
-    // buffer the blocker clears.
-    for (int slot = 0; slot <= kMaxPadSlot; ++slot)
-    {
-        const size_t offset = static_cast<size_t>(kPadButtonsOffset) + static_cast<size_t>(slot);
-        if (offset >= kPadStateSize)
-            break;
-        const bool pressedNow = (m_GamePadSnapshot[offset] & 0x80) != 0;
-        const bool pressedBefore = (m_GamePadSnapshotPrev[offset] & 0x80) != 0;
-        if (pressedNow && !pressedBefore)
-            return kPadSlotBase + slot;
-    }
-
-    // Then the d-pad: a direction that was centered last frame and is pressed
-    // this frame. Holding a direction does not re-trigger.
-    const uint32_t hatNow = *reinterpret_cast<const uint32_t*>(m_GamePadSnapshot.data() + kPadHatOffset);
-    const uint32_t hatBefore = *reinterpret_cast<const uint32_t*>(m_GamePadSnapshotPrev.data() + kPadHatOffset);
-    if (hatNow != static_cast<uint32_t>(kPadHatCentered)
-        && hatBefore == static_cast<uint32_t>(kPadHatCentered)
-        && hatNow <= static_cast<uint32_t>(kMaxPadHatDegrees) * 100u)
-    {
-        return kPadHatBase + static_cast<int>(hatNow / 100u);
-    }
-
-    return 0;
-}
-
 bool FreeJumpPlugin::RememberBlockedKey(int blockedKeyCode)
 {
     if (!IsValidBlockedKey(blockedKeyCode))
@@ -1776,40 +1780,11 @@ std::string FreeJumpPlugin::DescribeBlockedInputTarget(int bindableKeyCode)
         where << "mouse button " << slot.slot << " (" << buttonName << ")";
         break;
     }
-    case BlockedInputKind::PadButton:
-    {
-        // The entry IS this byte: it was measured in the game's own pad state
-        // when the button was assigned, and it is the byte the poll seam clears.
-        char detail[112] = {};
-        const char* slotName = PadSlotName(slot.slot);
-        if (*slotName)
-            snprintf(detail, sizeof(detail),
-                "clears the game's pad state byte 0x%02X - game button %d (usually %s)",
-                kPadButtonsOffset + slot.slot, slot.slot, slotName);
-        else
-            snprintf(detail, sizeof(detail),
-                "clears the game's pad state byte 0x%02X - game button %d",
-                kPadButtonsOffset + slot.slot, slot.slot);
-        where << detail;
-        break;
-    }
-    case BlockedInputKind::PadHat:
-    {
-        const char* direction = PadHatDirectionName(slot.hatDegrees);
-        where << "controller d-pad: the hat at state +0x20 is centred while it reports "
-              << (*direction ? direction : "this direction")
-              << " (the other three directions stay live)";
-        break;
-    }
     case BlockedInputKind::Unsupported:
     {
-        // Nothing in the game's buffers can be named for this entry. With the
-        // game-side capture there are no legacy translated entries left; what
-        // remains genuinely unclearable is an analog control (stick directions,
-        // triggers), which is a range of an axis rather than a byte.
         if (IsPadCode(bindableKeyCode))
-            return "NOT blocked - a stick direction or trigger is read as an analog "
-                   "axis by the game, which this build does not map";
+            return "controller: cleared from the XInput state the game receives "
+                   "(see the controller hook line below)";
         return "NOT blocked - no matching location in the game's input buffers";
     }
     }
@@ -1868,27 +1843,15 @@ void FreeJumpPlugin::LoadSettings()
             if (TryParseBool(value, enabled))
                 m_ParkourModeOn = enabled;
         }
-        else if (TryGetValue(trimmedLine, "WatchGamePadInput=", value))
-        {
-            bool enabled = false;
-            if (TryParseBool(value, enabled))
-                m_WatchGamePadInput = enabled;
-        }
-        else if (TryGetValue(trimmedLine, "DetachPadFallback=", value))
-        {
-            bool enabled = false;
-            if (TryParseBool(value, enabled))
-                m_BlockPadWhileParkour = enabled;
-        }
-        // Legacy `AutoFallbackOnLeak=` is not read any more: it armed the pad-detach
-        // fallback from the action-level leak detector, which no longer exists
-        // (buttons are now blocked at their source). The manual "detach the
-        // controller" fallback below is still available.
+        // Legacy `AutoFallbackOnLeak=`, `WatchGamePadInput=` and
+        // `DetachPadFallback=` are not read any more: the first armed a
+        // long-gone action-level leak detector, and the other two belonged to
+        // the pad-detach fallback that the controller XInput hook replaced.
+        // Unknown keys are skipped, so old files load cleanly and those options
+        // are simply gone.
         // Legacy `BlockPadWhileParkour=` is deliberately NOT read: in 0.11 it
-        // defaulted to 1 and was the primary (whole-pad) mechanism. Honouring a
-        // stored 1 would silently re-enable the detach as the active fix and
-        // freeze the sticks, hiding the per-site suppression. Unknown keys are
-        // skipped, so old files load cleanly and the option is simply off.
+        // defaulted to 1 and was the primary (whole-pad) mechanism. Unknown
+        // keys are skipped, so old files load cleanly and the option is gone.
         // Legacy `ParkourDisabledActions=` and `ParkourPadBindings=` are
         // deliberately NOT read: they described the old per-action checkbox
         // set, whose meaning depended on the in-game bindings of the moment it
@@ -1915,32 +1878,22 @@ void FreeJumpPlugin::LoadSettings()
         else if (TryGetValue(trimmedLine, "ParkourBlockedKeys=", value))
         {
             // Parkour Mode's blocked controls: keyboard/mouse Win32 virtual
-            // keys, and the GAME's own controller identifiers
-            // (kPadSlotBase+slot / kPadHatBase+degrees), pipe-separated.
-            // An EMPTY value is a meaningful state - the player deliberately
-            // blocked nothing - so it must replace, not fall back to, the
-            // built-in defaults.
+            // keys and PadCode_* controller codes, pipe-separated. An EMPTY
+            // value is a meaningful state - the player deliberately blocked
+            // nothing - so it must replace, not fall back to, the built-in
+            // defaults.
+            // Old files that stored game-slot values (kPadSlotBase+slot /
+            // kPadHatBase+degrees, from the abandoned game-side pad design)
+            // simply fail IsValidBlockedKey and are skipped.
             loadedBlockedKeys.clear();
-            int droppedLegacy = 0;
             for (const std::string_view keyToken : Split(value, '|'))
             {
                 int code = 0;
                 if (!TryParseInteger(keyToken, 10, code))
                     continue;
                 if (IsValidBlockedKey(code))
-                {
                     loadedBlockedKeys.push_back(code);
-                    continue;
-                }
-                // A stored XInput button NAME (kPadKeyBase+ParkourPadCode) is
-                // what earlier builds saved for the controller. It names a
-                // PHYSICAL button, not a location in the game's pad state, so
-                // this build cannot honour it; it is counted and reported so
-                // the player knows to re-assign those buttons once.
-                if (IsPadCode(code))
-                    ++droppedLegacy;
             }
-            m_DroppedLegacyPadBindings = droppedLegacy;
             hasBlockedKeys = true;
         }
         else if (TryGetValue(trimmedLine, "NumOverrides=", value))
@@ -2000,8 +1953,6 @@ void FreeJumpPlugin::SaveSettings()
     file << "ParkourModeKey=" << std::hex << m_ParkourModeKey << std::dec << "\n";
     file << "ParkourModeKeyPad=" << std::hex << m_ParkourModeKeyPad << std::dec << "\n";
     file << "ParkourModeOn=" << (m_ParkourModeOn ? 1 : 0) << "\n";
-    file << "DetachPadFallback=" << (m_BlockPadWhileParkour ? 1 : 0) << "\n";
-    file << "WatchGamePadInput=" << (m_WatchGamePadInput ? 1 : 0) << "\n";
     // Parkour Mode's blocked buttons, as decimal bindable codes. Keyboard/mouse
     // keys and controller codes are both written, so a controller assignment
     // survives a restart exactly as it was assigned.
@@ -2021,11 +1972,9 @@ void FreeJumpPlugin::SaveSettings()
         }
     }
     file << "\n";
-    // No separate learned-mapping line: a controller entry already IS the
-    // game's own identifier (kPadSlotBase+slot / kPadHatBase+degrees), so the
-    // list above persists the whole mapping. Nothing needs translating on
-    // reload, and nothing can drift between what was captured and what is
-    // cleared.
+    // No separate mapping line: a controller entry is a PadCode_*, the same
+    // physical-button code every feature uses, so the list above persists the
+    // whole mapping. Nothing needs translating on reload.
     file << "WallToHangEnabled=" << (m_WallToHangEnabled ? 1 : 0) << "\n";
     file << "DiveHotkey=" << std::hex << m_DiveHotkey << std::dec << "\n";
     file << "DiveHotkeyPad=" << std::hex << m_DiveHotkeyPad << std::dec << "\n";
@@ -2123,8 +2072,8 @@ void FreeJumpPlugin::OnBeforeActivate()
 
 void FreeJumpPlugin::OnBeforeDeactivate()
 {
-    if (m_KbmFillSuppressActive || m_PadPollSanitizeActive
-        || m_InputMergeSeamActive || m_PadBlockHookActive)
+    if (m_KbmFillSuppressActive || m_InputMergeSeamActive
+        || IsControllerHookActive())
         ApplyParkourMode(false);
     if (m_WallToHangHooksActive)
         ApplyWallToHang(false);
@@ -2154,10 +2103,10 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
         // Fresh activation: the seam counters then describe this ON period, so
         // "0 hits" means "never ran here" rather than "ran before this turn".
         const bool wasSomethingActive = m_KbmFillSuppressActive
-            || m_PadPollSanitizeActive || m_InputMergeSeamActive;
+            || m_InputMergeSeamActive || IsControllerHookActive();
         if (!wasSomethingActive)
         {
-            g_PadPollHits = 0;
+            g_ControllerHookHits = 0;
             g_KbmFillHits = 0;
             g_InputMergeHits = 0;
             g_InputMergeContainerHits = 0;
@@ -2178,20 +2127,12 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
                 m_KbmFillSuppressActive = true;
             }
         }
-        // ONE controller seam. It carries both of the game's pad paths, so
-        // there is no per-device decision to make and no second hook to keep in
-        // sync with it - which is what let the controller blocking drift out of
-        // step with the binding in the first place.
-        if (!m_PadPollSanitizeActive)
-        {
-            if (IsPadPollSitePatched())
-                anyRefused = true;
-            else
-            {
-                GetParkourModePadPollHook().Activate();
-                m_PadPollSanitizeActive = true;
-            }
-        }
+        // ONE controller hook: the game's XInputGetState (IAT, with an inline
+        // fallback on the DLL export). The detour clears the blocked buttons
+        // from the state the game is about to receive; the plugin's own pad
+        // reader (xinput1_4.dll) is a different module and is never touched.
+        if (!IsControllerHookActive())
+            ActivateControllerHook();
         // The aggregate seam - HybridInput's own detour site. When HybridInput
         // is loaded first, the site is E9-patched and we refuse it; the UI
         // reports that. This one is keyboard/mouse only (see its comment).
@@ -2206,22 +2147,6 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
             }
         }
         m_ParkourHookRefused = anyRefused;
-
-        // Optional fallback, off by default: detach the pad device. It hides
-        // every pad button without a per-button mapping, but it also disables
-        // the sticks, which is why it is not the primary mechanism.
-        if (m_BlockPadWhileParkour && !m_PadBlockHookActive)
-        {
-            if (IsParkourPadPollSitePatched())
-            {
-                m_ParkourHookRefused = true;
-            }
-            else
-            {
-                GetParkourModePadBlockHook().Activate();
-                m_PadBlockHookActive = true;
-            }
-        }
     }
     else
     {
@@ -2230,23 +2155,14 @@ void FreeJumpPlugin::ApplyParkourMode(bool enable)
             GetParkourModeKbmFillHook().Deactivate();
             m_KbmFillSuppressActive = false;
         }
-        if (m_PadPollSanitizeActive)
-        {
-            GetParkourModePadPollHook().Deactivate();
-            m_PadPollSanitizeActive = false;
-        }
         if (m_InputMergeSeamActive)
         {
             GetParkourModeInputMergeHook().Deactivate();
             m_InputMergeSeamActive = false;
         }
+        DeactivateControllerHook();
         if (g_ParkourModeInstance == this)
             g_ParkourModeInstance = nullptr;
-        if (m_PadBlockHookActive)
-        {
-            GetParkourModePadBlockHook().Deactivate();
-            m_PadBlockHookActive = false;
-        }
         m_ParkourHookRefused = false;
         ApplyOverrideFallback(false);
     }
@@ -2392,6 +2308,7 @@ void FreeJumpPlugin::UpdatePadStates()
     constexpr int kLeftThumbDeadzone = 7849;   // XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
     constexpr int kTriggerThreshold = 30;      // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
     constexpr int kPadSlotCount = 4;
+    tls_PluginPadPollInProgress = true;
     for (int slot = 0; slot < kPadSlotCount; ++slot)
     {
         XInputPadState state{};
@@ -2439,6 +2356,7 @@ void FreeJumpPlugin::UpdatePadStates()
             m_ActivePadSlot = slot;
         }
     }
+    tls_PluginPadPollInProgress = false;
 }
 
 void FreeJumpPlugin::UpdateKeyState(int bindableKeyCode)
@@ -2499,20 +2417,7 @@ void FreeJumpPlugin::OnUpdate()
 {
     m_KeyStateUpdatedThisFrame.fill(false);
     m_JustCapturedKey = 0;
-    // The pad seam runs during the game's own update, i.e. AFTER our previous
-    // frame's OnUpdate. Everything observed since the last OnUpdate (the seam
-    // or the container read below) is "this frame" for the binding capture
-    // further down, which is why the observed flag is rolled at the END of
-    // OnUpdate, AFTER the capture consumed it. (Resetting it here - before the
-    // capture - would make the capture dead code: no observation can arrive
-    // between the reset and the capture calls.)
     UpdatePadStates();
-    // Container-based observation fallback: the game itself keeps the pad
-    // snapshot at InputContainerBig+0x864, reachable through the
-    // HasInputContainers chain the HybridInput RE proved - with NO pad seam
-    // installed at all. NoteGamePadState's first-wins gate means a fresher
-    // seam observation always wins over this read.
-    NoteGamePadStateFromContainer(this);
 
     // Every binding exists in two profiles (keyboard/mouse + controller).
     // Both profiles' states are refreshed every frame so that switching
@@ -2595,33 +2500,12 @@ void FreeJumpPlugin::OnUpdate()
         return false;
     };
 
-    // The Parkour Mode block list needs a keyboard/mouse capture WITHOUT the
-    // XInput pad half: a blocked controller entry is not a physical button name
-    // but the game's own identifier, which is measured separately (below).
-    // Accepting an XInput code here would store an entry that names no byte of
-    // the game's input buffers, i.e. one that silently blocks nothing.
-    const auto captureKeyboardOrMouseKey = [this](int& destinationKey) -> bool {
-        for (int vkCode = kKeyboardKeyMin; vkCode <= kKeyboardKeyMax; ++vkCode)
-        {
-            if ((vkCode == VK_LBUTTON || vkCode == VK_RBUTTON)
-                && !m_MouseButtonsSettledSinceRebindStart)
-            {
-                continue;
-            }
-            if (WasKeyPressed(vkCode))
-            {
-                destinationKey = vkCode;
-                return true;
-            }
-        }
-        return false;
-    };
-
-    // Pad presses are stored in the controller slot and keyboard/mouse presses
-    // in the keyboard/mouse slot, regardless of which profile is currently
-    // active. That keeps both profiles populated while rebinding, which is what
-    // makes the profile switch usable, and it is why the switch no longer
-    // appears to behave inverted.
+    // One capture path for everything: keyboard, mouse and XInput. Pad presses
+    // are stored in the controller slot and keyboard/mouse presses in the
+    // keyboard/mouse slot, regardless of which profile is currently active.
+    // That keeps both profiles populated while rebinding, which is what makes
+    // the profile switch usable, and it is why the switch no longer appears to
+    // behave inverted.
     const auto routeFeatureKey = [this, &captureKey](int& kbmSlot, int& padSlot) -> bool {
         int captured = 0;
         if (!captureKey(captured))
@@ -2645,33 +2529,15 @@ void FreeJumpPlugin::OnUpdate()
     else if (m_WaitingForBlockedKey)
     {
         // Parkour Mode: the next control the player presses becomes blocked.
-        // Keyboard/mouse is captured from the plugin's own polling. A CONTROLLER
-        // entry is different by design: it has to be the game's own identifier,
-        // so it is measured from the game's pad state (GetRisingGamePadControl)
-        // rather than from a physical button name - captureKeyboardOrMouseKey
-        // deliberately does not accept XInput pad codes, because a button name
-        // names no byte of the game's input buffers and would block nothing.
-        // One buffer, read and written in the same place, no translation: which
-        // is why this behaves identically for a raw controller and for an
-        // emulator the plugin cannot see at all.
+        // One capture path for everything: keyboard, mouse and XInput (the
+        // controller entry is a PadCode_*, which the controller hook clears
+        // from the state the game receives).
         int captured = 0;
-        if (captureKeyboardOrMouseKey(captured))
+        if (captureKey(captured) && RememberBlockedKey(captured))
         {
-            if (RememberBlockedKey(captured))
-            {
-                m_JustCapturedKey = captured;
-                m_WaitingForBlockedKey = false;
-                SaveSettings();
-            }
-        }
-        else if (const int padControl = GetRisingGamePadControl())
-        {
-            if (RememberBlockedKey(padControl))
-            {
-                m_JustCapturedKey = padControl;
-                m_WaitingForBlockedKey = false;
-                SaveSettings();
-            }
+            m_JustCapturedKey = captured;
+            m_WaitingForBlockedKey = false;
+            SaveSettings();
         }
     }
     else if (m_WaitingForParkourKey)
@@ -2753,35 +2619,26 @@ void FreeJumpPlugin::OnUpdate()
     // assigned at least one; adding the first button (or toggling the mode on)
     // installs the sites, and the hooks come off the moment either stops being
     // true, so the game's input is untouched whenever the feature is unused.
-    // Parkour Mode's seams are installed while it blocks anything, and also
-    // while the player is assigning a controller button: measuring which game
-    // slot that button occupies requires watching the game's pad state, which
-    // is exactly what these hooks observe.
-    const bool wantParkourHook = m_ParkourModeOn && !m_UserBlockedKeys.empty();
-    const bool wantPadWatch = m_WaitingForBlockedKey || m_WatchGamePadInput;
-    const bool wantParkourSeams = wantParkourHook || wantPadWatch;
+    const bool wantParkourSeams = m_ParkourModeOn && !m_UserBlockedKeys.empty();
     const bool anyParkourSuppressActive =
-        m_KbmFillSuppressActive || m_PadPollSanitizeActive
-        || m_InputMergeSeamActive;
+        m_KbmFillSuppressActive || m_InputMergeSeamActive
+        || IsControllerHookActive();
     // Re-run while anything is still missing, so a site that was refused once
     // (plugin loaded later, or a transient mismatch) is retried instead of
     // staying refused for the whole session.
-    if (wantParkourSeams
-        && (!anyParkourSuppressActive
-            || m_ParkourHookRefused
-            || (m_BlockPadWhileParkour && !m_PadBlockHookActive)))
+    if (wantParkourSeams && !anyParkourSuppressActive)
     {
         ApplyParkourMode(true);
     }
-    else if (!wantParkourSeams && (anyParkourSuppressActive || m_PadBlockHookActive))
+    else if (!wantParkourSeams && anyParkourSuppressActive)
     {
         ApplyParkourMode(false);
     }
 
     // The action-level suppression mask: which ActionKeyCode entries the
-    // blocked buttons drive, derived from the game's own keymaps (captured at
-    // the KBM fill and pad snapshot seams). Recomputed every frame the seams
-    // are alive; the aggregate/pad seams consume it after the game's fills.
+    // blocked keyboard/mouse buttons drive, derived from the game's own KBM
+    // keymap (captured at the KBM fill seam). Recomputed every frame the seam
+    // is alive; the aggregate seam consumes it after the game's fills.
     if (wantParkourSeams || anyParkourSuppressActive)
         ComputeSuppressedActions(this);
 
@@ -2836,12 +2693,6 @@ void FreeJumpPlugin::OnUpdate()
         GetParkourOverrideFallbackHook().Deactivate();
         ApplyOverrideFallback(false);
     }
-
-    // Roll the observed-pad-state window forward AFTER the learning consumed
-    // it (see the comment at the top of this function). The UI reads the
-    // LastFrame half, so its "game sees" readout stays correct.
-    m_GamePadObservedLastFrame = m_GamePadObservedThisFrame;
-    m_GamePadObservedThisFrame = false;
 }
 
 void FreeJumpPlugin::OnImGuiRender()
@@ -2945,73 +2796,18 @@ void FreeJumpPlugin::OnImGuiRender()
             ImGui::TextColored(inactiveColor, "- nothing assigned yet");
         }
         // ── Diagnostics ────────────────────────────────────────
-        // Which seams actually run on THIS install, and what the game currently
-        // sees from the controller. This is the answer to "why isn't my button
-        // blocked": a seam whose counter stays at 0 while that device is being
-        // used is simply not on this build's input path. There is one controller
-        // seam, so "pad poll" is the whole controller story - and its hit
-        // counter is what tells you whether blocking can work at all.
-        if (m_KbmFillSuppressActive || m_PadPollSanitizeActive
-            || m_InputMergeSeamActive)
+        // ONE line for the controller: whether the hook is live and how often
+        // it ran while Parkour Mode has been ON. A counter that stays at 0
+        // while a pad is connected and buttons are pressed means the game does
+        // not read its pad through the hooked XInput path.
+        if (m_ParkourModeOn)
         {
-            auto hitText = [](const char* label, bool active, uint32_t hits)
-            {
-                return active
-                    ? std::string(label) + ": on (" + std::to_string(hits) + " hits)"
-                    : std::string(label) + ": site owned by another plugin";
-            };
-            ImGui::TextDisabled("seams:");
-            ImGui::TextDisabled("   %s", hitText("keyboard/mouse keymap fill", m_KbmFillSuppressActive, g_KbmFillHits).c_str());
-            ImGui::TextDisabled("   %s", hitText("pad poll - observes and clears the game's pad state (both pad paths)", m_PadPollSanitizeActive, g_PadPollHits).c_str());
-            if (m_PadPollSanitizeActive && g_PadPollHits == 0 && m_PadDllLoaded)
-            {
-                ImGui::TextColored(inactiveColor,
-                    "      the pad poll is not running - the controller cannot be blocked or bound.");
-            }
-            if (m_GamePadObservedThisFrame)
-            {
-                std::string pressed;
-                for (int slot = 0; slot <= kMaxPadSlot; ++slot)
-                {
-                    if (!(m_GamePadSnapshot[static_cast<size_t>(kPadButtonsOffset) + slot] & 0x80))
-                        continue;
-                    if (!pressed.empty())
-                        pressed += ",";
-                    pressed += std::to_string(slot);
-                }
-                const uint32_t hat = *reinterpret_cast<const uint32_t*>(
-                    m_GamePadSnapshot.data() + kPadHatOffset);
-                const int hatDegrees = hat == static_cast<uint32_t>(kPadHatCentered)
-                    ? -1
-                    : static_cast<int>(hat / 100u);
-                const char* hatName = PadHatDirectionName(hatDegrees);
-                char hatLabel[64] = {};
-                if (hatDegrees < 0)
-                    snprintf(hatLabel, sizeof(hatLabel), "centered");
-                else if (*hatName)
-                    snprintf(hatLabel, sizeof(hatLabel), "%s", hatName);
-                else
-                    snprintf(hatLabel, sizeof(hatLabel), "%d degrees", hatDegrees);
-                if (pressed.empty())
-                    ImGui::TextDisabled("   game sees: no buttons, d-pad %s", hatLabel);
-                else
-                    ImGui::TextDisabled("   game sees: buttons [%s], d-pad %s",
-                                        pressed.c_str(), hatLabel);
-            }
-            else
-            {
-                ImGui::TextDisabled("   game sees: no pad state observed this frame");
-            }
-            if (m_DroppedLegacyPadBindings > 0)
-            {
-                ImGui::TextColored(inactiveColor,
-                    "   %d blocked controller button(s) from an older settings file were dropped:",
-                    m_DroppedLegacyPadBindings);
-                ImGui::TextDisabled(
-                    "      they stored a PHYSICAL button name, and only the game's own");
-                ImGui::TextDisabled(
-                    "      identifiers can be blocked. Please re-assign them below.");
-            }
+            ImGui::TextDisabled("   controller hook: %s",
+                IsControllerHookActive()
+                    ? ("on (" + std::to_string(g_ControllerHookHits) + " hits)").c_str()
+                    : "not installed");
+            if (m_KbmFillSuppressActive)
+                ImGui::TextDisabled("   keyboard/mouse keymap fill: on (%s hits)", std::to_string(g_KbmFillHits).c_str());
         }
         ImGui::Text("  Toggle key: %s", KeyCodeLabel(EffectiveParkourModeKey()).c_str());
         if (m_WaitingForParkourKey) { ImGui::SameLine(); ImGui::TextColored(rebindColor, "Input key or pad button to bind..."); }
@@ -3083,42 +2879,11 @@ void FreeJumpPlugin::OnImGuiRender()
             }
             if (listChanged)
                 SaveSettings();
-            // Transparency about what cannot be blocked: stick directions and
-            // triggers arrive as analog axes (a range of an axis, not a byte
-            // that is either pressed or not), so the UI says so instead of
-            // silently ignoring them. Everything digital is covered.
             ImGui::TextDisabled(
-                "Stick directions and the triggers cannot be blocked (the game reads them as "
-                "analog axes); every keyboard key, mouse button, controller button and each "
-                "d-pad direction on its own can be.");
-            // The core guarantee, stated in the UI because it is what makes the
-            // controller entries dependable: they are the game's own controls,
-            // read from the game's own state, at the moment of assignment.
-            ImGui::TextDisabled(
-                "A controller entry is the exact control the GAME reported when you assigned it "
-                "(a byte of its pad state, or one d-pad direction), not a button name - so it "
-                "works for any controller, with or without XInput, and stays correct when you "
-                "switch between DS4Windows output modes.");
+                "Every keyboard key, mouse button and controller control listed here "
+                "is blocked for the game while Parkour Mode is on - including the "
+                "triggers and stick directions.");
             ImGui::TreePop();
-        }
-        bool blockPad = m_BlockPadWhileParkour;
-        if (ImGui::Checkbox("Fallback: detach the controller (also stops stick movement)", &blockPad))
-        {
-            m_BlockPadWhileParkour = blockPad;
-            SaveSettings();
-            if (m_ParkourModeOn)
-                ApplyParkourMode(false), ApplyParkourMode(true);
-        }
-        // The diagnostics switch. With this on, the observation seams are
-        // installed even with nothing blocked, so the "game sees" line reports
-        // what the game's own device layer produces for a controller - the one
-        // fact that decides whether blocking can work at all, and the first
-        // thing to check when a blocked button is still reaching the game.
-        bool watchPad = m_WatchGamePadInput;
-        if (ImGui::Checkbox("Watch the game's pad input (diagnostics)", &watchPad))
-        {
-            m_WatchGamePadInput = watchPad;
-            SaveSettings();
         }
     }
 

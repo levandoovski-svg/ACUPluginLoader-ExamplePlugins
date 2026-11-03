@@ -26,13 +26,11 @@ constexpr int kKeyboardKeyMax = 0xFE;
 
 // One entry per XInput button pair / digital stick direction / digital trigger.
 // Codes are persisted as decimal integers (like override keyCodes always were).
-// These are PHYSICAL button names read through the plugin's own independent
-// XInput polling, and they are what the parkour feature bindings (Free Jump,
-// overrides, dive hotkey, Parkour Mode's own toggle) are assigned to. They are
-// deliberately NOT what the Parkour Mode BLOCK LIST stores: a blocked control
-// is recorded as the exact control the GAME reports (see kPadSlotBase /
-// kPadHatBase below), so the list never has to translate between the plugin's
-// view of the pad and the game's.
+// These are the SAME codes the whole plugin uses: feature bindings (Free Jump,
+// overrides, dive hotkey, Parkour Mode's own toggle) AND the Parkour Mode BLOCK
+// LIST (see the controller hook in FreeJumpPlugin.cpp: the game reads pads
+// through XInputGetState, so blocking one of these clears that button in the
+// state the game is about to receive). One capture path for every device.
 enum ParkourPadCode
 {
     PadCode_DPAD_UP = 0,
@@ -63,27 +61,6 @@ enum ParkourPadCode
 };
 constexpr int kPadKeyBase = 0x1000;
 constexpr int kMaxBindableKey = kPadKeyBase + PadCode_COUNT;
-
-// A blocked entry may also name a raw GAME PAD CONTROL directly, instead of a
-// physical button name. This is the ONLY form a blocked controller entry
-// takes, and it is what makes the blocked list work with any controller and
-// any emulation: the entry is the exact control the GAME reports in its own
-// pad state, measured at the moment the player assigns it, so no XInput and
-// no assumption about how the pad presents itself is involved.
-//   kPadSlotBase + slot    a digital button: the byte at state + 0x30 + slot,
-//                          pressed when its bit 7 is set (DirectInput
-//                          DIJOYSTATE rgbButtons, as the game reads it).
-//   kPadHatBase + degrees  a d-pad direction: the POV dword at state + 0x20
-//                          (DirectInput hundredths of a degree, 0xFFFFFFFF =
-//                          centered). Only that exact direction is cleared.
-// Codes in these ranges are valid blocked-list entries only - they are
-// deliberately NOT bindable for the other features (Free Jump, overrides,
-// ...), which are bound to physical buttons by the player.
-constexpr int kPadSlotBase = 0x2000;
-constexpr int kMaxPadSlot = 0xDF;   // last digital-button byte: 0x30 + 0xDF = 0x10F
-constexpr int kPadHatBase = 0x2100;   // above the disjoint slot range
-constexpr int kMaxPadHatDegrees = 359;
-constexpr int kMaxBlockedKey = kPadHatBase + kMaxPadHatDegrees;
 
 // The game maps raw keyboard/mouse input to 32 ActionKeyCode entries per frame
 // (ActionKeyCode::ACTION_SET_SIZE == 0x20 in Enum_ActionKeyCode.h).
@@ -131,26 +108,13 @@ public:
     // what the game will stop seeing.
     static std::string DescribeBlockedInputTarget(int bindableKeyCode);
 
-    // ��� Parkour Mode: capture and block the game's own controls �����������������
-    // Binding a controller button and blocking it are the SAME operation, on the
-    // same data. The game's pad poll produces one 0x110-byte DirectInput pad
-    // state per frame in a buffer both of the game's pad paths consume; the
-    // plugin observes that exact buffer and, when the player assigns a button,
-    // records the exact control it finds pressed in it (a digital button byte,
-    // or a d-pad POV value). Blocking then clears that very control in that very
-    // buffer. No button name, no XInput-to-DirectInput translation, no table of
-    // assumed slots: whatever the game reports for the button is what gets
-    // blocked, so it cannot drift with the emulation (DS4Windows output mode,
-    // Steam Input, a raw DualSense) the way a translated mapping does.
-    void NoteGamePadState(const uint8_t* padState);
-    // The game-side control that went from released to pressed in the currently
-    // observed pad state, as a blocked-list code (`kPadSlotBase + slot` for a
-    // digital button, `kPadHatBase + degrees` for a d-pad direction), or 0 when
-    // there is none. This is the whole "binding" step for a controller.
-    int GetRisingGamePadControl() const;
+    // Binding a controller button and blocking it use the SAME codes: a
+    // blocked controller entry is a PadCode_*, captured with the same
+    // captureKey lambda as every other binding, and cleared from the XInput
+    // state the game is about to receive (see the controller hook in
+    // FreeJumpPlugin.cpp).
     bool RememberBlockedKey(int blockedKeyCode);
     bool IsBlockedKeyCapturePending() const { return m_WaitingForBlockedKey; }
-    bool IsWatchingGamePadInput() const { return m_WatchGamePadInput; }
 private:
     void UpdateKeyState(int bindableKeyCode);
     void UpdateAllKeyStates();
@@ -186,46 +150,15 @@ private:
 
     // Parkour Mode: the physical buttons the game must not see while the mode is
     // ON. Keyboard/mouse Win32 virtual keys (0x01..0xFE, mouse buttons
-    // included) plus controller entries, which are ALWAYS the game's own
-    // identifiers - `kPadSlotBase+slot` for a digital button and
-    // `kPadHatBase+degrees` for a d-pad direction, both measured from the pad
-    // state the GAME reports at the moment the button is assigned. That is why
-    // the list needs no XInput and works identically for a raw DualSense, a
-    // DS4Windows pad and a Steam Input pad.
+    // included) plus the same PadCode_* controller codes every other feature
+    // uses (see the controller hook in FreeJumpPlugin.cpp). One capture path
+    // for every device.
     // Persisted as decimal codes separated by `|` in `ParkourBlockedKeys=`.
     // Defaults are the physical keys the game binds attack/aim/crouch to by
     // default (left and right mouse button + Left Ctrl), so a fresh install
     // behaves like the old pre-selected checkbox set without any setup.
     std::vector<int> m_UserBlockedKeys{ VK_LBUTTON, VK_RBUTTON, VK_LCONTROL };
     bool m_WaitingForBlockedKey = false;   // UI rebind target, false = none
-    // Entries from a pre-0.15 INI that this build can no longer honour: the old
-    // list stored XInput button NAMES for the controller, which never described
-    // the game's own pad state and are therefore not a blockable target. They
-    // are dropped at load instead of silently doing nothing; the count is shown
-    // once in the UI so the player knows to re-assign those buttons.
-    int m_DroppedLegacyPadBindings = 0;
-    // Optional diagnostics-only observation of the game's pad input, so the
-    // player can see what the game's own device layer reports for a controller
-    // even when nothing is blocked. Off by default: the observation seams are
-    // hooks, and this codebase only installs them when the feature runs.
-    bool m_WatchGamePadInput = false;
-
-    // The game's own pad state, as observed this frame and last frame by the ONE
-    // pad seam (the poll's destination buffer). Powers the UI's "what the game
-    // sees" readout and the binding capture: a controller button is assigned by
-    // finding the control that went from released to pressed between these two
-    // snapshots.
-    std::array<uint8_t, 0x110> m_GamePadSnapshot{};
-    std::array<uint8_t, 0x110> m_GamePadSnapshotPrev{};
-    // Set by NoteGamePadState (the pad seam, or the container fallback read),
-    // consumed by the binding capture INSIDE OnUpdate, and rolled into
-    // ...LastFrame at the END of OnUpdate - AFTER the capture. Resetting this
-    // flag at the start of OnUpdate makes the capture dead code: no observation
-    // can arrive between the reset and the capture.
-    bool m_GamePadObservedThisFrame = false;
-    // What OnImGuiRender reads: whether anything was observed in the window
-    // between the previous OnUpdate and this one.
-    bool m_GamePadObservedLastFrame = false;
 
     // Wall-to-Hang (ported from ACUFixes-0.9.3 Parkour Helpers / dive helper).
     // While the dive hotkey is held, wall-eject-to-hang candidates are created
@@ -240,13 +173,6 @@ private:
     bool m_WallToHangHooksActive = false;
     bool m_WallToHangSiteTaken   = false;   // a site is E9-patched by another plugin
     bool m_WallToHangGphRefused  = false;   // sort&select owned by another plugin
-    // Fallback detach of the game's DirectInput/HID pad while Parkour Mode is
-    // on. Off by default: it also disables the sticks, and the pad-poll site
-    // below normally frees the assigned buttons one by one. The plugin's own
-    // XInput polling always keeps working, so override triggers bound to pad
-    // buttons still fire either way.
-    bool m_BlockPadWhileParkour = false;
-    bool m_PadBlockHookActive = false;
     // Parkour-mode suppression sites, installed independently of each other. Each
     // one sits at the single point where the game's own copy of a device's state
     // is created, so a blocked control is erased before ANY consumer can read
@@ -257,32 +183,16 @@ private:
     //                a blocked key there means the fill can never turn it into
     //                an ActionKeyCode, an analog mirror (+0x274/+0x29C/+0x2A8)
     //                or a press edge.
-    //   0x142728A1F the game's own pad poll, at the exact instruction after
-    //                GetDeviceState filled the 0x110-byte DirectInput state in
-    //                rsi. THE one controller seam, for both jobs: it observes
-    //                that buffer (binding capture + the UI's "game sees"
-    //                readout) and clears the assigned controls from it. This
-    //                single site covers BOTH of the game's pad paths, because
-    //                both callers converge on this poll and this buffer (the
-    //                device-id-9 keymap fill writes InputContainerBig+0x864,
-    //                the hard-coded per-device mapper reads its own stack copy -
-    //                in both cases the very buffer rsi points at), so there is
-    //                no second, device-specific hook to keep in sync.
-    // The controller-specific extra hooks that used to accompany it (the
-    // device-9 snapshot site 0x14273BEB3, the per-device mapper site
-    // 0x14273A726 and their action-level suppression) are gone: they existed to
-    // translate an assumed button mapping, and with the button cleared at its
-    // source there was nothing left for them to do. The old action-mask sites
-    // (keyStates at 0x14273BC7B / 0x14273BEC5 / 0x14273A726 and the pad
-    // snapshot at 0x14273BEB3) are gone for the same reason.
+    //   controller  the game's XInputGetState import (xinput1_3.dll), detoured
+    //                so the state the game is about to receive has the blocked
+    //                buttons cleared (see FreeJumpPlugin.cpp).
     bool m_KbmFillSuppressActive = false;
-    bool m_PadPollSanitizeActive = false;
     // The input-aggregate seam at 0x142739DBC - the exact site HybridInput.dll
     // detours to merge secondary device states into the container. Runs after
     // every keyStates writer, so suppressed actions are zeroed there one last
     // time (and HybridInput's own merge cannot resurrect them while we own it).
-    // Keyboard/mouse only: controller controls never reach this layer, they are
-    // already gone at the pad poll.
+    // Keyboard/mouse only: controller buttons never reach this layer, they are
+    // already gone from the XInput state the game reads.
     bool m_InputMergeSeamActive = false;
     bool m_ParkourHookRefused = false; // at least one site owned by another plugin
     bool m_OverrideFallbackActive = false;
@@ -314,8 +224,8 @@ private:
     std::vector<ParkourActionOverride> m_Overrides;
 
     // Parkour mode suppression hooks (active only while the mode is enabled):
-    // the KBM keymap stage, both gamepad keyStates writers, and the optional
-    // pad-device detach (see FreeJumpPlugin.cpp).
+    // the KBM keymap stage and the controller's XInputGetState detour (see
+    // FreeJumpPlugin.cpp).
     void ApplyParkourMode(bool enable);
     // Wall-to-Hang site hooks (see FreeJumpPlugin.cpp).
     void ApplyWallToHang(bool enable);
