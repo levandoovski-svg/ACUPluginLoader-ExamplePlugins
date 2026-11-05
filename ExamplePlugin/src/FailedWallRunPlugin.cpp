@@ -184,9 +184,9 @@ static bool IsType52Safe(const AvailableParkourAction* action)
 
 // ── Guard flag + cached settings for the static hooks ─────────────────────────
 static volatile bool g_ShouldCreateFailedWallrun = false;
-// True while the legacy (572-line port) implementation is selected. Read by the
-// static creation hook, which has no `this`. Written from OnUpdate.
-static volatile bool g_LegacyMode = false;
+// Selected implementation (FailedWallRunPlugin::kImpl*). Read by the static
+// creation hook, which has no `this`. Written from OnUpdate.
+static volatile int g_ImplMode = 0;
 static volatile bool g_ExpandRanges = false;
 static volatile bool g_SkipFitTest = false;
 static volatile bool g_SwapTesterVTables = false;
@@ -450,7 +450,8 @@ static void DuringClimbFacadeScan_CreateFailedWallrun_Legacy(AllRegisters* param
 
 static void DuringClimbFacadeScan_CreateFailedWallrun(AllRegisters* params)
 {
-    if (g_LegacyMode)
+    // Both "old" ports share the same creation body: create + append only.
+    if (g_ImplMode != FailedWallRunPlugin::kImplCurrent)
     {
         DuringClimbFacadeScan_CreateFailedWallrun_Legacy(params);
         return;
@@ -653,19 +654,22 @@ FailedWallRunPlugin::FailedWallRunPlugin()
     m_Callbacks.ChooseBeforeFiltering_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions) -> AvailableParkourAction*
     {
         auto* self = static_cast<FailedWallRunPlugin*>(userData);
-        if (g_LegacyMode) return self->ChooseBeforeFiltering_Legacy(actions);
+        if (g_ImplMode == FailedWallRunPlugin::kImplLegacy)    return self->ChooseBeforeFiltering_Legacy(actions);
+        if (g_ImplMode == FailedWallRunPlugin::kImplTimerLift) return self->ChooseBeforeFiltering_Timer(actions);
         return self->ChooseBeforeFiltering(actions);
     };
     m_Callbacks.ChooseAfterSorting_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame) -> AvailableParkourAction*
     {
         auto* self = static_cast<FailedWallRunPlugin*>(userData);
-        if (g_LegacyMode) return self->ChooseAfterSorting_Legacy(actions, selectedByGame);
+        if (g_ImplMode == FailedWallRunPlugin::kImplLegacy)    return self->ChooseAfterSorting_Legacy(actions, selectedByGame);
+        if (g_ImplMode == FailedWallRunPlugin::kImplTimerLift) return self->ChooseAfterSorting_Timer(actions, selectedByGame);
         return self->ChooseAfterSorting(actions, selectedByGame);
     };
     m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool
     {
         auto* self = static_cast<FailedWallRunPlugin*>(userData);
-        if (g_LegacyMode) return self->OverrideCreationDiscard_Legacy(action);
+        if (g_ImplMode == FailedWallRunPlugin::kImplLegacy)    return self->OverrideCreationDiscard_Legacy(action);
+        if (g_ImplMode == FailedWallRunPlugin::kImplTimerLift) return self->OverrideCreationDiscard_Timer(action);
         return self->OverrideCreationDiscard(action);
     };
     m_Callbacks.m_UserData = this;
@@ -677,7 +681,7 @@ FailedWallRunPlugin::FailedWallRunPlugin()
     // after a callback returns an action, so FreeJump's pass is skipped for
     // that cycle — no interference in either direction).
     // This is the CURRENT-implementation value; OnUpdate re-subscribes with
-    // 20000.0f when legacy mode is selected (old build's priority).
+    // 20000.0f when one of the old-style ports is selected (their priority).
     m_Callbacks.m_CallbackPriority = 4.5f;
     m_Callbacks.m_Name = "FailedWallRunPlugin";
 }
@@ -984,6 +988,160 @@ bool FailedWallRunPlugin::OverrideCreationDiscard_Legacy(AvailableParkourAction&
     return false;
 }
 
+// ── Timer-lift implementation: verbatim port of "check this one out" ─────────
+// Identical selection logic to the legacy port. The only differences are the
+// lift mechanism (timed per-frame Z-clamp instead of an instant teleport) and
+// the type-52 rise math (1.5m start, 40% of ledge capped at 3.0m).
+
+AvailableParkourAction* FailedWallRunPlugin::ChooseBeforeFiltering_Timer(SmallArray<AvailableParkourAction*>& actions)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return nullptr;
+
+    int action52Count = 0;
+    int beamTypeCount = 0;
+    int sabotagedCount = 0;
+
+    // First pass: count type 52 and beam-specific types
+    for (int i = 0; i < actions.size; ++i)
+    {
+        if (!actions[i]) continue;
+        int t = (int)actions[i]->GetEnumParkourAction();
+        if (t == 52)
+            action52Count++;
+        else if (t == 10 || t == 12 || t == 60 || t == 100 || t == 101)
+            beamTypeCount++;
+    }
+    (void)beamTypeCount;
+
+    // Second pass: manipulate fitness to force selection of type 52
+    for (int i = 0; i < actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action) continue;
+        int t = (int)action->GetEnumParkourAction();
+
+        if (t == 52)
+        {
+            action->fitness = 9999.0f;
+        }
+        else if (t == 54)
+        {
+            SmallArray_POD__RemoveGeneric(&actions, i--, 8u);
+            sabotagedCount++;
+        }
+        else if (action52Count > 0 && (t == 53 || t == 65 || t == 73 ||
+                 t == 32 || t == 44 || t == 77 || t == 70 || t == 35))
+        {
+            action->fitness = 0.0f;
+            sabotagedCount++;
+        }
+        else if (action52Count == 0)
+        {
+            if (t == 10 || t == 12 || t == 60 || t == 100 || t == 101)
+            {
+                action->fitness = 0.0f;
+                sabotagedCount++;
+            }
+            else if (t == 53)
+            {
+                action->fitness = 9999.0f;
+            }
+        }
+    }
+
+    m_LastAction52Count = action52Count;
+    m_LastSabotagedCount = sabotagedCount;
+
+    return nullptr;
+}
+
+AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting_Timer(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return selectedByGame;
+
+    for (int i = 0; i < actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action) continue;
+        int t = (int)action->GetEnumParkourAction();
+        if (t == 52 || t == 53)
+        {
+            float liftAmount = m_LiftAmount;
+            if (t == 53)
+                liftAmount += 0.5f;
+
+            m_LastForceSelectSucceeded = true;
+            m_LiftTimerFrames = m_LiftDurationFrames;
+            if (Entity* player = ACU::GetPlayer())
+            {
+                m_LiftTargetZ = player->GetPosition().z + liftAmount;
+                Vector3f& dest = (Vector3f&)action->locationAnchorDest;
+                dest.z = m_LiftTargetZ;
+            }
+            return action;
+        }
+    }
+
+    m_LastForceSelectSucceeded = false;
+    return selectedByGame;
+}
+
+bool FailedWallRunPlugin::OverrideCreationDiscard_Timer(AvailableParkourAction& action)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return false;
+    int t = (int)action.GetEnumParkourAction();
+
+    // Capture type 52's fancyVTable for optional vtable swap on beams
+    if (t == 52 && s_Type52FancyVTable == 0)
+        s_Type52FancyVTable = (uint64)action.fancyVTable;
+
+    // Keep type 52 alive and adjust its destination height
+    if (t == 52)
+    {
+        Vector3f& dest = (Vector3f&)action.locationAnchorDest;
+        Vector3f& src = (Vector3f&)action.locationAnchorSrc;
+        float topLedgeZ = action.locationTopLedge.z;
+        float riseTarget = src.z + 1.5f;
+        if (topLedgeZ < 1e9f && topLedgeZ > src.z)
+        {
+            float pctRise = src.z + (topLedgeZ - src.z) * 0.40f;
+            riseTarget = (pctRise > src.z + 3.0f) ? (src.z + 3.0f) : pctRise;
+        }
+        if (dest.z < riseTarget)
+        {
+            dest.z = riseTarget;
+            action.expectedVerticalSpeed_mb = m_LiftSpeed;
+            action.expectedHeightDiff_mb = riseTarget - src.z;
+            action.expectedVerticalDefaultDisplace = -1.0f;
+        }
+
+        return true;
+    }
+
+    // Adjust type 53 (normal wallrun) for beam-converted use
+    if (t == 53)
+    {
+        Vector3f& dest = (Vector3f&)action.locationAnchorDest;
+        Vector3f& src = (Vector3f&)action.locationAnchorSrc;
+        float riseTarget = src.z + 2.0f;
+        if (dest.z < riseTarget)
+        {
+            dest.z = riseTarget;
+            action.expectedVerticalSpeed_mb = m_LiftSpeed + 0.5f;
+            action.expectedHeightDiff_mb = riseTarget - src.z;
+            action.expectedVerticalDefaultDisplace = -1.0f;
+        }
+
+        // Optional vtable swap (crash risk — experimental)
+        if (m_VtableSwapEnabled && s_Type52FancyVTable != 0)
+            action.fancyVTable = reinterpret_cast<ParkourAction_FancyVTable*>(s_Type52FancyVTable);
+
+        return true;
+    }
+
+    return false;
+}
+
 // ── Per-frame update ──────────────────────────────────────────────────────────
 
 void FailedWallRunPlugin::OnUpdate()
@@ -1015,38 +1173,41 @@ void FailedWallRunPlugin::OnUpdate()
     }
 
     // ── Implementation selector ───────────────────────────────────────────────
-    // Two mutually exclusive implementations, chosen by the UI checkboxes.
-    // Legacy mode is a verbatim port of the 572-line build and must not share
-    // any of the dump-corrected layers (fit-test slot swap, cycle-start swap,
-    // range widener, sabotage-on-create), so those are forced off here and
-    // restored automatically when switching back.
-    const bool legacy = m_LegacyMode;
-    g_LegacyMode = legacy;
+    // Three mutually exclusive implementations, chosen by the UI checkboxes.
+    // Both "old" ports are verbatim ports and must not share any of the
+    // dump-corrected layers (fit-test slot swap, cycle-start swap, range
+    // widener, sabotage-on-create), so those are forced off here and restored
+    // automatically when switching back.
+    const int implMode = m_ImplMode;
+    g_ImplMode = implMode;
+    const bool legacy = (implMode == kImplLegacy);
+    const bool timerLift = (implMode == kImplTimerLift);
+    const bool oldStyle = legacy || timerLift;
 
-    static bool s_AppliedLegacyMode = false;
-    if (s_AppliedLegacyMode != legacy)
+    static bool s_AppliedOldStyleMode = false;
+    if (s_AppliedOldStyleMode != oldStyle)
     {
-        if (!legacy && m_CreatorHookActive)
+        if (!oldStyle && m_CreatorHookActive)
         {
-            // Leaving legacy: re-run the vanilla-byte gate before trusting the
-            // site again (legacy installed it without one).
+            // Leaving an old-style port: re-run the vanilla-byte gate before
+            // trusting the site again (the ports installed it without one).
             m_FailedWallrunCreator.Deactivate();
             m_CreatorHookActive = false;
         }
-        s_AppliedLegacyMode = legacy;
+        s_AppliedOldStyleMode = oldStyle;
     }
 
     // -- Single-stage mode (exact ForcedSidehop-style): disable all extra
     // hooks (creation, widener, fit-override, cycle-swap) and only use GPH.
-    // Legacy mode supersedes it.
-    bool singleStage = !legacy && m_SingleStageMode;
-    // Legacy OnUpdate used IsFeatureActive() alone; the old callbacks apply the
-    // enforce gate internally.
-    bool shouldBeActive = legacy
+    // The old-style ports supersede it.
+    bool singleStage = !oldStyle && m_SingleStageMode;
+    // Old ports' OnUpdate used IsFeatureActive() alone; their callbacks apply
+    // the enforce gate internally.
+    bool shouldBeActive = oldStyle
         ? IsFeatureActive()
         : (IsFeatureActive() && m_EnforceEnabled);
 
-    if (legacy)
+    if (oldStyle)
     {
         // Old build's flag layout: creation hook on/off only, every extra
         // layer disabled.
@@ -1102,8 +1263,8 @@ void FailedWallRunPlugin::OnUpdate()
     // (fail closed on foreign patches — BreakfallForce/ExactPositionTeleport
     // fail-safe pattern). Gated hooks that fail verification simply stay
     // inactive and retry each frame; the UI shows the per-site check state.
-    // (None of this runs in legacy mode; its block above owns the hooks.)
-    if (!legacy)
+    // (None of this runs in an old-style port; its block above owns the hooks.)
+    if (!oldStyle)
     {
         if (singleStage && m_CreatorHookActive)
         {
@@ -1167,16 +1328,16 @@ void FailedWallRunPlugin::OnUpdate()
                 m_VTableSwapHookActive = false;
             }
         }
-    } // !legacy
+    } // !oldStyle
 
     // Sort&select + creation-stage enforcement via GenericHooksInParkourFiltering
     // In single-stage mode we disable the GPH callbacks that enforce type-52
     // and instead rely ONLY on the ForcedSidehop-style rewrite approach.
-    bool useGphEnforce = legacy || !m_SingleStageMode; // legacy always uses GPH
+    bool useGphEnforce = oldStyle || !m_SingleStageMode; // old ports always use GPH
     // Priority is only read inside Subscribe(), so a mode change must
     // re-subscribe to move the callback in the dispatch order. 20000 puts it
-    // last (old build); 4.5 puts it just before FreeJump's 5.0 (current build).
-    const float desiredPriority = legacy ? 20000.0f : 4.5f;
+    // last (old builds); 4.5 puts it just before FreeJump's 5.0 (current build).
+    const float desiredPriority = oldStyle ? 20000.0f : 4.5f;
     if (useGphEnforce && shouldBeActive && !m_GphActive)
     {
         m_Callbacks.m_CallbackPriority = desiredPriority;
@@ -1205,12 +1366,27 @@ void FailedWallRunPlugin::OnUpdate()
         m_GphActive = false;
     }
 
-    // Refresh debug stats from the globals. The legacy path writes its own
-    // members directly, so do not clobber them with the current-mode counters.
-    if (!legacy)
+    // Refresh debug stats from the globals. The old-style ports write their
+    // own members directly, so do not clobber them with the current counters.
+    if (!oldStyle)
     {
         m_LastAction52Count = g_Action52Count;
         m_LastSabotagedCount = g_SabotagedCount;
+    }
+
+    // ── Timer-lift Z-clamp ("check this one out") ────────────────────────────
+    // Armed by ChooseAfterSorting_Timer; holds the player at m_LiftTargetZ for
+    // m_LiftDurationFrames. Only the timer-lift implementation uses this.
+    if (timerLift && m_LiftTimerFrames > 0)
+    {
+        if (Entity* player = ACU::GetPlayer())
+        {
+            if (player->GetPosition().z < m_LiftTargetZ)
+                player->GetPosition().z = m_LiftTargetZ;
+        }
+        m_LiftTimerFrames--;
+        if (m_LiftTimerFrames <= 0)
+            m_LiftTimerFrames = 0;
     }
 
     // --- Ezio-style Animation Cancel ---
@@ -1262,31 +1438,46 @@ void FailedWallRunPlugin::OnImGuiRender()
 
     if (ImGui::CollapsingHeader("Failed Wallrun Side-Eject", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        // ── Implementation selector: exactly one of the two is active ─────────
-        // Ticking one box ticks the other off. Unticking the active box is a
-        // no-op so the plugin can never end up with neither implementation.
+        // ── Implementation selector: exactly one of the three is active ────────
+        // Ticking one box ticks the others off. Unticking the active box is a
+        // no-op so the plugin can never end up with no implementation.
         ImGui::TextColored(debugColor, "Implementation (mutually exclusive):");
         {
-            bool useCurrent = !m_LegacyMode;
+            bool useCurrent = (m_ImplMode == kImplCurrent);
             if (ImGui::Checkbox("Current (dump-corrected 1.5.0)##impl_current", &useCurrent))
             {
-                if (useCurrent) m_LegacyMode = false;
+                if (useCurrent) m_ImplMode = kImplCurrent;
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Fit-test slot swap, cycle-start vtable swap, in-place range\n"
                                   "widening, null-safe type reads, vanilla-byte site checks.");
 
-            bool useLegacy = m_LegacyMode;
+            bool useLegacy = (m_ImplMode == kImplLegacy);
             if (ImGui::Checkbox("Old (exact 572-line build)##impl_legacy", &useLegacy))
             {
-                if (useLegacy) m_LegacyMode = true;
+                if (useLegacy) m_ImplMode = kImplLegacy;
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Verbatim behaviour of 'another failed wallrun version':\n"
                                   "literal GetEnumParkourAction() reads (may crash on the transient\n"
-                                  "table), player-Z teleport on force-select, no fit-test /\n"
+                                  "table), instant player-Z teleport on force-select, no fit-test /\n"
                                   "cycle-start / range-widener layers, callback priority 20000.");
+
+            bool useTimer = (m_ImplMode == kImplTimerLift);
+            if (ImGui::Checkbox("Old (timer-lift variant)##impl_timer", &useTimer))
+            {
+                if (useTimer) m_ImplMode = kImplTimerLift;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Verbatim behaviour of 'check this one out':\n"
+                                  "same selection logic as the 572-line build, but the lift is a\n"
+                                  "timed per-frame Z-clamp instead of an instant teleport, and the\n"
+                                  "type-52 rise is 1.5m / 40%% of ledge capped at 3.0m.");
         }
+        if (m_ImplMode == kImplCurrent && m_SingleStageMode)
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.10f, 1.0f),
+                "Warning: Single-stage mode is ON (loaded from the INI) — it disables every\n"
+                "current-mode hook, so 'Current' behaves as a no-op. Untick it below to test.");
         ImGui::Separator();
 
         bool enabled = m_PluginEnabled;
@@ -1324,8 +1515,8 @@ void FailedWallRunPlugin::OnImGuiRender()
                 m_WaitingForKey = !m_WaitingForKey;
 
             ImGui::Separator();
-            if (m_LegacyMode)
-                ImGui::TextColored(debugColor, "Legacy implementation (572-line build):");
+            if (m_ImplMode != kImplCurrent)
+                ImGui::TextColored(debugColor, "Old implementation (verbatim port):");
             else
                 ImGui::TextColored(debugColor, "Patches (all 1.5.0 dump-verified):");
 
@@ -1340,7 +1531,7 @@ void FailedWallRunPlugin::OnImGuiRender()
             {
                 ImGui::Indent();
 
-                if (!m_LegacyMode)
+                if (m_ImplMode == kImplCurrent)
                 {
                     bool widener = m_RangeWidenerEnabled;
                     if (ImGui::Checkbox("Widen acceptance ranges (at fit-test time)", &widener))
@@ -1385,7 +1576,7 @@ void FailedWallRunPlugin::OnImGuiRender()
                                           "fancy vtable at walling/failed-wallrun cycle start while the key\n"
                                           "is held, so more move types get scanned on walls.");
                 }
-                else
+                else if (m_ImplMode == kImplLegacy)
                 {
                     // The old build's checkbox, with the old build's meaning and
                     // its old default (off). Kept on a separate flag so it cannot
@@ -1399,6 +1590,32 @@ void FailedWallRunPlugin::OnImGuiRender()
                         ImGui::SetTooltip("Old build: swap a type-53 action's fancy vtable to type 52\n"
                                           "at creation time. Off by default, exactly as in the old build.\n"
                                           "Session-only (not written to the INI).");
+                }
+                else // kImplTimerLift
+                {
+                    // "check this one out" used the shared VtableSwapEnabled flag
+                    // for the same 53->52 creation swap. The cycle-start layer is
+                    // disabled in this mode, so the flag only affects the timer
+                    // implementation's creation override.
+                    bool vtableSwap = m_VtableSwapEnabled;
+                    if (ImGui::Checkbox("Vtable swap (experimental, crash risk)##timer", &vtableSwap))
+                    {
+                        m_VtableSwapEnabled = vtableSwap;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Timer variant: swap a type-53 action's fancy vtable to type 52\n"
+                                          "at creation time. Off by default. Session-only.");
+
+                    ImGui::Text("Lift duration (frames):");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(80);
+                    int liftD = m_LiftDurationFrames;
+                    if (ImGui::InputInt("frames##liftduration", &liftD, 1, 10))
+                    {
+                        if (liftD < 1) liftD = 1;
+                        if (liftD > 600) liftD = 600;
+                        m_LiftDurationFrames = liftD;
+                    }
                 }
 
                 ImGui::Text("Lift height:");
@@ -1431,7 +1648,7 @@ void FailedWallRunPlugin::OnImGuiRender()
             if (isActive)
             {
                 ImGui::Separator();
-                if (m_LegacyMode)
+                if (m_ImplMode == kImplLegacy)
                 {
                     ImGui::TextColored(debugColor, "Stats (legacy):");
                     ImGui::Text("  Action 52 found: %d | Sabotaged: %d | Selected: %s",
@@ -1443,6 +1660,21 @@ void FailedWallRunPlugin::OnImGuiRender()
                         m_LiftSpeed,
                         m_LastForceSelectSucceeded ? m_LiftAmount : 0.0f);
                     if (s_LegacyType52FancyVTable == 0)
+                        ImGui::TextColored(ImVec4(1,1,0,1),
+                            "  (capturing type 52 vtable... approach a wall)");
+                }
+                else if (m_ImplMode == kImplTimerLift)
+                {
+                    ImGui::TextColored(debugColor, "Stats (timer-lift):");
+                    ImGui::Text("  Action 52 found: %d | Sabotaged: %d | Selected: %s",
+                        m_LastAction52Count,
+                        m_LastSabotagedCount,
+                        m_LastForceSelectSucceeded ? "YES" : "NO");
+                    ImGui::Text("  Lift timer: %d / %d frames | TargetZ: %.1f",
+                        m_LiftTimerFrames,
+                        m_LiftDurationFrames,
+                        m_LiftTargetZ);
+                    if (s_Type52FancyVTable == 0)
                         ImGui::TextColored(ImVec4(1,1,0,1),
                             "  (capturing type 52 vtable... approach a wall)");
                 }

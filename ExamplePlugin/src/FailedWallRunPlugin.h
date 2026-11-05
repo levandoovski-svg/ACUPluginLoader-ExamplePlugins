@@ -79,7 +79,7 @@ public:
     bool OverrideCreationDiscard(AvailableParkourAction& action);
 
     // ── Legacy implementation (verbatim port of the 572-line build) ───────────
-    // Selected by m_LegacyMode. These are byte-for-byte behavioural ports of
+    // Selected by kImplLegacy. These are byte-for-byte behavioural ports of
     // "another failed wallrun version.txt"; they deliberately keep the old
     // unsafe action->GetEnumParkourAction() reads, the player-Z teleport in
     // ChooseAfterSorting, and the 53->52 swap gated by m_LegacyVtableSwapEnabled.
@@ -88,6 +88,20 @@ public:
     AvailableParkourAction* ChooseBeforeFiltering_Legacy(SmallArray<AvailableParkourAction*>& actions);
     AvailableParkourAction* ChooseAfterSorting_Legacy(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame);
     bool OverrideCreationDiscard_Legacy(AvailableParkourAction& action);
+
+    // ── Timer-lift implementation (verbatim port of "check this one out") ─────
+    // Same selection logic as the legacy port, but the lift is applied as a
+    // timed per-frame Z-clamp instead of an instant player-Z teleport, and the
+    // type-52 rise target is 1.5m / 40%-of-ledge capped at 3.0m. Selected by
+    // kImplTimerLift. Kept separate so this variant can be A/B tested too.
+    AvailableParkourAction* ChooseBeforeFiltering_Timer(SmallArray<AvailableParkourAction*>& actions);
+    AvailableParkourAction* ChooseAfterSorting_Timer(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame);
+    bool OverrideCreationDiscard_Timer(AvailableParkourAction& action);
+
+    // ── Implementation selector values (session-only) ────────────────────────
+    static constexpr int kImplCurrent = 0;   // dump-corrected, current build
+    static constexpr int kImplLegacy = 1;    // 572-line build (instant Z teleport)
+    static constexpr int kImplTimerLift = 2; // "check this one out" (timed Z-clamp)
 
 private:
     static bool IsRisingEdgePressed(int vkCode);
@@ -145,23 +159,33 @@ private:
     bool m_SingleStageMode = false;
 
     // ── Implementation selector (session-only; deliberately NOT in the INI) ──
-    // false = current, dump-corrected implementation (default).
-    // true  = verbatim port of the 572-line "another failed wallrun version"
-    //         build: literal GetEnumParkourAction() reads (can crash on the
-    //         transient table), player-Z teleport in ChooseAfterSorting, no
-    //         fit-test slot swap / cycle-start swap / range widener, and
-    //         callback priority 20000 instead of 4.5.
-    bool m_LegacyMode = false;
+    // kImplCurrent    = current, dump-corrected implementation (default).
+    // kImplLegacy     = verbatim port of the 572-line "another failed wallrun
+    //                   version" build: literal GetEnumParkourAction() reads,
+    //                   instant player-Z teleport, no extra hook layers,
+    //                   callback priority 20000.
+    // kImplTimerLift  = verbatim port of "check this one out": same selection
+    //                   logic, but a timed per-frame Z-clamp instead of the
+    //                   instant teleport.
+    int m_ImplMode = kImplCurrent;
 
     // Old file's "Vtable swap (experimental, crash risk)" checkbox: swaps a
     // type-53 action's fancy vtable to type 52 at creation time. Separate from
     // m_VtableSwapEnabled (which means the cycle-start tester swap in the
     // current implementation) so the two modes cannot cross-contaminate.
-    // Default off, matching the old build.
+    // Default off, matching the old build. Used by the legacy mode only; the
+    // timer-lift port used the shared m_VtableSwapEnabled flag.
     bool m_LegacyVtableSwapEnabled = false;
 
     // Old file's "force-select succeeded" debug flag (legacy stats block).
     bool m_LastForceSelectSucceeded = false;
+
+    // ── Timer-lift state ("check this one out") ──────────────────────────────
+    // Frames left in the current lift clamp, the Z to hold while it runs, and
+    // how many frames a lift lasts. Session-only (not in the INI).
+    int m_LiftTimerFrames = 0;
+    float m_LiftTargetZ = 0.0f;
+    int m_LiftDurationFrames = 30;
 
     // Debug stats (written from the game thread, read by the UI).
     int m_LastAction52Count = 0;
