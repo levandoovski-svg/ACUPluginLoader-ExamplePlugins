@@ -184,6 +184,9 @@ static bool IsType52Safe(const AvailableParkourAction* action)
 
 // ── Guard flag + cached settings for the static hooks ─────────────────────────
 static volatile bool g_ShouldCreateFailedWallrun = false;
+// True while the legacy (572-line port) implementation is selected. Read by the
+// static creation hook, which has no `this`. Written from OnUpdate.
+static volatile bool g_LegacyMode = false;
 static volatile bool g_ExpandRanges = false;
 static volatile bool g_SkipFitTest = false;
 static volatile bool g_SwapTesterVTables = false;
@@ -223,6 +226,13 @@ using SmallArray_RemoveFunc = void(__fastcall*)(void* smallArray, int p_idx, uns
 static SmallArray_RemoveFunc SmallArray_POD__RemoveGeneric = (SmallArray_RemoveFunc)0x142725F00;
 
 uint64 FailedWallRunPlugin::s_Type52FancyVTable = 0;
+
+// Separate capture for the legacy path. The old build captured the first
+// type-52 table it saw, including the transient base table (NULL fancy 0x45).
+// Keeping it separate means running legacy once cannot poison the current
+// implementation's runtime-only capture (s_Type52FancyVTable).
+static uint64 s_LegacyType52FancyVTable = 0;
+
 static int g_CreationOverrideCount = 0;
 
 // Raise an action's destination so Arno visibly gains height during the
@@ -407,8 +417,45 @@ static void WhenStartingFailedWallrunCycle_SwapFVTables(AllRegisters* params)
 }
 
 // ── Hook 1 callback: create the failed wallrun action during facade scans ─────
+
+// LEGACY: verbatim body of the 572-line build's creation hook. Creates and
+// appends only -- no counting, no range widening, no fitness boost, no sabotage.
+static void DuringClimbFacadeScan_CreateFailedWallrun_Legacy(AllRegisters* params)
+{
+    if (!g_ShouldCreateFailedWallrun) return;
+
+    ParkourAction_Commonbase* newAction = nullptr;
+    bool isCreated = CreateParkourActionForParkourPointIfFits(
+        EnumParkourAction::wallrunUpFromGroundFailed_mb,
+        params->rdx_,
+        (__m128*)params->rdi_,
+        (__m128*)params->r9_,
+        params->XMM6.f0,
+        (int&)params->r13_,
+        *(char*)(params->GetRSP() + 0x100),
+        *(uint64*)(*(uint64*)params->r12_ + (int&)params->r15_),
+        *(uint64*)(params->rbp_ + 0x118),
+        *(uint64*)(params->rbp_ + 0x120),
+        &newAction,
+        *(float*)(params->rbp_ + 0x104),
+        *(float*)(params->rbp_ + 0x108)
+    );
+    if (isCreated && newAction)
+    {
+        ACU::Memory::SmallArrayAppend(
+            *(SmallArray<ParkourAction_Commonbase*>*)params->rbx_,
+            newAction);
+    }
+}
+
 static void DuringClimbFacadeScan_CreateFailedWallrun(AllRegisters* params)
 {
+    if (g_LegacyMode)
+    {
+        DuringClimbFacadeScan_CreateFailedWallrun_Legacy(params);
+        return;
+    }
+
     if (!g_ShouldCreateFailedWallrun) return;
 
     // --- Count existing actions by type (null-safe!) ---
@@ -605,15 +652,21 @@ FailedWallRunPlugin::FailedWallRunPlugin()
 {
     m_Callbacks.ChooseBeforeFiltering_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions) -> AvailableParkourAction*
     {
-        return static_cast<FailedWallRunPlugin*>(userData)->ChooseBeforeFiltering(actions);
+        auto* self = static_cast<FailedWallRunPlugin*>(userData);
+        if (g_LegacyMode) return self->ChooseBeforeFiltering_Legacy(actions);
+        return self->ChooseBeforeFiltering(actions);
     };
     m_Callbacks.ChooseAfterSorting_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame) -> AvailableParkourAction*
     {
-        return static_cast<FailedWallRunPlugin*>(userData)->ChooseAfterSorting(actions, selectedByGame);
+        auto* self = static_cast<FailedWallRunPlugin*>(userData);
+        if (g_LegacyMode) return self->ChooseAfterSorting_Legacy(actions, selectedByGame);
+        return self->ChooseAfterSorting(actions, selectedByGame);
     };
     m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool
     {
-        return static_cast<FailedWallRunPlugin*>(userData)->OverrideCreationDiscard(action);
+        auto* self = static_cast<FailedWallRunPlugin*>(userData);
+        if (g_LegacyMode) return self->OverrideCreationDiscard_Legacy(action);
+        return self->OverrideCreationDiscard(action);
     };
     m_Callbacks.m_UserData = this;
     // Distinct priority (proven pattern: ForcedSidehop used 4.0 vs FreeJump's
@@ -623,6 +676,8 @@ FailedWallRunPlugin::FailedWallRunPlugin()
     // wipe/overrides when both keys are held (the GPH dispatcher short-circuits
     // after a callback returns an action, so FreeJump's pass is skipped for
     // that cycle — no interference in either direction).
+    // This is the CURRENT-implementation value; OnUpdate re-subscribes with
+    // 20000.0f when legacy mode is selected (old build's priority).
     m_Callbacks.m_CallbackPriority = 4.5f;
     m_Callbacks.m_Name = "FailedWallRunPlugin";
 }
@@ -776,6 +831,159 @@ bool FailedWallRunPlugin::OverrideCreationDiscard(AvailableParkourAction& action
     return false;
 }
 
+// ── Legacy implementation: verbatim port of the 572-line build ───────────────
+// Everything below is intentionally byte-for-byte behavioural: literal
+// GetEnumParkourAction() reads (unsafe, as in the old build), magic type
+// numbers, the player-Z teleport in ChooseAfterSorting, and the old
+// 53->52 vtable swap gated by m_LegacyVtableSwapEnabled. Do not "fix" these --
+// they are the control group for the A/B comparison.
+
+AvailableParkourAction* FailedWallRunPlugin::ChooseBeforeFiltering_Legacy(SmallArray<AvailableParkourAction*>& actions)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return nullptr;
+
+    int action52Count = 0;
+    int beamTypeCount = 0;
+    int sabotagedCount = 0;
+
+    // First pass: count type 52 and beam-specific types
+    for (int i = 0; i < actions.size; ++i)
+    {
+        if (!actions[i]) continue;
+        int t = (int)actions[i]->GetEnumParkourAction();
+        if (t == 52)
+            action52Count++;
+        else if (t == 10 || t == 12 || t == 60 || t == 100 || t == 101)
+            beamTypeCount++;
+    }
+    (void)beamTypeCount; // unused in the original build; kept for fidelity
+
+    // Second pass: manipulate fitness to force selection of type 52
+    // On walls: type 52 is injected by the ClimbFacade hook, sabotage wall competitors
+    // On beams: no type 52 injected, so sabotage beam types and boost type 53 (which
+    //   OverrideCreationDiscard will convert to type 52 via vtable swap)
+    for (int i = 0; i < actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action) continue;
+        int t = (int)action->GetEnumParkourAction();
+
+        if (t == 52)
+        {
+            action->fitness = 9999.0f;
+        }
+        else if (t == 54)
+        {
+            SmallArray_POD__RemoveGeneric(&actions, i--, 8u);
+            sabotagedCount++;
+        }
+        else if (action52Count > 0 && (t == 53 || t == 65 || t == 73 ||
+                 t == 32 || t == 44 || t == 77 || t == 70 || t == 35))
+        {
+            action->fitness = 0.0f;
+            sabotagedCount++;
+        }
+        else if (action52Count == 0)
+        {
+            // No type 52 available (we're on beams or ropes)
+            // Sabotage beam-specific actions so type 53 becomes the only viable option
+            if (t == 10 || t == 12 || t == 60 || t == 100 || t == 101)
+            {
+                action->fitness = 0.0f;
+                sabotagedCount++;
+            }
+            else if (t == 53)
+            {
+                action->fitness = 9999.0f;
+            }
+        }
+    }
+
+    m_LastAction52Count = action52Count;
+    m_LastSabotagedCount = sabotagedCount;
+
+    return nullptr;
+}
+
+AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting_Legacy(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return selectedByGame;
+
+    for (int i = 0; i < actions.size; ++i)
+    {
+        AvailableParkourAction* action = actions[i];
+        if (!action) continue;
+        int t = (int)action->GetEnumParkourAction();
+        if (t == 52 || t == 53)
+        {
+            float liftAmount = m_LiftAmount;
+            if (t == 53)
+                liftAmount += 0.5f;
+
+            m_LastForceSelectSucceeded = true;
+            if (Entity* player = ACU::GetPlayer())
+                player->GetPosition().z += liftAmount;
+            return action;
+        }
+    }
+
+    m_LastForceSelectSucceeded = false;
+    return selectedByGame;
+}
+
+bool FailedWallRunPlugin::OverrideCreationDiscard_Legacy(AvailableParkourAction& action)
+{
+    if (!IsFeatureActive() || !m_EnforceEnabled) return false;
+    int t = (int)action.GetEnumParkourAction();
+
+    // Capture type 52's fancyVTable for optional vtable swap on beams
+    if (t == 52 && s_LegacyType52FancyVTable == 0)
+        s_LegacyType52FancyVTable = (uint64)action.fancyVTable;
+
+    // Keep type 52 alive and adjust its destination height
+    if (t == 52)
+    {
+        Vector3f& dest = (Vector3f&)action.locationAnchorDest;
+        Vector3f& src = (Vector3f&)action.locationAnchorSrc;
+        float topLedgeZ = action.locationTopLedge.z;
+        float riseTarget = src.z + m_LiftAmount;
+        if (topLedgeZ < 1e9f && topLedgeZ > src.z + 0.5f)
+            riseTarget = std::min(topLedgeZ - 0.3f, src.z + m_LiftAmount + 1.0f);
+        if (dest.z < riseTarget)
+        {
+            dest.z = riseTarget;
+            action.expectedVerticalSpeed_mb = m_LiftSpeed;
+            action.expectedHeightDiff_mb = riseTarget - src.z;
+            action.expectedVerticalDefaultDisplace = -1.0f;
+        }
+
+        return true;
+    }
+
+    // Adjust type 53 (normal wallrun) for beam-converted use
+    if (t == 53)
+    {
+        Vector3f& dest = (Vector3f&)action.locationAnchorDest;
+        Vector3f& src = (Vector3f&)action.locationAnchorSrc;
+        float riseTarget = src.z + 2.0f;
+        if (dest.z < riseTarget)
+        {
+            dest.z = riseTarget;
+            action.expectedVerticalSpeed_mb = m_LiftSpeed + 0.5f;
+            action.expectedHeightDiff_mb = riseTarget - src.z;
+            action.expectedVerticalDefaultDisplace = -1.0f;
+        }
+
+        // Optional vtable swap (crash risk — experimental)
+        if (m_LegacyVtableSwapEnabled && s_LegacyType52FancyVTable != 0)
+            action.fancyVTable = reinterpret_cast<ParkourAction_FancyVTable*>(s_LegacyType52FancyVTable);
+
+        return true;
+    }
+
+    return false;
+}
+
 // ── Per-frame update ──────────────────────────────────────────────────────────
 
 void FailedWallRunPlugin::OnUpdate()
@@ -806,11 +1014,72 @@ void FailedWallRunPlugin::OnUpdate()
         }
     }
 
+    // ── Implementation selector ───────────────────────────────────────────────
+    // Two mutually exclusive implementations, chosen by the UI checkboxes.
+    // Legacy mode is a verbatim port of the 572-line build and must not share
+    // any of the dump-corrected layers (fit-test slot swap, cycle-start swap,
+    // range widener, sabotage-on-create), so those are forced off here and
+    // restored automatically when switching back.
+    const bool legacy = m_LegacyMode;
+    g_LegacyMode = legacy;
+
+    static bool s_AppliedLegacyMode = false;
+    if (s_AppliedLegacyMode != legacy)
+    {
+        if (!legacy && m_CreatorHookActive)
+        {
+            // Leaving legacy: re-run the vanilla-byte gate before trusting the
+            // site again (legacy installed it without one).
+            m_FailedWallrunCreator.Deactivate();
+            m_CreatorHookActive = false;
+        }
+        s_AppliedLegacyMode = legacy;
+    }
+
     // -- Single-stage mode (exact ForcedSidehop-style): disable all extra
     // hooks (creation, widener, fit-override, cycle-swap) and only use GPH.
-    bool singleStage = m_SingleStageMode;
-    bool shouldBeActive = IsFeatureActive() && m_EnforceEnabled;
-    if (singleStage)
+    // Legacy mode supersedes it.
+    bool singleStage = !legacy && m_SingleStageMode;
+    // Legacy OnUpdate used IsFeatureActive() alone; the old callbacks apply the
+    // enforce gate internally.
+    bool shouldBeActive = legacy
+        ? IsFeatureActive()
+        : (IsFeatureActive() && m_EnforceEnabled);
+
+    if (legacy)
+    {
+        // Old build's flag layout: creation hook on/off only, every extra
+        // layer disabled.
+        g_ShouldCreateFailedWallrun = shouldBeActive;
+        g_ExpandRanges = false;
+        g_SkipFitTest = false;
+        g_SwapTesterVTables = false;
+
+        // Old build activated the creation hook unconditionally (no byte gate).
+        if (shouldBeActive && !m_CreatorHookActive)
+        {
+            m_FailedWallrunCreator.Activate();
+            m_CreatorHookActive = true;
+        }
+        else if (!shouldBeActive && m_CreatorHookActive)
+        {
+            m_FailedWallrunCreator.Deactivate();
+            m_CreatorHookActive = false;
+        }
+
+        // Restore the current implementation's extra layers if they were live.
+        if (m_FitTestHookActive)
+        {
+            SwapType52FitTestFn(false);
+            m_FitTestHookActive = false;
+        }
+        if (m_VTableSwapHookActive)
+        {
+            m_VTableSwapHook.Deactivate();
+            m_VTableSwapHookActive = false;
+        }
+    }
+    else if (singleStage)
     {
         // Force only GPH-based behavior; disable all injection layers.
         g_ShouldCreateFailedWallrun = false;
@@ -833,75 +1102,84 @@ void FailedWallRunPlugin::OnUpdate()
     // (fail closed on foreign patches — BreakfallForce/ExactPositionTeleport
     // fail-safe pattern). Gated hooks that fail verification simply stay
     // inactive and retry each frame; the UI shows the per-site check state.
-    if (singleStage && m_CreatorHookActive)
+    // (None of this runs in legacy mode; its block above owns the hooks.)
+    if (!legacy)
     {
-        m_FailedWallrunCreator.Deactivate();
-        m_CreatorHookActive = false;
-    } else if (!m_SingleStageMode) {
-        if (shouldBeActive && !m_CreatorHookActive)
-        {
-            m_CreatorSiteOk = SiteBytesMatch(0x140135230, k_ExpectedBytes_CreationSite, sizeof(k_ExpectedBytes_CreationSite));
-            if (m_CreatorSiteOk)
-            {
-                m_FailedWallrunCreator.Activate();
-                m_CreatorHookActive = true;
-            }
-        }
-        else if (!shouldBeActive && m_CreatorHookActive)
+        if (singleStage && m_CreatorHookActive)
         {
             m_FailedWallrunCreator.Deactivate();
             m_CreatorHookActive = false;
+        } else if (!m_SingleStageMode) {
+            if (shouldBeActive && !m_CreatorHookActive)
+            {
+                m_CreatorSiteOk = SiteBytesMatch(0x140135230, k_ExpectedBytes_CreationSite, sizeof(k_ExpectedBytes_CreationSite));
+                if (m_CreatorSiteOk)
+                {
+                    m_FailedWallrunCreator.Activate();
+                    m_CreatorHookActive = true;
+                }
+            }
+            else if (!shouldBeActive && m_CreatorHookActive)
+            {
+                m_FailedWallrunCreator.Deactivate();
+                m_CreatorHookActive = false;
+            }
         }
-    }
 
-    // The fit-test slot swap covers BOTH the widening (g_ExpandRanges, applied
-    // inside the stub after 0x64 wrote the vanilla ranges) and the verdict
-    // override (g_SkipFitTest), so it activates when either feature wants it.
-    if (singleStage && m_FitTestHookActive)
-    {
-        SwapType52FitTestFn(false);
-        m_FitTestHookActive = false;
-    } else if (!m_SingleStageMode) {
-        if (shouldBeActive && (m_SkipFitTestEnabled || m_RangeWidenerEnabled) && !m_FitTestHookActive)
-        {
-            m_FitTestSlotOk = SwapType52FitTestFn(true);
-            m_FitTestHookActive = m_FitTestSlotOk;
-        }
-        else if ((!shouldBeActive || (!m_SkipFitTestEnabled && !m_RangeWidenerEnabled)) && m_FitTestHookActive)
+        // The fit-test slot swap covers BOTH the widening (g_ExpandRanges, applied
+        // inside the stub after 0x64 wrote the vanilla ranges) and the verdict
+        // override (g_SkipFitTest), so it activates when either feature wants it.
+        if (singleStage && m_FitTestHookActive)
         {
             SwapType52FitTestFn(false);
             m_FitTestHookActive = false;
-        }
-    }
-
-    if (singleStage && m_VTableSwapHookActive)
-    {
-        m_VTableSwapHook.Deactivate();
-        m_VTableSwapHookActive = false;
-    } else if (!m_SingleStageMode) {
-        if (shouldBeActive && m_VtableSwapEnabled && !m_VTableSwapHookActive)
-        {
-            m_SwapSitesOk = SiteBytesMatch(0x141A4D7CB, k_ExpectedBytes_WallingCycleSite, sizeof(k_ExpectedBytes_WallingCycleSite))
-                         && SiteBytesMatch(0x141A1BA0C, k_ExpectedBytes_FailedWallrunCycleSite, sizeof(k_ExpectedBytes_FailedWallrunCycleSite));
-            if (m_SwapSitesOk)
+        } else if (!m_SingleStageMode) {
+            if (shouldBeActive && (m_SkipFitTestEnabled || m_RangeWidenerEnabled) && !m_FitTestHookActive)
             {
-                m_VTableSwapHook.Activate();
-                m_VTableSwapHookActive = true;
+                m_FitTestSlotOk = SwapType52FitTestFn(true);
+                m_FitTestHookActive = m_FitTestSlotOk;
+            }
+            else if ((!shouldBeActive || (!m_SkipFitTestEnabled && !m_RangeWidenerEnabled)) && m_FitTestHookActive)
+            {
+                SwapType52FitTestFn(false);
+                m_FitTestHookActive = false;
             }
         }
-        else if ((!shouldBeActive || !m_VtableSwapEnabled) && m_VTableSwapHookActive)
+
+        if (singleStage && m_VTableSwapHookActive)
         {
             m_VTableSwapHook.Deactivate();
             m_VTableSwapHookActive = false;
+        } else if (!m_SingleStageMode) {
+            if (shouldBeActive && m_VtableSwapEnabled && !m_VTableSwapHookActive)
+            {
+                m_SwapSitesOk = SiteBytesMatch(0x141A4D7CB, k_ExpectedBytes_WallingCycleSite, sizeof(k_ExpectedBytes_WallingCycleSite))
+                             && SiteBytesMatch(0x141A1BA0C, k_ExpectedBytes_FailedWallrunCycleSite, sizeof(k_ExpectedBytes_FailedWallrunCycleSite));
+                if (m_SwapSitesOk)
+                {
+                    m_VTableSwapHook.Activate();
+                    m_VTableSwapHookActive = true;
+                }
+            }
+            else if ((!shouldBeActive || !m_VtableSwapEnabled) && m_VTableSwapHookActive)
+            {
+                m_VTableSwapHook.Deactivate();
+                m_VTableSwapHookActive = false;
+            }
         }
-    }
+    } // !legacy
 
     // Sort&select + creation-stage enforcement via GenericHooksInParkourFiltering
     // In single-stage mode we disable the GPH callbacks that enforce type-52
     // and instead rely ONLY on the ForcedSidehop-style rewrite approach.
-    bool useGphEnforce = !m_SingleStageMode;
+    bool useGphEnforce = legacy || !m_SingleStageMode; // legacy always uses GPH
+    // Priority is only read inside Subscribe(), so a mode change must
+    // re-subscribe to move the callback in the dispatch order. 20000 puts it
+    // last (old build); 4.5 puts it just before FreeJump's 5.0 (current build).
+    const float desiredPriority = legacy ? 20000.0f : 4.5f;
     if (useGphEnforce && shouldBeActive && !m_GphActive)
     {
+        m_Callbacks.m_CallbackPriority = desiredPriority;
         auto gph = GenericHooksInParkourFiltering::GetSingleton();
         gph->Subscribe(m_Callbacks);
         m_HookActivator = gph->RequestGPHSortAndSelect();
@@ -911,7 +1189,15 @@ void FailedWallRunPlugin::OnUpdate()
         m_HookActivatorCreation = gph->RequestGPHCreation();
         m_GphActive = true;
     }
-    else if (!m_SingleStageMode && !shouldBeActive && m_GphActive)
+    else if (useGphEnforce && shouldBeActive && m_GphActive
+             && m_Callbacks.m_CallbackPriority != desiredPriority)
+    {
+        auto gph = GenericHooksInParkourFiltering::GetSingleton();
+        gph->Unsubscribe(m_Callbacks);
+        m_Callbacks.m_CallbackPriority = desiredPriority;
+        gph->Subscribe(m_Callbacks);
+    }
+    else if ((!useGphEnforce || !shouldBeActive) && m_GphActive)
     {
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
         m_HookActivator.reset();
@@ -919,9 +1205,13 @@ void FailedWallRunPlugin::OnUpdate()
         m_GphActive = false;
     }
 
-    // Refresh debug stats from the globals
-    m_LastAction52Count = g_Action52Count;
-    m_LastSabotagedCount = g_SabotagedCount;
+    // Refresh debug stats from the globals. The legacy path writes its own
+    // members directly, so do not clobber them with the current-mode counters.
+    if (!legacy)
+    {
+        m_LastAction52Count = g_Action52Count;
+        m_LastSabotagedCount = g_SabotagedCount;
+    }
 
     // --- Ezio-style Animation Cancel ---
     if (m_CancelEnabled)
@@ -972,6 +1262,33 @@ void FailedWallRunPlugin::OnImGuiRender()
 
     if (ImGui::CollapsingHeader("Failed Wallrun Side-Eject", ImGuiTreeNodeFlags_DefaultOpen))
     {
+        // ── Implementation selector: exactly one of the two is active ─────────
+        // Ticking one box ticks the other off. Unticking the active box is a
+        // no-op so the plugin can never end up with neither implementation.
+        ImGui::TextColored(debugColor, "Implementation (mutually exclusive):");
+        {
+            bool useCurrent = !m_LegacyMode;
+            if (ImGui::Checkbox("Current (dump-corrected 1.5.0)##impl_current", &useCurrent))
+            {
+                if (useCurrent) m_LegacyMode = false;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Fit-test slot swap, cycle-start vtable swap, in-place range\n"
+                                  "widening, null-safe type reads, vanilla-byte site checks.");
+
+            bool useLegacy = m_LegacyMode;
+            if (ImGui::Checkbox("Old (exact 572-line build)##impl_legacy", &useLegacy))
+            {
+                if (useLegacy) m_LegacyMode = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Verbatim behaviour of 'another failed wallrun version':\n"
+                                  "literal GetEnumParkourAction() reads (may crash on the transient\n"
+                                  "table), player-Z teleport on force-select, no fit-test /\n"
+                                  "cycle-start / range-widener layers, callback priority 20000.");
+        }
+        ImGui::Separator();
+
         bool enabled = m_PluginEnabled;
         if (ImGui::Checkbox("Enable Failed Wallrun", &enabled))
         {
@@ -1007,7 +1324,10 @@ void FailedWallRunPlugin::OnImGuiRender()
                 m_WaitingForKey = !m_WaitingForKey;
 
             ImGui::Separator();
-            ImGui::TextColored(debugColor, "Patches (all 1.5.0 dump-verified):");
+            if (m_LegacyMode)
+                ImGui::TextColored(debugColor, "Legacy implementation (572-line build):");
+            else
+                ImGui::TextColored(debugColor, "Patches (all 1.5.0 dump-verified):");
 
             bool enforce = m_EnforceEnabled;
             if (ImGui::Checkbox("Enforce failed wallrun", &enforce))
@@ -1020,48 +1340,66 @@ void FailedWallRunPlugin::OnImGuiRender()
             {
                 ImGui::Indent();
 
-                bool widener = m_RangeWidenerEnabled;
-                if (ImGui::Checkbox("Widen acceptance ranges (at fit-test time)", &widener))
+                if (!m_LegacyMode)
                 {
-                    m_RangeWidenerEnabled = widener;
-                    SaveSettings();
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Applied from inside the swapped type-52 fit-test slot,\n"
-                                      "strictly after the game wrote its vanilla ranges (fancy 0x64)\n"
-                                      "and before the per-type test consumes them. Only ever loosens\n"
-                                      "vanilla ranges. Requires the fit-test slot swap to be active.");
+                    bool widener = m_RangeWidenerEnabled;
+                    if (ImGui::Checkbox("Widen acceptance ranges (at fit-test time)", &widener))
+                    {
+                        m_RangeWidenerEnabled = widener;
+                        SaveSettings();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Applied from inside the swapped type-52 fit-test slot,\n"
+                                          "strictly after the game wrote its vanilla ranges (fancy 0x64)\n"
+                                          "and before the per-type test consumes them. Only ever loosens\n"
+                                          "vanilla ranges. Requires the fit-test slot swap to be active.");
 
-                bool skipFit = m_SkipFitTestEnabled;
-                if (ImGui::Checkbox("Override wall-context fit test", &skipFit))
-                {
-                    m_SkipFitTestEnabled = skipFit;
-                    SaveSettings();
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Forces the per-type fit-test verdict (fancy 0x4A ->\n"
-                                      "0x1401B5700 quick-check chain) to 'fits' for type-52 actions\n"
-                                      "only. This is what makes the move work on walls WITH handholds.");
+                    bool skipFit = m_SkipFitTestEnabled;
+                    if (ImGui::Checkbox("Override wall-context fit test", &skipFit))
+                    {
+                        m_SkipFitTestEnabled = skipFit;
+                        SaveSettings();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Forces the per-type fit-test verdict (fancy 0x4A ->\n"
+                                          "0x1401B5700 quick-check chain) to 'fits' for type-52 actions\n"
+                                          "only. This is what makes the move work on walls WITH handholds.");
 
-                bool singleStageChk = m_SingleStageMode;
-                if (ImGui::Checkbox("Single-stage mode (ForcedSidehop-style)", &singleStageChk))
-                {
-                    m_SingleStageMode = singleStageChk;
-                    SaveSettings();
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("When enabled: disables all injection hooks (creation, widener, fit-override, cycle-swap) and uses only GPH like ForcedSidehopPlugin.");
+                    bool singleStageChk = m_SingleStageMode;
+                    if (ImGui::Checkbox("Single-stage mode (ForcedSidehop-style)", &singleStageChk))
+                    {
+                        m_SingleStageMode = singleStageChk;
+                        SaveSettings();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("When enabled: disables all injection hooks (creation, widener, fit-override, cycle-swap) and uses only GPH like ForcedSidehopPlugin.");
 
-                bool vtableSwap = m_VtableSwapEnabled;
-                if (ImGui::Checkbox("Cycle-start tester vtable swap (experimental)", &vtableSwap))
-                {
-                    m_VtableSwapEnabled = vtableSwap;
-                    SaveSettings();
+                    bool vtableSwap = m_VtableSwapEnabled;
+                    if (ImGui::Checkbox("Cycle-start tester vtable swap (experimental)", &vtableSwap))
+                    {
+                        m_VtableSwapEnabled = vtableSwap;
+                        SaveSettings();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("ACUFixes/ACU_ParkourPatches pattern: swap the climbFacadeTester\n"
+                                          "fancy vtable at walling/failed-wallrun cycle start while the key\n"
+                                          "is held, so more move types get scanned on walls.");
                 }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("ACUFixes/ACU_ParkourPatches pattern: swap the climbFacadeTester\n"
-                                      "fancy vtable at walling/failed-wallrun cycle start while the key\n"
-                                      "is held, so more move types get scanned on walls.");
+                else
+                {
+                    // The old build's checkbox, with the old build's meaning and
+                    // its old default (off). Kept on a separate flag so it cannot
+                    // be confused with the cycle-start swap above.
+                    bool legacyVtableSwap = m_LegacyVtableSwapEnabled;
+                    if (ImGui::Checkbox("Vtable swap (experimental, crash risk)##legacy", &legacyVtableSwap))
+                    {
+                        m_LegacyVtableSwapEnabled = legacyVtableSwap;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Old build: swap a type-53 action's fancy vtable to type 52\n"
+                                          "at creation time. Off by default, exactly as in the old build.\n"
+                                          "Session-only (not written to the INI).");
+                }
 
                 ImGui::Text("Lift height:");
                 ImGui::SameLine();
@@ -1093,32 +1431,50 @@ void FailedWallRunPlugin::OnImGuiRender()
             if (isActive)
             {
                 ImGui::Separator();
-                ImGui::TextColored(debugColor, "Stats (last scan cycle):");
-                ImGui::Text("  Type-52 in list: %d | Sabotaged competitors: %d",
-                    m_LastAction52Count,
-                    m_LastSabotagedCount);
-                ImGui::Text("  Range widenings: %d | Fit-test overrides: %d",
-                    g_WidenCount, g_FitOverrideCount);
-                ImGui::Text("  Kept/converted at creation: %d",
-                    g_CreationOverrideCount);
-                if (s_Type52FancyVTable == 0)
-                    ImGui::TextColored(ImVec4(1, 1, 0, 1),
-                        "  (capturing type-52 vtable... approach any wall once)");
-                ImGui::Text("  Hooks: creation %s | fit-override %s | vtable-swap %s",
-                    m_CreatorHookActive ? "ON" : "off",
-                    m_FitTestHookActive ? "ON" : "off",
-                    m_VTableSwapHookActive ? "ON" : "off");
-                bool sitesOk = m_CreatorSiteOk && m_FitTestSlotOk && m_SwapSitesOk;
-                ImGui::Text("  Site checks (vanilla bytes): %s",
-                    sitesOk ? "OK" : "MISMATCH — a hook site was modified by something else;"
-                                      " affected layer refused to install");
-                if (!sitesOk)
+                if (m_LegacyMode)
                 {
-                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f),
-                        "    creation:%s fit-slot:%s swap:%s",
-                        m_CreatorSiteOk ? "ok" : "MODIFIED",
-                        m_FitTestSlotOk ? "ok" : "MODIFIED",
-                        m_SwapSitesOk ? "ok" : "MODIFIED");
+                    ImGui::TextColored(debugColor, "Stats (legacy):");
+                    ImGui::Text("  Action 52 found: %d | Sabotaged: %d | Selected: %s",
+                        m_LastAction52Count,
+                        m_LastSabotagedCount,
+                        m_LastForceSelectSucceeded ? "YES" : "NO");
+                    ImGui::Text("  Lift height: %.1fm | Speed: %.1f | Rise: %.1fm",
+                        m_LiftAmount,
+                        m_LiftSpeed,
+                        m_LastForceSelectSucceeded ? m_LiftAmount : 0.0f);
+                    if (s_LegacyType52FancyVTable == 0)
+                        ImGui::TextColored(ImVec4(1,1,0,1),
+                            "  (capturing type 52 vtable... approach a wall)");
+                }
+                else
+                {
+                    ImGui::TextColored(debugColor, "Stats (last scan cycle):");
+                    ImGui::Text("  Type-52 in list: %d | Sabotaged competitors: %d",
+                        m_LastAction52Count,
+                        m_LastSabotagedCount);
+                    ImGui::Text("  Range widenings: %d | Fit-test overrides: %d",
+                        g_WidenCount, g_FitOverrideCount);
+                    ImGui::Text("  Kept/converted at creation: %d",
+                        g_CreationOverrideCount);
+                    if (s_Type52FancyVTable == 0)
+                        ImGui::TextColored(ImVec4(1, 1, 0, 1),
+                            "  (capturing type-52 vtable... approach any wall once)");
+                    ImGui::Text("  Hooks: creation %s | fit-override %s | vtable-swap %s",
+                        m_CreatorHookActive ? "ON" : "off",
+                        m_FitTestHookActive ? "ON" : "off",
+                        m_VTableSwapHookActive ? "ON" : "off");
+                    bool sitesOk = m_CreatorSiteOk && m_FitTestSlotOk && m_SwapSitesOk;
+                    ImGui::Text("  Site checks (vanilla bytes): %s",
+                        sitesOk ? "OK" : "MISMATCH — a hook site was modified by something else;"
+                                          " affected layer refused to install");
+                    if (!sitesOk)
+                    {
+                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f),
+                            "    creation:%s fit-slot:%s swap:%s",
+                            m_CreatorSiteOk ? "ok" : "MODIFIED",
+                            m_FitTestSlotOk ? "ok" : "MODIFIED",
+                            m_SwapSitesOk ? "ok" : "MODIFIED");
+                    }
                 }
             }
 
