@@ -182,6 +182,44 @@ static bool IsType52Safe(const AvailableParkourAction* action)
     return GetTypeIntSafe(action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
 }
 
+// ── ACUFixes-style action enforcer ───────────────────────────────────────────
+// This is the mechanism ACUFixes' "ParkourDebug_EnforceMove" uses: inside
+// ChooseAfterSorting, scan the sorted candidate array for the EXACT enforced
+// action type and return that action; the dispatcher then force-selects its
+// index. It does not touch fitness, ranges, or the action itself.
+//
+// The important part is "exact": the previous single-pass check here accepted
+// 52 OR 53 and returned whichever appeared first in the fitness-sorted array.
+// The normal wallrun-up (53, fancy vtable 0x143A58280) almost always sorts
+// above the failed wallrun (52, 0x143A522F0), so the plugin was returning 53 —
+// i.e. it played the normal wallrun-up while claiming to enforce 52.
+//
+// Two passes: the preferred type (52) first, then the fallback (53) only when
+// no 52 exists at all (the beam/rope conversion case the old build wanted).
+// `safeReads` selects GetTypeIntSafe (current mode) vs the old build's literal
+// GetEnumParkourAction() (legacy/timer ports, crash exposure preserved).
+static AvailableParkourAction* FindEnforcedAction(
+    SmallArray<AvailableParkourAction*>& actions,
+    int preferredType,
+    int fallbackType,
+    bool safeReads)
+{
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const int want = (pass == 0) ? preferredType : fallbackType;
+        if (want < 0) continue;
+        for (int i = 0; i < (int)actions.size; ++i)
+        {
+            AvailableParkourAction* action = actions[i];
+            if (!action) continue;
+            const int t = safeReads ? GetTypeIntSafe(action)
+                                    : (int)action->GetEnumParkourAction();
+            if (t == want) return action;
+        }
+    }
+    return nullptr;
+}
+
 // ── Guard flag + cached settings for the static hooks ─────────────────────────
 static volatile bool g_ShouldCreateFailedWallrun = false;
 // Selected implementation (FailedWallRunPlugin::kImpl*). Read by the static
@@ -769,8 +807,14 @@ AvailableParkourAction* FailedWallRunPlugin::ChooseBeforeFiltering(SmallArray<Av
         AvailableParkourAction* action = actions[i];
         if (!action) continue;
         if (IsType52Safe(action))
+        {
+            m_LastSelectedType = (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
+            m_LastSelectedVTable = (uint64)action->fancyVTable;
             return action;
+        }
     }
+    m_LastSelectedType = -1;
+    m_LastSelectedVTable = 0;
     return nullptr;
 }
 
@@ -779,17 +823,21 @@ AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting(SmallArray<Avail
     if (m_SingleStageMode) return selectedByGame;
 
     if (!IsFeatureActive() || !m_EnforceEnabled) return selectedByGame;
-    for (int i = 0; i < (int)actions.size; ++i)
+
+    // ACUFixes ParkourDebug_EnforceMove mechanism: exact type match, 52 first.
+    AvailableParkourAction* chosen = FindEnforcedAction(
+        actions,
+        (int)EnumParkourAction::wallrunUpFromGroundFailed_mb,
+        (int)EnumParkourAction::wallrunUpFromGround_mb,
+        /*safeReads=*/true);
+    if (chosen)
     {
-        AvailableParkourAction* action = actions[i];
-        if (!action) continue;
-        // 52 = failed wallrun; 53 = normal wallrun-up kept as a defensive
-        // fallback (post-conversion actions read as 52 anyway).
-        const int t = GetTypeIntSafe(action);
-        if (t == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb
-            || t == (int)EnumParkourAction::wallrunUpFromGround_mb)
-            return action;
+        m_LastSelectedType = GetTypeIntSafe(chosen);
+        m_LastSelectedVTable = (uint64)chosen->fancyVTable;
+        return chosen;
     }
+    m_LastSelectedType = -1;
+    m_LastSelectedVTable = 0;
     return nullptr;
 }
 
@@ -913,25 +961,27 @@ AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting_Legacy(SmallArra
 {
     if (!IsFeatureActive() || !m_EnforceEnabled) return selectedByGame;
 
-    for (int i = 0; i < actions.size; ++i)
+    // Exact-type enforcer (ACUFixes mechanism): 52 first, 53 only as the old
+    // build's beam fallback. Literal type reads kept for fidelity.
+    AvailableParkourAction* action = FindEnforcedAction(actions, 52, 53, /*safeReads=*/false);
+    if (action)
     {
-        AvailableParkourAction* action = actions[i];
-        if (!action) continue;
         int t = (int)action->GetEnumParkourAction();
-        if (t == 52 || t == 53)
-        {
-            float liftAmount = m_LiftAmount;
-            if (t == 53)
-                liftAmount += 0.5f;
+        float liftAmount = m_LiftAmount;
+        if (t == 53)
+            liftAmount += 0.5f;
 
-            m_LastForceSelectSucceeded = true;
-            if (Entity* player = ACU::GetPlayer())
-                player->GetPosition().z += liftAmount;
-            return action;
-        }
+        m_LastForceSelectSucceeded = true;
+        m_LastSelectedType = t;
+        m_LastSelectedVTable = (uint64)action->fancyVTable;
+        if (Entity* player = ACU::GetPlayer())
+            player->GetPosition().z += liftAmount;
+        return action;
     }
 
     m_LastForceSelectSucceeded = false;
+    m_LastSelectedType = -1;
+    m_LastSelectedVTable = 0;
     return selectedByGame;
 }
 
@@ -1059,30 +1109,31 @@ AvailableParkourAction* FailedWallRunPlugin::ChooseAfterSorting_Timer(SmallArray
 {
     if (!IsFeatureActive() || !m_EnforceEnabled) return selectedByGame;
 
-    for (int i = 0; i < actions.size; ++i)
+    // Exact-type enforcer (ACUFixes mechanism): 52 first, 53 only as fallback.
+    AvailableParkourAction* action = FindEnforcedAction(actions, 52, 53, /*safeReads=*/false);
+    if (action)
     {
-        AvailableParkourAction* action = actions[i];
-        if (!action) continue;
         int t = (int)action->GetEnumParkourAction();
-        if (t == 52 || t == 53)
-        {
-            float liftAmount = m_LiftAmount;
-            if (t == 53)
-                liftAmount += 0.5f;
+        float liftAmount = m_LiftAmount;
+        if (t == 53)
+            liftAmount += 0.5f;
 
-            m_LastForceSelectSucceeded = true;
-            m_LiftTimerFrames = m_LiftDurationFrames;
-            if (Entity* player = ACU::GetPlayer())
-            {
-                m_LiftTargetZ = player->GetPosition().z + liftAmount;
-                Vector3f& dest = (Vector3f&)action->locationAnchorDest;
-                dest.z = m_LiftTargetZ;
-            }
-            return action;
+        m_LastForceSelectSucceeded = true;
+        m_LastSelectedType = t;
+        m_LastSelectedVTable = (uint64)action->fancyVTable;
+        m_LiftTimerFrames = m_LiftDurationFrames;
+        if (Entity* player = ACU::GetPlayer())
+        {
+            m_LiftTargetZ = player->GetPosition().z + liftAmount;
+            Vector3f& dest = (Vector3f&)action->locationAnchorDest;
+            dest.z = m_LiftTargetZ;
         }
+        return action;
     }
 
     m_LastForceSelectSucceeded = false;
+    m_LastSelectedType = -1;
+    m_LastSelectedVTable = 0;
     return selectedByGame;
 }
 
@@ -1648,6 +1699,20 @@ void FailedWallRunPlugin::OnImGuiRender()
             if (isActive)
             {
                 ImGui::Separator();
+                // Ground truth: the fancy vtable of the action we actually
+                // force-selected. 52 = 0x143A522F0, 53 = 0x143A58280.
+                if (m_LastSelectedType == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+                    ImGui::TextColored(activeColor,
+                        "Selected: type 52 failed wallrun | vtable 0x%llX",
+                        (unsigned long long)m_LastSelectedVTable);
+                else if (m_LastSelectedType < 0)
+                    ImGui::TextColored(debugColor,
+                        "Selected: none this cycle");
+                else
+                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                        "Selected: type %d | vtable 0x%llX  <-- NOT the failed wallrun",
+                        (int)m_LastSelectedType, (unsigned long long)m_LastSelectedVTable);
+
                 if (m_ImplMode == kImplLegacy)
                 {
                     ImGui::TextColored(debugColor, "Stats (legacy):");

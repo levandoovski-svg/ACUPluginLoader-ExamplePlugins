@@ -190,4 +190,10 @@ private:
     // Debug stats (written from the game thread, read by the UI).
     int m_LastAction52Count = 0;
     int m_LastSabotagedCount = 0;
+
+    // Diagnostic: what the plugin actually force-selected last cycle. This is
+    // the ground truth that matters — the fancy vtable *is* the move. 52 =
+    // 0x143A522F0 (failed wallrun), 53 = 0x143A58280 (normal wallrun-up).
+    volatile int m_LastSelectedType = -1;
+    volatile uint64 m_LastSelectedVTable = 0;
 };
