@@ -9,11 +9,12 @@
 
 class AvailableParkourAction;
 
-// Single-purpose plugin: while the hotkey is ACTIVE, force the failed wallrun
-// (wallrunUpFromGroundFailed_mb / type 52) instead of wallrunUpFromGround_mb
-// (type 53), regardless of the "no handholds in reach" context:
-//   creation: convert 53 -> 52 right after construction (vtable swap at +0x8)
-//             and keep it alive despite the InitialTestIfActionFits reject
+// Single-purpose plugin: while the hotkey is ACTIVE, favor the freeform
+// wallrun (wallrunUpFromGroundFailed_mb / type 52) over the normal wallrun
+// (type 53) and wallrun-to-overhang — the proven CheatEngine approach: BOOST
+// the natural 52's weight, KEEP it alive at creation, and FORCE-SELECT it.
+// No vtable swapping: a converted 53 runs with 53-computed trajectory data
+// and behaves unpredictably.
 //   weights:  boost type-52 totalWeight so it wins the sort
 //   select:   force-select the (best) type-52 after sorting
 class FancyVTableSwapPlugin
@@ -31,10 +32,9 @@ public:
     AvailableParkourAction* ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions);
 
     // Enforce-52 stages:
-    // 0 post-construct: convert 53 -> 52 before any type-specific creation call.
-    void OnPostConstruct(AvailableParkourAction& action);
-    // 1 creation-discard override: keep (already-converted) 52 alive despite
-    // the vanilla "InitialTestIfActionFits" reject.
+    // 1 creation-discard override: keep naturally-created 52s alive despite
+    // the vanilla "InitialTestIfActionFits" reject. No vtable swapping: the
+    // freeform wallrun must use the 52 the game created itself.
     bool OnCreationDiscardOverride(AvailableParkourAction& action);
     // 3 force-select: return the best type-52 in the sorted array (prefer one
     // that passed both final filters; the game's own pick is ignored while
@@ -73,7 +73,7 @@ private:
     bool m_ChooseFired = false;
 
     // Enforce-52 counters (UI-only).
-    int m_EnforceConverted = 0;      // cumulative 53->52 conversions
+    int m_EnforceKeptAlive = 0;      // cumulative native 52s kept alive
     int m_EnforceLastSelectedType = -1;
     uint64 m_EnforceLastSelectedVTable = 0;
 };

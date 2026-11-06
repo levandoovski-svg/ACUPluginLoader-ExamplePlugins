@@ -48,9 +48,6 @@ FancyVTableSwapPlugin::FancyVTableSwapPlugin()
     m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool {
         return static_cast<FancyVTableSwapPlugin*>(userData)->OnCreationDiscardOverride(action);
     };
-    m_Callbacks.PostConstruct_fnp = [](void* userData, AvailableParkourAction& action) -> void {
-        static_cast<FancyVTableSwapPlugin*>(userData)->OnPostConstruct(action);
-    };
     // Priority before ACUFixes' enforcer (10000).
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 4.0f;
@@ -146,31 +143,21 @@ AvailableParkourAction* FancyVTableSwapPlugin::ChooseBeforeFiltering(SmallArray<
     return nullptr; // diagnostics only; never force-select
 }
 
-// Enforce-52 stage 0 (post-construct): while armed, convert every created
-// wallrunUpFromGround_mb (53) into wallrunUpFromGroundFailed_mb (52) RIGHT
-// AFTER construction, so all following creation steps (Set2Floats, InitialTest,
-// fitness) run with the 52 table. Converting only after the initial test
-// crashed: type-52 functions walked type-53-initialized data.
-void FancyVTableSwapPlugin::OnPostConstruct(AvailableParkourAction& action)
-{
-    s_EnforceActive = m_Enabled && IsActive();
-    if (!s_EnforceActive) return;
-    if (GetTypeIntSafe(&action) != (int)EnumParkourAction::wallrunUpFromGround_mb) return;
-    // The swap: one pointer write at +0x8, targeting the verified type-52
-    // runtime table (same constants as FailedWallRunPlugin.cpp — 0x143A522F0).
-    action.fancyVTable = (ParkourAction_FancyVTable*)k_Type52FancyVTable_Runtime;
-    std::lock_guard lk(m_Mutex);
-    ++m_EnforceConverted;
-}
-
-// Enforce-52 stage 1 (discard override): keep every (now or naturally) type-52
-// alive even when the vanilla verdict rejects it — the "no handholds in
-// reach" context is exactly what this override waives on handhold walls.
+// Enforce-52 stage 1 (discard override): keep natural type-52s alive even
+// when the vanilla verdict rejects them — on handhold walls the freeform
+// wallrun gets discarded here, which is exactly what we waive. NO vtable
+// swapping: a converted 53 runs with 53-computed trajectory data and behaves
+// unpredictably (unexplained height, ground clipping). The freeform wallrun
+// must be the one the game created itself, like the proven CheatEngine
+// approach: fitness boost + keep-alive + selection, never a type rewrite.
 bool FancyVTableSwapPlugin::OnCreationDiscardOverride(AvailableParkourAction& action)
 {
     s_EnforceActive = m_Enabled && IsActive();
     if (!s_EnforceActive) return false;
-    return GetTypeIntSafe(&action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
+    if (GetTypeIntSafe(&action) != (int)EnumParkourAction::wallrunUpFromGroundFailed_mb) return false;
+    std::lock_guard lk(m_Mutex);
+    ++m_EnforceKeptAlive;
+    return true;
 }
 
 // Enforce-52 stage 3 (force-select): prefer a type-52 that passed both final
@@ -278,7 +265,7 @@ void FancyVTableSwapPlugin::OnImGuiRender()
     if (m_WaitingForKey) ImGui::Text("Press any key...");
 
     ImGui::Separator();
-    ImGui::Text("Converted 53->52: %d this session", m_EnforceConverted);
+    ImGui::Text("Native 52s kept alive: %d this session", m_EnforceKeptAlive);
     if (m_EnforceLastSelectedType == 52)
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "  Last sort: selected type 52 (vtable 0x%llX)",
             (unsigned long long)m_EnforceLastSelectedVTable);
@@ -336,7 +323,7 @@ void FancyVTableSwapPlugin::OnImGuiRender()
     {
         ImGui::Text("No parkour cycle seen yet — with you on a wall this means the scanner hooks aren't logging. Confirm game version is 1.5.0.");
     }
-    ImGui::TextWrapped("Hold/toggle the hotkey while running at any wall: the ordinary wallrun-up (53) is "
-        "converted into the failed wallrun (52) and forced through selection. "
-        "Tables must be the same 0x78-entry size — the fixed 52/53 pair is verified for ACU 1.5.0.");
+    ImGui::TextWrapped("Hold/toggle the hotkey while running at any wall: naturally-created freeform wallrun (52) "
+        "candidates are kept alive and weight-boosted, then forced through selection over the normal "
+        "wallrun-up (53) and wallrun-to-overhang. No vtable swapping — the move keeps its own data.");
 }
