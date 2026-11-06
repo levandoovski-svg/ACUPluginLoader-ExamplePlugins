@@ -60,6 +60,12 @@ struct ParkourCallbacks
     //                   rejected it (the callback may have mutated it in place);
     //   return false -> no override, vanilla discard verdict stands.
     bool (*OverrideCreationDiscard_fnp)(void* userData, AvailableParkourAction& action) = nullptr;
+    // Invoked by the creation replacements immediately after construction but
+    // BEFORE any type-specific creation calls (Set2FloatsAfterCreation,
+    // InitialTestIfActionFits). Callbacks may swap action.fancyVTable here so
+    // every later creation step runs with the FINAL table. (Project-local
+    // addition, like OverrideCreationDiscard_fnp above.)
+    void (*PostConstruct_fnp)(void* userData, AvailableParkourAction& newAction) = nullptr;
     void* m_UserData = nullptr;
     float m_CallbackPriority;
     const char* m_Name = nullptr;

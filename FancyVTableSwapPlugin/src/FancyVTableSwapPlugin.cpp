@@ -40,6 +40,10 @@ FancyVTableSwapPlugin::FancyVTableSwapPlugin()
     m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool {
         return static_cast<FancyVTableSwapPlugin*>(userData)->OnCreationDiscardOverride(action);
     };
+    // Convert 53->52 right after construction, before type-specific setup.
+    m_Callbacks.PostConstruct_fnp = [](void* userData, AvailableParkourAction& action) -> void {
+        static_cast<FancyVTableSwapPlugin*>(userData)->OnPostConstruct(action);
+    };
     m_Callbacks.m_UserData = this;
     // Priority before ACUFixes' enforcer (10000) so swaps happen before any
     // force-selection reads the enum/fitness from the new table.
@@ -136,33 +140,35 @@ bool FancyVTableSwapPlugin::IsActive() const
     return m_ToggleState;
 }
 
-// Enforce-52 stage 1 (creation): while armed, convert every created
-// wallrunUpFromGround_mb (53) into wallrunUpFromGroundFailed_mb (52) and keep
-// it alive even when the vanilla InitialTestIfActionFits rejects it — the
-// "no-handholds-in-range" context is exactly what this override waives.
-// shortcut: return true unconditionally for 52/53 while armed (keeps also
+// Enforce-52 stage 0 (post-construct): while armed, convert every created
+// wallrunUpFromGround_mb (53) into wallrunUpFromGroundFailed_mb (52) RIGHT
+// AFTER construction, so all following creation steps (Set2Floats, InitialTest,
+// fitness) run with the 52 table. Converting only after the initial test
+// crashed: type-52 functions walked type-53-initialized data.
+void FancyVTableSwapPlugin::OnPostConstruct(AvailableParkourAction& action)
+{
+    s_EnforceActive = m_Enabled && m_Enforce52 && IsActive();
+    if (!s_EnforceActive) return;
+    if (GetTypeIntSafe(&action) != (int)EnumParkourAction::wallrunUpFromGround_mb) return;
+    // Same one-pointer write as the generic swap, targeting the verified
+    // type-52 runtime table (same constants as FailedWallRunPlugin.cpp
+    // uses — 0x143A522F0, 1.5.0).
+    action.fancyVTable = (ParkourAction_FancyVTable*)k_Type52FancyVTable_Runtime;
+    std::lock_guard lk(m_Mutex);
+    ++m_EnforceConvertedThisCycle;
+}
+
+// Enforce-52 stage 1 (discard override): after the initial test, keep every
+// already-converted (or naturally created) type-52 even when the vanilla
+// verdict rejects it — the "no-handholds-in-range" context is exactly what
+// this override waives on handhold walls.
+// shortcut: return true unconditionally for 52 while armed (keeps also
 // already-fitting 52s — harmless, they'd be kept anyway).
 bool FancyVTableSwapPlugin::OnCreationDiscardOverride(AvailableParkourAction& action)
 {
     s_EnforceActive = m_Enabled && m_Enforce52 && IsActive();
     if (!s_EnforceActive) return false;
-    const int type = GetTypeIntSafe(&action);
-    if (type == (int)EnumParkourAction::wallrunUpFromGround_mb)
-    {
-        // Same one-pointer write as the generic swap, targeting the verified
-        // type-52 runtime table (same constants as FailedWallRunPlugin.cpp
-        // uses — 0x143A522F0, 1.5.0).
-        action.fancyVTable = (ParkourAction_FancyVTable*)k_Type52FancyVTable_Runtime;
-        {
-            std::lock_guard lk(m_Mutex);
-            ++m_EnforceConvertedThisCycle;
-        }
-    }
-    else if (type != (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
-    {
-        return false; // unrelated move: vanilla verdict
-    }
-    return true;
+    return GetTypeIntSafe(&action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
 }
 
 // Enforce-52 stage 3 (force-select): first type-52 in the sorted array wins;

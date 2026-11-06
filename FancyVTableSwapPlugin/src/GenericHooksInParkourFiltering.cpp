@@ -82,6 +82,16 @@ static void RunCreationDiscardOverrides(AvailableParkourAction& newAction, bool&
     }
 }
 
+static void RunPostConstruct(AvailableParkourAction& newAction)
+{
+    auto& allParkourCallbacks = GenericHooksInParkourFiltering::GetSingleton()->m_Callbacks;
+    for (ParkourCallbacks* parkourCallbacks : allParkourCallbacks)
+    {
+        if (!parkourCallbacks->PostConstruct_fnp) continue;
+        parkourCallbacks->PostConstruct_fnp(parkourCallbacks->m_UserData, newAction);
+    }
+}
+
 bool CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement(
     EnumParkourAction actionType,
     __m128* p_locationOfOrigin,
@@ -97,6 +107,10 @@ bool CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement(
     AvailableParkourAction* newAction = ConstructParkourAction_A(actionType, p_locationOfOrigin, a3, p_directionOfMovementInputWorldSpace, a6, a7, (uint64)a8, p_previousAction_mb);
     *p_newAction_out = newAction;
     if (!newAction) return false;
+    // ENFORCE-52: swap the table BEFORE any type-specific creation call, so
+    // Set2Floats/InitialTest/fitness all run with the final table. Converting
+    // only afterwards crashed (type-52 fns walked type-53-initialized data).
+    RunPostConstruct(*newAction);
     if (p_player)
         AvailableParkourAction__InitializePlayerRef(&newAction->playerRef, p_player);
     GET_AND_CAST_FANCY_FUNC(*newAction, ParkourActionKnownFancyVFuncs::Set2FloatsAfterCreation)(newAction, a12, p_epsilon_mb);
@@ -141,6 +155,8 @@ bool CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement(
     AvailableParkourAction* newAction = ConstructParkourAction_B(actionType, p_locationOfOrigin, a3, p_directionOfMovementInputWorldSpace, a6, a7, a8, a9, p_player, p_previousAction_mb);
     *p_newAction_out = newAction;
     if (!newAction) return false;
+    // ENFORCE-52: swap before type-specific setup (same reasoning as above).
+    RunPostConstruct(*newAction);
     if (p_player)
         AvailableParkourAction__InitializePlayerRef(&newAction->playerRef, p_player);
     GET_AND_CAST_FANCY_FUNC(*newAction, ParkourActionKnownFancyVFuncs::Set2FloatsAfterCreation)(newAction, a13, p_epsilon_mb);

@@ -44,9 +44,11 @@ private:
     void ApplyHexInputs();
     // Press mode: scan the latest logged parkour cycle and swap/revert now.
     void PressSwapNow();
-    // Creation-stage: convert wallrunUpFromGround_mb (53) to the failed 52
-    // table and keep it alive, overriding the discard verdict (the "context"
-    // of a no-handhold wall is irrelevant while this is armed).
+    // Enforce-52 (failed wallrun) stages:
+    // 0 post-construct: convert 53 -> 52 before any type-specific creation call.
+    void OnPostConstruct(AvailableParkourAction& action);
+    // 1 creation-discard override: keep (already-converted) 52 alive despite the
+    // vanilla "InitialTestIfActionFits" reject.
     bool OnCreationDiscardOverride(AvailableParkourAction& action);
     // Force-select: return the first type-52 in the sorted array (the game's
     // own pick is ignored while armed).
