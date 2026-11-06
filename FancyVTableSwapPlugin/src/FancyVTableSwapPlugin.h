@@ -36,18 +36,25 @@ public:
     };
 
 private:
+    enum { Mode_Press = 0, Mode_Hold = 1, Mode_Toggle = 2 };
+
     bool IsActive() const;
     void LoadSettings();
     void SaveSettings() const;
     void ApplyHexInputs();
+    // Press mode: scan the latest logged parkour cycle and swap/revert now.
+    void PressSwapNow();
 
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_Activator;
+    // Creation-stage hooks so our ParkourLog port sees every created action
+    // (same wiring ACUFixes' parkour debugger uses).
+    std::shared_ptr<SharedHookActivator> m_ActivatorCreation;
 
     // Config (persisted to INI)
     bool m_Enabled = true;
     int m_Hotkey = 0x77; // F8
-    bool m_HoldMode = true;
+    int m_SwapMode = Mode_Hold;
     bool m_ToggleState = false;
     bool m_WaitingForKey = false;
     uint64 m_SourceVTable = 0; // 0 = match by type only (when type filter set)
@@ -65,4 +72,12 @@ private:
     std::vector<DiscoveredVTable> m_Discovered;
     int m_LastActionsSeen = 0;
     int m_LastSwapped = 0;
+    bool m_ChooseFired = false;
+
+    // Press-mode state (guarded by m_Mutex; written from OnUpdate thread).
+    struct LiveSwap { AvailableParkourAction* ptr; uint64 origVTable; };
+    std::vector<LiveSwap> m_PressSwapsOn;
+    bool m_PressIsOn = false;
+    int m_PressLastMatched = 0;
+    int m_PressLastSwapped = 0;
 };
