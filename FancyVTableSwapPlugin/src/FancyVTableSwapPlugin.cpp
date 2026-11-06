@@ -19,16 +19,30 @@ static std::string GetIniPath()
     return "FancyVTableSwapPlugin.ini";
 }
 
+// Static enforcer flag consulted by the ParkourLog weights hook. Set on the
+// game thread once per cycle-frame; a torn read would at most flip one cycle.
+static bool s_EnforceActive = false;
+bool FVTS_IsEnforcing()
+{
+    return s_EnforceActive;
+}
+
 FancyVTableSwapPlugin::FancyVTableSwapPlugin()
 {
     m_Callbacks.ChooseBeforeFiltering_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions) -> AvailableParkourAction* {
         return static_cast<FancyVTableSwapPlugin*>(userData)->ChooseBeforeFiltering(actions);
     };
-    // Single-purpose plugin: no ChooseAfterSorting force-select, so leave it null.
+    // Force-select for the failed-wallrun enforcer.
+    m_Callbacks.ChooseAfterSorting_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame) -> AvailableParkourAction* {
+        return static_cast<FancyVTableSwapPlugin*>(userData)->ChooseAfterSorting(actions, selectedByGame);
+    };
+    // Keep-alive + 53->52 conversion at creation (failed-wallrun enforcer).
+    m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool {
+        return static_cast<FancyVTableSwapPlugin*>(userData)->OnCreationDiscardOverride(action);
+    };
+    m_Callbacks.m_UserData = this;
     // Priority before ACUFixes' enforcer (10000) so swaps happen before any
     // force-selection reads the enum/fitness from the new table.
-    m_Callbacks.ChooseAfterSorting_fnp = nullptr;
-    m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 4.0f;
     m_Callbacks.m_Name = "FancyVTableSwapPlugin_Swap";
     LoadSettings();
@@ -122,6 +136,61 @@ bool FancyVTableSwapPlugin::IsActive() const
     return m_ToggleState;
 }
 
+// Enforce-52 stage 1 (creation): while armed, convert every created
+// wallrunUpFromGround_mb (53) into wallrunUpFromGroundFailed_mb (52) and keep
+// it alive even when the vanilla InitialTestIfActionFits rejects it — the
+// "no-handholds-in-range" context is exactly what this override waives.
+// shortcut: return true unconditionally for 52/53 while armed (keeps also
+// already-fitting 52s — harmless, they'd be kept anyway).
+bool FancyVTableSwapPlugin::OnCreationDiscardOverride(AvailableParkourAction& action)
+{
+    s_EnforceActive = m_Enabled && m_Enforce52 && IsActive();
+    if (!s_EnforceActive) return false;
+    const int type = GetTypeIntSafe(&action);
+    if (type == (int)EnumParkourAction::wallrunUpFromGround_mb)
+    {
+        // Same one-pointer write as the generic swap, targeting the verified
+        // type-52 runtime table (same constants as FailedWallRunPlugin.cpp
+        // uses — 0x143A522F0, 1.5.0).
+        action.fancyVTable = (ParkourAction_FancyVTable*)k_Type52FancyVTable_Runtime;
+        {
+            std::lock_guard lk(m_Mutex);
+            ++m_EnforceConvertedThisCycle;
+        }
+    }
+    else if (type != (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+    {
+        return false; // unrelated move: vanilla verdict
+    }
+    return true;
+}
+
+// Enforce-52 stage 3 (force-select): first type-52 in the sorted array wins;
+// stages 2 (weight boost, in ParkourLog weights logging) guarantees one
+// survives the "fitness too low" removal even on handhold walls.
+AvailableParkourAction* FancyVTableSwapPlugin::ChooseAfterSorting(
+    SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
+{
+    (void)selectedByGame;
+    s_EnforceActive = m_Enabled && m_Enforce52 && IsActive();
+    if (!s_EnforceActive) return nullptr;
+    for (AvailableParkourAction* action : actions)
+    {
+        if (!action) continue;
+        if (GetTypeIntSafe(action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+        {
+            std::lock_guard lk(m_Mutex);
+            m_EnforceLastSelectedType = 52;
+            m_EnforceLastSelectedVTable = (uint64)action->fancyVTable;
+            return action;
+        }
+    }
+    std::lock_guard lk(m_Mutex);
+    m_EnforceLastSelectedType = -1;
+    m_EnforceLastSelectedVTable = 0;
+    return nullptr;
+}
+
 void FancyVTableSwapPlugin::LoadSettings()
 {
     std::ifstream file(GetIniPath());
@@ -147,6 +216,8 @@ void FancyVTableSwapPlugin::LoadSettings()
                 try { m_DestVTable = std::stoull(line.substr(11), nullptr, 0); } catch (...) {}
             else if (line.rfind("TypeFilter=", 0) == 0)
                 try { m_TypeFilter = std::stoi(line.substr(11)); } catch (...) {}
+            else if (line.rfind("Enforce52=", 0) == 0)
+                m_Enforce52 = (line.substr(10) == "1");
         }
         catch (...) {}
     }
@@ -168,6 +239,7 @@ void FancyVTableSwapPlugin::SaveSettings() const
             file << "SourceVTable=" << std::hex << m_SourceVTable << std::dec << "\n";
             file << "DestVTable=" << std::hex << m_DestVTable << std::dec << "\n";
             file << "TypeFilter=" << m_TypeFilter << "\n";
+            file << "Enforce52=" << (m_Enforce52 ? 1 : 0) << "\n";
         }
     } catch (...) {}
 }
@@ -396,6 +468,26 @@ void FancyVTableSwapPlugin::OnImGuiRender()
     {
         ImGui::Text("No parkour cycle seen yet — with you on a wall this means the scanner hooks aren't logging. Confirm game version is 1.5.0.");
     }
+    ImGui::Separator();
+
+    // Failed-wallrun enforcer: hotkey-active -> created type 53 becomes type
+    // 52, kept alive despite the discard, boosted to win the sort, and
+    // force-selected. The one-goal path the generic rule can't reach, because
+    // the killer is the reject-at-creation, not the vtable choice.
+    if (ImGui::Checkbox("Enforce wallrunUpFromGroundFailed (52) while hotkey ACTIVE", &m_Enforce52))
+        SaveSettings();
+    if (m_Enforce52)
+    {
+        ImGui::Text("  Converted 53->52: %d this session", m_EnforceConvertedThisCycle);
+        if (m_EnforceLastSelectedType == 52)
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "  Last sort: selected type 52 (vtable 0x%llX)",
+                (unsigned long long)m_EnforceLastSelectedVTable);
+        else if (m_EnforceLastSelectedType >= 0)
+            ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1.0f), "  Last sort: selected type %d — no 52 won", m_EnforceLastSelectedType);
+        else
+            ImGui::Text("  Last sort: no selection this cycle");
+    }
+
     ImGui::TextWrapped("Swapping changes the move's behaviour live (fitness, filters, enum). "
         "Only use tables of the same 0x78-entry size; mismatched tables can crash.");
 }

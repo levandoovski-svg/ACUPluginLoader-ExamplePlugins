@@ -44,6 +44,13 @@ private:
     void ApplyHexInputs();
     // Press mode: scan the latest logged parkour cycle and swap/revert now.
     void PressSwapNow();
+    // Creation-stage: convert wallrunUpFromGround_mb (53) to the failed 52
+    // table and keep it alive, overriding the discard verdict (the "context"
+    // of a no-handhold wall is irrelevant while this is armed).
+    bool OnCreationDiscardOverride(AvailableParkourAction& action);
+    // Force-select: return the first type-52 in the sorted array (the game's
+    // own pick is ignored while armed).
+    AvailableParkourAction* ChooseAfterSorting(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame);
 
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_Activator;
@@ -80,4 +87,10 @@ private:
     bool m_PressIsOn = false;
     int m_PressLastMatched = 0;
     int m_PressLastSwapped = 0;
+
+    // Enforce-52 (failed wallrun) state. Config persisted; counts are UI-only.
+    bool m_Enforce52 = false;
+    int m_EnforceConvertedThisCycle = 0; // cumulative 53->52 conversions
+    int m_EnforceLastSelectedType = -1;
+    uint64 m_EnforceLastSelectedVTable = 0;
 };

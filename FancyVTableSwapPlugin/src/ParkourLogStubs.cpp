@@ -11,8 +11,13 @@
 #include "pch.h"
 #include "ParkourDebugging/ParkourLog.h"
 #include "ParkourDebugging/GetTypeIntSafe.h"
+#include "ParkourDebugging/EnumParkourAction.h"
 #include <memory>
 #include <mutex>
+
+// Defined in FancyVTableSwapPlugin.cpp — true while the failed-wallrun
+// enforcer is armed (hotkey active + Enforce52 checkbox).
+bool FVTS_IsEnforcing();
 
 ParkourActionLogged::ParkourActionLogged(AvailableParkourAction& action, size_t indexInOrderOfCreationInCycle)
     : m_ActionPtr(&action)
@@ -41,7 +46,13 @@ void ParkourCycleLogged::LogActionBeforeFiltering(AvailableParkourAction& action
 }
 float ParkourCycleLogged::LogActionWeights(AvailableParkourAction& action, float defaultWeight, float totalWeight)
 {
-    (void)action; (void)defaultWeight;
+    (void)defaultWeight;
+    // Enforce-52 stage 2: while the failed-wallrun enforcer is armed, give
+    // every type-52 candidate an unbeatable weight so it survives the
+    // "fitness too low" removal and wins the sort.
+    if (!m_IsDisabled && FVTS_IsEnforcing()
+        && GetTypeIntSafe(&action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+        return totalWeight = 1e9f;
     return totalWeight;
 }
 void ParkourCycleLogged::LogActionFinalFilter1(AvailableParkourAction& action, bool resultOfFinalFilter1)
