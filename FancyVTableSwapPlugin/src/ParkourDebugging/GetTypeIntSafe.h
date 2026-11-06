@@ -38,15 +38,17 @@ inline bool IsExecutableCode(uint64 p)
     return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
                            PAGE_EXECUTE_WRITECOPY)) != 0;
 }
-constexpr uint64 k_TypeSlotOffset = 0x8A0; // idx 0x45 * 0x20 within the fancy table
+constexpr uint64 k_TypeSlotFnOffset = 0x8B0; // idx 0x45 * 0x20 + 0x10 (fn inside its entry)
 // The ONE gate for "is this a plausible fancy table we may read/fn-call":
-// committed readable through the type slot, and the type-slot fn pointer is
-// real code. Doesn't prove it's the RIGHT table — only that calling it won't
-// jump into garbage.
+// committed readable through the type-slot fn pointer, and that fn pointer is
+// either null (some tables, e.g. type-52, leave this slot empty — the type is
+// then resolved by known table address) or real executable code. Doesn't
+// prove it's the RIGHT table — only that a call won't jump into garbage.
 inline bool IsPlausibleFancyTable(uint64 table)
 {
-    if (!IsReadableMemory(table, k_TypeSlotOffset + 0x20)) return false;
-    return IsExecutableCode(*(uint64*)(table + k_TypeSlotOffset));
+    if (!IsReadableMemory(table, k_TypeSlotFnOffset + 8)) return false;
+    const uint64 fn = *(uint64*)(table + k_TypeSlotFnOffset);
+    return fn == 0 || IsExecutableCode(fn);
 }
 
 inline int GetTypeIntSafe(const AvailableParkourAction* action)
