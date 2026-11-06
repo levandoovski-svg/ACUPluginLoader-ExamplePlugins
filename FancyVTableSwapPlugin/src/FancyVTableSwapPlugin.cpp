@@ -149,7 +149,7 @@ void FancyVTableSwapPlugin::PressSwapNow()
     {
         if (!record || record->m_IsDiscarded_immediatelyAfterCreation) continue;
         AvailableParkourAction* action = record->m_ActionPtr;
-        if (!action || !action->fancyVTable) continue;
+        if (!action || !IsReadableMemory((uint64)action, 0x10) || !action->fancyVTable) continue;
         bool matchSrc = (m_SourceVTable == 0 || record->m_FancyVTable == m_SourceVTable);
         bool matchType = (m_TypeFilter < 0 || (int)record->m_ActionType == m_TypeFilter);
         if (!matchSrc || !matchType) continue;

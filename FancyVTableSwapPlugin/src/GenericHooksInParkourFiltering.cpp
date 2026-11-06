@@ -7,6 +7,8 @@
 #include "ParkourDebugging/FancyVFunctionDescription.h"
 #include "ParkourDebugging/ParkourTester.h"
 #include "ParkourDebugging/ParkourLog.h"
+#include "ParkourDebugging/GetTypeIntSafe.h"
+#include "ParkourDebugging/EnumParkourAction.h"
 #include "ACU_DefineNativeFunction.h"
 #include <mutex>
 #include <algorithm>
@@ -220,6 +222,21 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
     , std::shared_ptr<ParkourCycleLogged>& currentCycle
 )
 {
+    // Memory-sanity gate: drop candidates whose fancyVTable pointer is not a
+    // plausible game fancy-table BEFORE any dispatch (fitness reads, type
+    // reads, subscriber callbacks). A single poisoned candidate otherwise
+    // crashes the first fancy-fn call, regardless of which plugin or hotkey
+    // produced the bad pointer.
+    for (int i = 0; i < p_parkourSensorsResults.size; i++)
+    {
+        AvailableParkourAction* action = p_parkourSensorsResults[i];
+        const uint64 table = (action && IsReadableMemory((uint64)action, 0x10))
+            ? (uint64)action->fancyVTable : 0;
+        if (table >= 0x140000000 && table < 0x148000000 && IsReadableMemory(table, 0x8C0))
+            continue;
+        SmallArray_POD__RemoveGeneric(&p_parkourSensorsResults, i--, 8u);
+    }
+
     currentCycle->LogActionsBeforeFiltering(p_parkourSensorsResults);
 
     auto& allParkourCallbacks = GenericHooksInParkourFiltering::GetSingleton()->m_Callbacks;
