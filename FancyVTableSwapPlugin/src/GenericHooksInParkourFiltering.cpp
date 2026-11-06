@@ -232,7 +232,7 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
         AvailableParkourAction* action = p_parkourSensorsResults[i];
         const uint64 table = (action && IsReadableMemory((uint64)action, 0x10))
             ? (uint64)action->fancyVTable : 0;
-        if (table >= 0x140000000 && table < 0x148000000 && IsReadableMemory(table, 0x8C0))
+        if (table >= 0x140000000 && table < 0x148000000 && IsPlausibleFancyTable(table))
             continue;
         SmallArray_POD__RemoveGeneric(&p_parkourSensorsResults, i--, 8u);
     }

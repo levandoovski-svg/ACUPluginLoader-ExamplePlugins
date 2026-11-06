@@ -25,14 +25,38 @@ inline bool IsReadableMemory(uint64 p, uint64 len)
     return (p + len) <= ((uint64)mbi.BaseAddress + mbi.RegionSize);
 }
 
+// A fancy-fn pointer must be executable code in the ACU 1.5.0 image before we
+// call it. Readable-but-garbage tables (freed/reused game data) otherwise
+// produce a wild call from our own code — the crash class from both dumps
+// (FancyVTableSwapPlugin.dll frames directly under the wild PC).
+inline bool IsExecutableCode(uint64 p)
+{
+    if (p < 0x140000000 || p >= 0x148000000) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+constexpr uint64 k_TypeSlotOffset = 0x8A0; // idx 0x45 * 0x20 within the fancy table
+// The ONE gate for "is this a plausible fancy table we may read/fn-call":
+// committed readable through the type slot, and the type-slot fn pointer is
+// real code. Doesn't prove it's the RIGHT table — only that calling it won't
+// jump into garbage.
+inline bool IsPlausibleFancyTable(uint64 table)
+{
+    if (!IsReadableMemory(table, k_TypeSlotOffset + 0x20)) return false;
+    return IsExecutableCode(*(uint64*)(table + k_TypeSlotOffset));
+}
+
 inline int GetTypeIntSafe(const AvailableParkourAction* action)
 {
     if (!action) return -1;
     const uint64 table = (uint64)action->fancyVTable;
     if (!table) return -1;
-    // The type slot (idx 0x45) sits at table offset 0x8A0..0x8C0 — require
-    // readability before reading anything out of a possibly-poisoned table.
-    if (!IsReadableMemory(table, 0x8C0)) return -1;
+    // Readability alone is NOT enough: a readable garbage "table" holds a
+    // garbage fn pointer, and calling it is the wild-call crash we chased.
+    if (!IsPlausibleFancyTable(table)) return -1;
     const FancyVFunction& slot = action->fancyVTable->fancyVirtuals[ParkourActionKnownFancyVFuncs::GetEnumParkourAction::idx];
     if (!slot.fn)
     {
