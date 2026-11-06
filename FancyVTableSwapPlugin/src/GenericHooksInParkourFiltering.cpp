@@ -42,6 +42,10 @@ DEFINE_GAME_FUNCTION(ConstructParkourAction_B, 0x1401D1FC0, AvailableParkourActi
 DEFINE_GAME_FUNCTION(AvailableParkourAction__InitializePlayerRef, 0x14015A570, void, __fastcall, (PlayerRefInParkourAction*, Entity*));
 DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
 
+// Defined in FancyVTableSwapPlugin.cpp — true while the failed-wallrun
+// enforcer is armed and the action is type 52 (skip the ~zero-fitness cull).
+bool FVTS_ShouldSkipFitnessCull(AvailableParkourAction* action);
+
 class Entity;
 
 // ── Creation-stage replacements (ported verbatim from ACUFixes-0.9.3) ──────
@@ -239,7 +243,11 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
             float fitness = GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetFitness)(action);
             bool isDiscarded_becauseFitnessWeightTooLow = fabsf(fitness) <= 0.0000099999997;
             currentCycle->LogActionBeforeFiltering(*action, fitness, isDiscarded_becauseFitnessWeightTooLow);
-            if (isDiscarded_becauseFitnessWeightTooLow)
+            // ENFORCE-52: keep type-52 candidates in the array even at ~zero
+            // fitness (a failed wallrun's fitness is ~0 by nature — the
+            // weight boost happens later, at the sort stage, so this cull
+            // would erase every enforced candidate before force-select).
+            if (isDiscarded_becauseFitnessWeightTooLow && !FVTS_ShouldSkipFitnessCull(action))
             {
                 SmallArray_POD__RemoveGeneric(&p_parkourSensorsResults, i--, 8u);
             }

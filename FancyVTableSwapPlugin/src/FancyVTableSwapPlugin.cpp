@@ -26,6 +26,15 @@ bool FVTS_IsEnforcing()
 {
     return s_EnforceActive;
 }
+// Skip the ~zero-fitness cull for type-52 candidates while the enforcer is
+// armed: their fitness is ~0 by design, and they're removed before the
+// weight boost could save them.
+bool FVTS_ShouldSkipFitnessCull(AvailableParkourAction* action)
+{
+    return s_EnforceActive
+        && action
+        && GetTypeIntSafe(action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
+}
 
 FancyVTableSwapPlugin::FancyVTableSwapPlugin()
 {
