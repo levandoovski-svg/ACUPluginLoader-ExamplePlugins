@@ -36,6 +36,20 @@ bool FVTS_ShouldSkipFitnessCull(AvailableParkourAction* action)
         && GetTypeIntSafe(action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
 }
 
+// A swap destination must look like a real game fancy-vtable: inside the
+// ACU 1.5.0 module range and committed readable memory. Guards against
+// mistyped hex (e.g. "0x8" — the struct offset, not an address) turning every
+// swap into a write of a garbage function-pointer table (wild-call crash).
+static bool IsValidDestVTable(uint64 p)
+{
+    if (p < 0x140000000 || p >= 0x148000000) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return ((uint64)p + 0x20) <= ((uint64)mbi.BaseAddress + mbi.RegionSize);
+}
+
 FancyVTableSwapPlugin::FancyVTableSwapPlugin()
 {
     m_Callbacks.ChooseBeforeFiltering_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions) -> AvailableParkourAction* {
@@ -111,16 +125,26 @@ void FancyVTableSwapPlugin::PressSwapNow()
         m_PressLastSwapped = 0;
         return;
     }
-    const bool ruleValid = m_DestVTable != 0 && (m_SourceVTable != 0 || m_TypeFilter >= 0);
+    const bool ruleValid = IsValidDestVTable(m_DestVTable) &&
+        (m_SourceVTable != 0 || m_TypeFilter >= 0);
     if (!ruleValid)
     {
-        m_PressLastMatched = 0;
+        m_PressLastMatched = -1; // invalid rule (bad dest), distinct from "0 found"
         m_PressLastSwapped = 0;
         return;
     }
     int matched = 0;
     m_PressSwapsOn.clear();
     std::lock_guard cycleLock(cycle->m_Mutex);
+    // Only touch actions from a very recent cycle: older records are usually
+    // already freed, and writing into freed memory poisons whatever the
+    // allocator puts there next (the crash-on-press class).
+    if (GetTickCount64() - cycle->m_Timestamp > 1500)
+    {
+        m_PressLastMatched = 0;
+        m_PressLastSwapped = 0;
+        return;
+    }
     for (auto& record : cycle->m_Actions)
     {
         if (!record || record->m_IsDiscarded_immediatelyAfterCreation) continue;
@@ -180,19 +204,49 @@ bool FancyVTableSwapPlugin::OnCreationDiscardOverride(AvailableParkourAction& ac
     return GetTypeIntSafe(&action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
 }
 
-// Enforce-52 stage 3 (force-select): first type-52 in the sorted array wins;
-// stages 2 (weight boost, in ParkourLog weights logging) guarantees one
-// survives the "fitness too low" removal even on handhold walls.
+// Enforce-52 stage 3 (force-select): prefer a type-52 that passed both final
+// filters; fall back to the first 52 if none passed (matches ACUFixes'
+// enforcer semantics, which also forces unfiltered picks). Stages 1 (keep at
+// creation) and 2 (weight boost) get at least one 52 into the sorted array
+// even on handhold walls.
 AvailableParkourAction* FancyVTableSwapPlugin::ChooseAfterSorting(
     SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
 {
     (void)selectedByGame;
     s_EnforceActive = m_Enabled && m_Enforce52 && IsActive();
     if (!s_EnforceActive) return nullptr;
+
+    // Final-filter verdicts for THIS cycle's actions, from the scanner.
+    auto cycle = ParkourLog::GetSingleton().GetCurrentLoggedParkourCycle();
+    std::unordered_map<AvailableParkourAction*, std::pair<bool, bool>> filterResults;
+    if (cycle)
+    {
+        std::lock_guard cycleLock(cycle->m_Mutex);
+        for (auto& record : cycle->m_Actions)
+        {
+            if (!record) continue;
+            filterResults.emplace(record->m_ActionPtr,
+                std::make_pair(record->m_ResultOfFinalFilter1.value_or(true),
+                               record->m_ResultOfFinalFilter2.value_or(true)));
+        }
+    }
+    auto IsPassedBoth = [&](AvailableParkourAction* action) {
+        auto it = filterResults.find(action);
+        return it != filterResults.end() && it->second.first && it->second.second;
+    };
+
+    AvailableParkourAction* first52 = nullptr;
     for (AvailableParkourAction* action : actions)
     {
         if (!action) continue;
-        if (GetTypeIntSafe(action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
+        if (GetTypeIntSafe(action) != (int)EnumParkourAction::wallrunUpFromGroundFailed_mb) continue;
+        if (!first52)
+        {
+            std::lock_guard lk(m_Mutex);
+            m_EnforceLastSelectedVTable = (uint64)action->fancyVTable;
+            first52 = action;
+        }
+        if (IsPassedBoth(action))
         {
             std::lock_guard lk(m_Mutex);
             m_EnforceLastSelectedType = 52;
@@ -200,10 +254,11 @@ AvailableParkourAction* FancyVTableSwapPlugin::ChooseAfterSorting(
             return action;
         }
     }
-    std::lock_guard lk(m_Mutex);
-    m_EnforceLastSelectedType = -1;
-    m_EnforceLastSelectedVTable = 0;
-    return nullptr;
+    {
+        std::lock_guard lk(m_Mutex);
+        m_EnforceLastSelectedType = first52 ? 52 : -1;
+        return first52; // nullptr when no 52 survived into the sorted array
+    }
 }
 
 void FancyVTableSwapPlugin::LoadSettings()
@@ -272,7 +327,7 @@ AvailableParkourAction* FancyVTableSwapPlugin::ChooseBeforeFiltering(SmallArray<
     std::vector<DiscoveredVTable> found;
     found.reserve(actions.size);
     int swapped = 0;
-    const bool active = IsActive() && m_DestVTable != 0 &&
+    const bool active = IsActive() && IsValidDestVTable(m_DestVTable) &&
         (m_SourceVTable != 0 || m_TypeFilter >= 0);
 
     for (AvailableParkourAction* action : actions)
@@ -420,7 +475,10 @@ void FancyVTableSwapPlugin::OnImGuiRender()
     if (m_SwapMode == Mode_Press)
     {
         std::lock_guard lk(m_Mutex);
-        if (m_PressLastSwapped >= 0)
+        if (m_PressLastMatched < 0)
+            ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1.0f),
+                "Last press: invalid dest vtable — nothing swapped (fix the hex)");
+        else if (m_PressLastSwapped >= 0)
             ImGui::Text("Last press: %d matched, %d swapped%s",
                 m_PressLastMatched, m_PressLastSwapped, m_PressIsOn ? " (press to revert)" : "");
         else

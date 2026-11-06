@@ -41,8 +41,10 @@ void ParkourCycleLogged::LogActionsBeforeFiltering(SmallArray<AvailableParkourAc
 }
 void ParkourCycleLogged::LogActionBeforeFiltering(AvailableParkourAction& action, float fitness, bool& isDiscarded_becauseFitnessWeightTooLow)
 {
-    (void)action; (void)fitness;
-    (void)isDiscarded_becauseFitnessWeightTooLow;
+    if (m_IsDisabled) return;
+    ParkourActionLogged& record = GetOrMakeRecordForAction(action);
+    record.m_FitnessWeight = fitness;
+    record.m_IsDiscarded_becauseFitnessWeightTooLow = isDiscarded_becauseFitnessWeightTooLow;
 }
 float ParkourCycleLogged::LogActionWeights(AvailableParkourAction& action, float defaultWeight, float totalWeight)
 {
@@ -57,15 +59,18 @@ float ParkourCycleLogged::LogActionWeights(AvailableParkourAction& action, float
 }
 void ParkourCycleLogged::LogActionFinalFilter1(AvailableParkourAction& action, bool resultOfFinalFilter1)
 {
-    (void)action; (void)resultOfFinalFilter1;
+    if (m_IsDisabled) return;
+    GetOrMakeRecordForAction(action).m_ResultOfFinalFilter1 = resultOfFinalFilter1;
 }
 void ParkourCycleLogged::LogActionFinalFilter2(AvailableParkourAction& action, bool resultOfFinalFilter2)
 {
-    (void)action; (void)resultOfFinalFilter2;
+    if (m_IsDisabled) return;
+    GetOrMakeRecordForAction(action).m_ResultOfFinalFilter2 = resultOfFinalFilter2;
 }
 void ParkourCycleLogged::LogActionWhenReturningBestMatch(AvailableParkourAction& bestMatchMove)
 {
-    (void)bestMatchMove;
+    if (m_IsDisabled) return;
+    GetOrMakeRecordForAction(bestMatchMove).m_IsTheSelectedBestMatch = true;
 }
 ParkourActionLogged& ParkourCycleLogged::GetOrMakeRecordForAction(AvailableParkourAction& action)
 {
