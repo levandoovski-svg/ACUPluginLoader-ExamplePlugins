@@ -226,13 +226,17 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
     // plausible game fancy-table BEFORE any dispatch (fitness reads, type
     // reads, subscriber callbacks). A single poisoned candidate otherwise
     // crashes the first fancy-fn call, regardless of which plugin or hotkey
-    // produced the bad pointer.
+    // produced the bad pointer. Also require a callable GetFitness — the
+    // weights comparator below calls it repeatedly under std::sort and is
+    // otherwise the wild-call site.
     for (int i = 0; i < p_parkourSensorsResults.size; i++)
     {
         AvailableParkourAction* action = p_parkourSensorsResults[i];
         const uint64 table = (action && IsReadableMemory((uint64)action, 0x10))
             ? (uint64)action->fancyVTable : 0;
-        if (table >= 0x140000000 && table < 0x148000000 && IsPlausibleFancyTable(table))
+        if (table >= 0x140000000 && table < 0x148000000
+            && IsPlausibleFancyTable(table)
+            && GetCallableFancyFn(table, ParkourActionKnownFancyVFuncs::GetFitness::idx))
             continue;
         SmallArray_POD__RemoveGeneric(&p_parkourSensorsResults, i--, 8u);
     }

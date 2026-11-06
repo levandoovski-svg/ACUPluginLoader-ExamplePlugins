@@ -51,6 +51,17 @@ inline bool IsPlausibleFancyTable(uint64 table)
     return fn == 0 || IsExecutableCode(fn);
 }
 
+// fn pointer for a given fancy slot; 0 when the slot is not safely callable
+// (null or not executable code — callers must skip the action, calling a
+// null/garbage fn is exactly the wild-call crash we keep hitting).
+inline uint64 GetCallableFancyFn(uint64 table, uint32 idx)
+{
+    const uint64 off = (uint64)idx * 0x20 + 0x10; // fn sits at +0x10 in its 0x20 entry
+    if (!IsReadableMemory(table, off + 8)) return 0;
+    const uint64 fn = *(uint64*)(table + off);
+    return IsExecutableCode(fn) ? fn : 0;
+}
+
 inline int GetTypeIntSafe(const AvailableParkourAction* action)
 {
     if (!action) return -1;
