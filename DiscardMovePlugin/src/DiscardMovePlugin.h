@@ -5,6 +5,7 @@
 #include "ParkourDebugging/GenericHooksInParkourFiltering.h"
 #include "ParkourDebugging/EnumParkourAction.h"
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -74,6 +75,14 @@ private:
 
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_ActivatorCreation;
+
+    // Diagnostics ring: actions seen at the creation hook (any thread).
+    // type -2 = slot not yet written, -1 = type unreadable.
+    static constexpr int kDiagCount = 12;
+    struct DiagEntry { int type = -2; bool wasOnList = false; bool discardApplied = false; };
+    DiagEntry m_Diag[kDiagCount]{};
+    std::atomic<int> m_DiagWriteIdx{ 0 };
+    bool m_ShowDiagnostics = false;
 
     // Config (persisted to INI)
     bool m_Enabled = true;

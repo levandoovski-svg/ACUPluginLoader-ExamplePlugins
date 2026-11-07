@@ -233,10 +233,14 @@ bool DiscardMovePlugin::IsDiscarded(int actionType) const
 // While ACTIVE, discard action types the user picked, via the vanilla destroy
 // path (same shape as a native reject). Runs after all keep-alive overrides,
 // so a keep-alive from another plugin cannot resurrect a move listed here.
+// Also records everything seen at the hook into the diagnostics ring.
 bool DiscardMovePlugin::OnForceCreationDiscard(AvailableParkourAction& action)
 {
-    if (!IsActive()) return false;
-    return IsDiscarded(GetTypeIntSafe(&action));
+    const int type = GetTypeIntSafe(&action);
+    const bool willDiscard = IsActive() && IsDiscarded(type);
+    const int slot = ((m_DiagWriteIdx.fetch_add(1, std::memory_order_relaxed) % kDiagCount) + kDiagCount) % kDiagCount;
+    m_Diag[slot] = { type, willDiscard, willDiscard };
+    return willDiscard;
 }
 
 void DiscardMovePlugin::UpdatePadStates()
@@ -419,4 +423,35 @@ void DiscardMovePlugin::OnImGuiRender()
     }
     if (m_DiscardList.empty())
         ImGui::TextDisabled("(empty - no moves are discarded)");
+
+    ImGui::Separator();
+    ImGui::Checkbox("Diagnostics: last actions seen at the discard hook", &m_ShowDiagnostics);
+    if (!m_ShowDiagnostics) return;
+    ImGui::TextDisabled("Type 'unknown' means the type could not be read for that action.");
+    if (ImGui::BeginTable("discardDiag", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+    {
+        ImGui::TableSetupColumn("Type");
+        ImGui::TableSetupColumn("Name");
+        ImGui::TableSetupColumn("Discarded?");
+        ImGui::TableHeadersRow();
+        // Newest first.
+        int writeIdx = m_DiagWriteIdx.load(std::memory_order_relaxed);
+        for (int j = 0; j < kDiagCount; ++j)
+        {
+            const int idx = writeIdx - 1 - j;
+            if (idx < 0) break;
+            const int slot = ((idx % kDiagCount) + kDiagCount) % kDiagCount;
+            const DiagEntry& e = m_Diag[slot];
+            if (e.type <= -2) continue; // slot never written
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", e.type);
+            ImGui::TableNextColumn();
+            ImGui::Text(e.type < 0 ? "(unreadable)" 
+                : enum_reflection<EnumParkourAction>::GetString((EnumParkourAction)e.type));
+            ImGui::TableNextColumn();
+            ImGui::Text(e.discardApplied ? "YES" : "no");
+        }
+        ImGui::EndTable();
+    }
 }
