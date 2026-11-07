@@ -62,19 +62,30 @@ public:
 
     // Only the force-discard hook is used: return true to destroy the action.
     bool OnForceCreationDiscard(AvailableParkourAction& action);
+    // Keep-alive: waive the vanilla reject for the enforced move so the
+    // enforce pick below always has a surviving candidate.
+    bool OnCreationDiscardOverride(AvailableParkourAction& action);
+    AvailableParkourAction* OnChooseAfterSorting(
+        SmallArray<AvailableParkourAction*>& allActionsSorted,
+        AvailableParkourAction* selectedByGame);
 
 private:
-    bool IsActive() const;
+    bool IsActive() const;          // discard gating (m_Hotkey, hold/toggle)
+    bool IsEnforceActive() const;   // enforce gating (m_EnforceHotkey, hold)
     bool IsBoundKeyDown() const;   // hold-mode: bound key/pad held right now
     bool IsPadCode(int key) const;
     void UpdatePadStates();
-    void CaptureBinding(const std::array<bool, DiscardPad_COUNT>& padEdges);
+    void CaptureBinding(int* targetKey, const std::array<bool, DiscardPad_COUNT>& padEdges);
     void LoadSettings();
     void SaveSettings() const;
     bool IsDiscarded(int actionType) const;
 
     ParkourCallbacks m_Callbacks;
     std::shared_ptr<SharedHookActivator> m_ActivatorCreation;
+    // Owned only while the enforce key is held (dynamic, see OnUpdate):
+    // avoids permanently patching the sort&select site next to FreeJump
+    // (its FinalFilter1 fallback cave) and the ACU parkour debugger.
+    std::shared_ptr<SharedHookActivator> m_ActivatorSortAndSelect;
 
     // Diagnostics ring: actions seen at the creation hook (any thread).
     // type -2 = slot not yet written, -1 = type unreadable.
@@ -86,10 +97,12 @@ private:
 
     // Config (persisted to INI)
     bool m_Enabled = true;
-    int m_Hotkey = 0x77; // F8
+    int m_Hotkey = 0x77; // F8 - discard key
+    int m_EnforceHotkey = 0x76; // F7 - enforce jumpIntoWindow while held
     bool m_HoldMode = true;
     bool m_ToggleState = false;
     bool m_WaitingForKey = false;
+    bool m_EnforceWaitingForKey = false;
 
     // The moves to discard, persisted to INI as enum names.
     std::vector<EnumParkourAction> m_DiscardList;

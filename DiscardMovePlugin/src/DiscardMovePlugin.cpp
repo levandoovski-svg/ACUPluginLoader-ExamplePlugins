@@ -106,6 +106,12 @@ DiscardMovePlugin::DiscardMovePlugin()
     m_Callbacks.ForceCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool {
         return static_cast<DiscardMovePlugin*>(userData)->OnForceCreationDiscard(action);
     };
+    m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool {
+        return static_cast<DiscardMovePlugin*>(userData)->OnCreationDiscardOverride(action);
+    };
+    m_Callbacks.ChooseAfterSorting_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame) -> AvailableParkourAction* {
+        return static_cast<DiscardMovePlugin*>(userData)->OnChooseAfterSorting(actions, selectedByGame);
+    };
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 4.0f;
     m_Callbacks.m_Name = "DiscardMovePlugin_DiscardChosenMoves";
@@ -114,9 +120,10 @@ DiscardMovePlugin::DiscardMovePlugin()
 
 DiscardMovePlugin::~DiscardMovePlugin()
 {
-    if (m_ActivatorCreation)
+    if (m_ActivatorCreation || m_ActivatorSortAndSelect)
     {
         GenericHooksInParkourFiltering::GetSingleton()->Unsubscribe(m_Callbacks);
+        m_ActivatorSortAndSelect.reset();
         m_ActivatorCreation.reset();
     }
 }
@@ -154,10 +161,25 @@ bool DiscardMovePlugin::IsActive() const
     return m_ToggleState;
 }
 
+// Enforce key is hold-only: patching the sort&select site exactly while the
+// user is baiting the jump keeps the site unpatched the rest of the time.
+bool DiscardMovePlugin::IsEnforceActive() const
+{
+    if (!m_Enabled) return false;
+    if (IsPadCode(m_EnforceHotkey))
+        return m_PadDown[m_EnforceHotkey - kDiscardPadKeyBase];
+    return (GetAsyncKeyState(m_EnforceHotkey) & 0x8000) != 0;
+}
+
 void DiscardMovePlugin::LoadSettings()
 {
     std::ifstream file(GetIniPath());
-    if (!file) return;
+    if (!file)
+    {
+        // First run: the original ask - discard the step-down while held.
+        m_DiscardList.push_back(EnumParkourAction::stepDownWaistHeight_mb);
+        return;
+    }
     std::string line;
     while (std::getline(file, line))
     {
@@ -165,6 +187,8 @@ void DiscardMovePlugin::LoadSettings()
         {
             if (line.rfind("Hotkey=", 0) == 0)
                 try { m_Hotkey = std::stoi(line.substr(7), nullptr, 16); } catch (...) {}
+            else if (line.rfind("EnforceHotkey=", 0) == 0)
+                try { m_EnforceHotkey = std::stoi(line.substr(14), nullptr, 16); } catch (...) {}
             else if (line.rfind("Enabled=", 0) == 0)
                 m_Enabled = (line.substr(8) == "1");
             else if (line.rfind("HoldMode=", 0) == 0)
@@ -198,6 +222,8 @@ void DiscardMovePlugin::LoadSettings()
     }
     const bool padKey = m_Hotkey >= kDiscardPadKeyBase && m_Hotkey < kDiscardPadKeyBase + DiscardPad_COUNT;
     if ((m_Hotkey < 1 || m_Hotkey > 0xFE) && !padKey) m_Hotkey = 0x77;
+    const bool padKeyEnforce = m_EnforceHotkey >= kDiscardPadKeyBase && m_EnforceHotkey < kDiscardPadKeyBase + DiscardPad_COUNT;
+    if ((m_EnforceHotkey < 1 || m_EnforceHotkey > 0xFE) && !padKeyEnforce) m_EnforceHotkey = 0x76;
 }
 
 void DiscardMovePlugin::SaveSettings() const
@@ -208,6 +234,7 @@ void DiscardMovePlugin::SaveSettings() const
         if (file)
         {
             file << "Hotkey=" << std::hex << m_Hotkey << std::dec << "\n";
+            file << "EnforceHotkey=" << std::hex << m_EnforceHotkey << std::dec << "\n";
             file << "Enabled=" << (m_Enabled ? 1 : 0) << "\n";
             file << "HoldMode=" << (m_HoldMode ? 1 : 0) << "\n";
             file << "ToggleState=" << (m_ToggleState ? 1 : 0) << "\n";
@@ -241,6 +268,33 @@ bool DiscardMovePlugin::OnForceCreationDiscard(AvailableParkourAction& action)
     const int slot = ((m_DiagWriteIdx.fetch_add(1, std::memory_order_relaxed) % kDiagCount) + kDiagCount) % kDiagCount;
     m_Diag[slot] = { type, willDiscard, willDiscard };
     return willDiscard;
+}
+
+// While the enforce key is held, waive the vanilla "InitialTestIfActionFits"
+// reject for jumpIntoWindow (123) - same rescue FreeFormWallrun applies to
+// freeform 52s - so the enforce pick in OnChooseAfterSorting always has a
+// surviving candidate.
+bool DiscardMovePlugin::OnCreationDiscardOverride(AvailableParkourAction& action)
+{
+    if (!IsEnforceActive()) return false;
+    return GetTypeIntSafe(&action) == (int)EnumParkourAction::jumpIntoWindow;
+}
+
+// While the enforce key is held, jumpIntoWindow wins over the game's own pick.
+// Only picks actions that survived into the sorted list (the array is sorted
+// by total weight descending, so the first match is the fittest one).
+AvailableParkourAction* DiscardMovePlugin::OnChooseAfterSorting(
+    SmallArray<AvailableParkourAction*>& allActionsSorted,
+    AvailableParkourAction* selectedByGame)
+{
+    if (!IsEnforceActive()) return nullptr;
+    for (int i = 0; i < allActionsSorted.size; i++)
+    {
+        AvailableParkourAction* action = allActionsSorted[i];
+        if (GetTypeIntSafe(action) != (int)EnumParkourAction::jumpIntoWindow) continue;
+        return action;
+    }
+    return nullptr;
 }
 
 void DiscardMovePlugin::UpdatePadStates()
@@ -306,8 +360,12 @@ void DiscardMovePlugin::OnUpdate()
 
     if (m_WaitingForKey)
     {
-        CaptureBinding(padEdges);
+        CaptureBinding(&m_Hotkey, padEdges);
         // toggle-state tracking still works underneath
+    }
+    if (m_EnforceWaitingForKey)
+    {
+        CaptureBinding(&m_EnforceHotkey, padEdges);
     }
 
     if (m_Enabled && !m_HoldMode)
@@ -321,9 +379,19 @@ void DiscardMovePlugin::OnUpdate()
             SaveSettings();
         }
     }
+
+    // Own the sort&select site only while the enforce key is held. This is
+    // what lets the enforce pick work without permanently patching the site
+    // (FreeJump's fallback cave engages on permanent co-patching; the ACU
+    // parkour debugger also owns the site while open).
+    const bool wantEnforceHook = IsEnforceActive();
+    if (wantEnforceHook && !m_ActivatorSortAndSelect)
+        m_ActivatorSortAndSelect = GenericHooksInParkourFiltering::GetSingleton()->RequestGPHSortAndSelect();
+    else if (!wantEnforceHook && m_ActivatorSortAndSelect)
+        m_ActivatorSortAndSelect.reset();
 }
 
-void DiscardMovePlugin::CaptureBinding(const std::array<bool, DiscardPad_COUNT>& padEdges)
+void DiscardMovePlugin::CaptureBinding(int* targetKey, const std::array<bool, DiscardPad_COUNT>& padEdges)
 {
     for (int vk = 1; vk <= 0xFE; ++vk)
     {
@@ -334,8 +402,9 @@ void DiscardMovePlugin::CaptureBinding(const std::array<bool, DiscardPad_COUNT>&
             continue;
         if (m_KbPressed[vk])
         {
-            m_Hotkey = vk;
+            *targetKey = vk;
             m_WaitingForKey = false;
+            m_EnforceWaitingForKey = false;
             SaveSettings();
             return;
         }
@@ -344,8 +413,9 @@ void DiscardMovePlugin::CaptureBinding(const std::array<bool, DiscardPad_COUNT>&
     {
         if (padEdges[c])
         {
-            m_Hotkey = kDiscardPadKeyBase + c;
+            *targetKey = kDiscardPadKeyBase + c;
             m_WaitingForKey = false;
+            m_EnforceWaitingForKey = false;
             SaveSettings();
             return;
         }
@@ -375,6 +445,16 @@ void DiscardMovePlugin::OnImGuiRender()
         m_WaitingForKey = !m_WaitingForKey;
     if (m_WaitingForKey)
         ImGui::TextWrapped("Press a keyboard key, mouse button or gamepad button to bind it...");
+
+    ImGui::Separator();
+    ImGui::Text("Enforce jump-into-window: %s", IsEnforceActive() ? "ACTIVE (holding key)" : "inactive");
+    ImGui::Text("Enforce key: %s", KeyCodeLabel(m_EnforceHotkey).c_str());
+    ImGui::SameLine();
+    if (ImGui::Button(m_EnforceWaitingForKey ? "Cancel rebind" : "Rebind enforce"))
+        m_EnforceWaitingForKey = !m_EnforceWaitingForKey;
+    if (m_EnforceWaitingForKey)
+        ImGui::TextWrapped("Press a keyboard key, mouse button or gamepad button to bind it...");
+    ImGui::TextDisabled("Hold the enforce key while baiting the jump: jumpIntoWindow is\nkept alive even if vanilla rejected it and wins over every other move.");
 
     ImGui::Separator();
     ImGui::TextWrapped("Moves discarded at creation while the hotkey is ACTIVE:");
