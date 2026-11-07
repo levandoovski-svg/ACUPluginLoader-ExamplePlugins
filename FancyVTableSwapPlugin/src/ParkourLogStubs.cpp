@@ -7,6 +7,7 @@
 // ParkourCycleLogged::m_IsDisabled and no cycle or record is ever allocated.
 #include "pch.h"
 #include "ParkourDebugging/ParkourLog.h"
+#include "ParkourDebugging/AvailableParkourAction.h"
 #include <memory>
 #include <mutex>
 
