@@ -1,4 +1,6 @@
 name: Build FreeFormWallrun
+
+on:
   push:
     branches: [ "**" ]
     paths:
