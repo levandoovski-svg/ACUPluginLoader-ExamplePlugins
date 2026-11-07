@@ -46,14 +46,23 @@ static std::set<AvailableParkourAction*> s_ConvertedThisCycle;
 // the player straight up (exact-teleport style position write + one HSTE
 // reset at the cap) until the configured height above lift-start is reached.
 // shortcut: lift settings are file statics, not INI-persisted.
+// Thread split (proven by ExactTeleportPlugin): transform WRITES are safe from
+// the render thread (that plugin teleports from its OnUpdate/Present path),
+// but the HSTE state reset mutates state objects the render frame does not
+// expect to change, so it runs deferred on our existing game-thread
+// sort&select hook. Do NOT patch the FOV site 0x141F3FE3B for this — ACUFixes'
+// FreezeFOV owns the same 6 bytes and the collision crashes at startup.
+DEFINE_GAME_FUNCTION(BaseEntity__SetTransform, 0x1425DE360, void, __fastcall,
+    (Entity* entity, const Matrix4f* newTransform));
 DEFINE_GAME_FUNCTION(Human__Dispatch_HSTE_ResetBehavior, 0x14131A530, char, __fastcall, (Human* a1));
 static bool   g_LiftEnabledOn = true;
 static float  g_LiftHeight = 6.0f;   // meters above lift-start
 static float  g_LiftSpeed  = 4.0f;   // meters/second
-static bool   g_LiftShouldStart = false;   // set by force-select, served by hook
+static bool   g_LiftShouldStart = false;   // armed by force-select, started by OnUpdate
 static bool   g_LiftActive = false;
 static float  g_LiftTargetZ = 0.0f;
 static ULONGLONG g_LiftLastTickMs = 0;
+static bool   g_PendingHSTE = false;   // reset at cap, consumed on next game-thread parkour cycle
 
 static Entity* GetPlayerSafely()
 {
@@ -66,65 +75,54 @@ static Human* GetPlayerHumanSafely()
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
-static void ServiceLift();
-static void ServeLiftStart(); // defined below; ServiceLift (the hook body) calls it
-
-// Per-frame game-thread hook ("safe injection" pattern from ExactTeleport:
-// FOV site 0x141F3FE3B, 6 stolen bytes) — the game expects movement mutations
-// here, never on the Present thread.
-static void ServiceLift()
+// Start/step, called every frame from OnUpdate (render thread).
+static void ServiceLiftOnFrame()
 {
-    ServeLiftStart();
-    if (!g_LiftActive || !FVTS_IsEnforcing()) { g_LiftActive = false; return; }
-    const ULONGLONG now = GetTickCount64();
-    const float dt = float(now - g_LiftLastTickMs) / 1000.0f;
-    g_LiftLastTickMs = now;
-    if (dt <= 0.0f || dt > 0.05f) return; // tolerate first/mostly-paused ticks
-    Entity* player = GetPlayerSafely();
-    if (!player) return;
-    __try
+    if (g_LiftShouldStart)
     {
-        Vector3f& pos = player->GetPosition();
-        pos.z += g_LiftSpeed * dt;
-        if (pos.z >= g_LiftTargetZ)
-        {
-            pos.z = g_LiftTargetZ;
-            g_LiftActive = false;
-            if (Human* human = GetPlayerHumanSafely())
-                Human__Dispatch_HSTE_ResetBehavior(human); // re-evaluate parkour state
-        }
+        g_LiftShouldStart = false;
+        if (Entity* player = GetPlayerSafely())
+            g_LiftTargetZ = player->GetPosition().z + g_LiftHeight;
+        g_LiftActive = true;
+        g_LiftLastTickMs = GetTickCount64();
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { g_LiftActive = false; }
+    if (!g_LiftActive) return;
+    const ULONGLONG now = GetTickCount64();
+    float dt = float(now - g_LiftLastTickMs) / 1000.0f;
+    g_LiftLastTickMs = now;
+    if (dt <= 0.0f || dt > 0.1f) return; // paused/loading frames: skip, keep clock
+    if (Entity* player = GetPlayerSafely())
+    {
+        __try
+        {
+            Vector3f& pos = player->GetPosition();
+            pos.z += g_LiftSpeed * dt;
+            if (pos.z >= g_LiftTargetZ)
+                pos.z = g_LiftTargetZ;
+            BaseEntity__SetTransform(player, &player->GetTransform());
+            if (pos.z >= g_LiftTargetZ)
+            {
+                g_LiftActive = false;
+                g_PendingHSTE = true; // game-thread hook performs the reset
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_LiftActive = false; }
+    }
 }
 
-struct DeferredLiftHook : AutoAssemblerCodeHolder_Base
+// Game-thread reset, consumed inside ChooseAfterSorting (sort&select hook).
+static void ServicePendingHSTE()
 {
-    DeferredLiftHook()
-    {
-        constexpr uintptr_t whenSettingFOVforFrame = 0x141F3FE3B;
-        PresetScript_CCodeInTheMiddle(whenSettingFOVforFrame, 6,
-            [](AllRegisters*) { ServiceLift(); });
-    }
-};
-static std::unique_ptr<AutoAssembleWrapper<DeferredLiftHook>> s_LiftHook;
+    if (!g_PendingHSTE) return;
+    g_PendingHSTE = false;
+    if (Human* human = GetPlayerHumanSafely())
+        Human__Dispatch_HSTE_ResetBehavior(human);
+}
 
 static void StartLiftIfNeeded()
 {
     if (!g_LiftEnabledOn || g_LiftActive) return;
     g_LiftShouldStart = true;
-    g_LiftLastTickMs = 0;
-}
-
-static void ServeLiftStart()
-{
-    if (!g_LiftShouldStart) return;
-    g_LiftShouldStart = false;
-    Entity* player = GetPlayerSafely();
-    if (!player) return;
-    const Vector3f& pos = player->GetPosition();
-    g_LiftTargetZ = pos.z + g_LiftHeight;
-    g_LiftActive = true;
-    g_LiftLastTickMs = GetTickCount64();
 }
 
 static std::string GetIniPath()
@@ -172,11 +170,7 @@ void FancyVTableSwapPlugin::OnBeforeActivate()
     gph->Subscribe(m_Callbacks);
     m_Activator = gph->RequestGPHSortAndSelect();
     m_ActivatorCreation = gph->RequestGPHCreation();
-    if (!s_LiftHook)
-    {
-        s_LiftHook = std::make_unique<AutoAssembleWrapper<DeferredLiftHook>>();
-        s_LiftHook->Activate();
-    }
+    // (lift hook was here before — removed: FOV site is owned by ACUFixes)
 }
 
 bool FancyVTableSwapPlugin::IsActive() const
@@ -352,6 +346,8 @@ AvailableParkourAction* FancyVTableSwapPlugin::ChooseAfterSorting(
         // A freeform 52 is about to execute while armed — arm the lift.
         if (pick) StartLiftIfNeeded();
     }
+    // Pending HSTE reset from a finished lift runs on the game thread here.
+    ServicePendingHSTE();
     s_ConvertedThisCycle.clear(); // conversions are single-cycle (stage 0 comment)
     return pick; // nullptr when no 52 survived into the sorted array
 }
@@ -373,11 +369,16 @@ void FancyVTableSwapPlugin::OnUpdate()
         return;
     }
     s_EnforceActive = m_Enabled && IsActive();
-    // Hotkey released → any armed lift dies; the hook re-checks too.
+    // Hotkey released → any armed lift dies.
     if (!s_EnforceActive)
     {
         g_LiftShouldStart = false;
         g_LiftActive = false;
+    }
+    else if (!m_WaitingForKey)
+    {
+        // Present thread: transform writes proven safe (ExactTeleport pattern).
+        ServiceLiftOnFrame();
     }
     if (m_Enabled && !m_HoldMode && (GetAsyncKeyState(m_Hotkey) & 1))
     {
@@ -428,7 +429,7 @@ void FancyVTableSwapPlugin::OnImGuiRender()
     {
         ImGui::SliderFloat("Lift height (m)", &g_LiftHeight, 0.5f, 20.0f, "%.1f");
         ImGui::SliderFloat("Lift speed (m/s)", &g_LiftSpeed, 0.5f, 20.0f, "%.1f");
-        ImGui::TextWrapped("Starts above wherever you were when a freeform 52 was force-selected with the hotkey held; ends with one parkour-state reset at the cap.");
+        ImGui::TextWrapped("Starts above wherever you were when a freeform 52 was force-selected with the hotkey held; at the cap the parkour-state reset applies on the game thread's next parkour evaluation.");
         ImGui::Text("Lift status: %s", g_LiftActive ? "LIFTING" : g_LiftShouldStart ? "waiting for next tick" : "idle");
     }
 
