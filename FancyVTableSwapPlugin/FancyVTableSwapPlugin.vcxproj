@@ -182,6 +182,10 @@ if exist "$(ProjectDir)copy_output_to_directory.txt" (
       <SubSystem>Console</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
+      <!-- Map file so crash-log module offsets (dll+0x1234) resolve to functions -->
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(TargetName).map</MapFileName>
+      <MapExports>true</MapExports>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <AdditionalDependencies>

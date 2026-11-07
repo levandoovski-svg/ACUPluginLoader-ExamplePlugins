@@ -53,3 +53,4 @@ jobs:
         name: FancyVTableSwapPlugin
         path: |
           s/FancyVTableSwapPlugin/build/x64/Release/plugins/FancyVTableSwapPlugin.dll
+          s/FancyVTableSwapPlugin/**/FancyVTableSwapPlugin.map

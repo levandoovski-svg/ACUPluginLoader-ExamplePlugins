@@ -50,11 +50,13 @@ float ParkourCycleLogged::LogActionWeights(AvailableParkourAction& action, float
 {
     (void)defaultWeight;
     // Enforce-52 stage 2: while the failed-wallrun enforcer is armed, give
-    // every type-52 candidate an unbeatable weight so it survives the
-    // "fitness too low" removal and wins the sort.
+    // every type-52 candidate an unbeatable weight. ADD the natural weight
+    // instead of returning a constant, so the natural quality ranking among
+    // 52s survives the sort — a constant collapsed it, and force-select then
+    // picked an arbitrary (often degenerate, tiny-height) trajectory.
     if (!m_IsDisabled && FVTS_IsEnforcing()
         && GetTypeIntSafe(&action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb)
-        return totalWeight = 1e9f;
+        return totalWeight = 1e9f + totalWeight;
     return totalWeight;
 }
 void ParkourCycleLogged::LogActionFinalFilter1(AvailableParkourAction& action, bool resultOfFinalFilter1)
