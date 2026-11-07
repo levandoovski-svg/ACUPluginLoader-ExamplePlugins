@@ -90,7 +90,7 @@ private:
     // Diagnostics ring: actions seen at the creation hook (any thread).
     // type -2 = slot not yet written, -1 = type unreadable.
     static constexpr int kDiagCount = 12;
-    struct DiagEntry { int type = -2; bool wasOnList = false; bool discardApplied = false; };
+    struct DiagEntry { int type = -2; bool onList = false; bool discardApplied = false; };
     DiagEntry m_Diag[kDiagCount]{};
     std::atomic<int> m_DiagWriteIdx{ 0 };
     bool m_ShowDiagnostics = false;

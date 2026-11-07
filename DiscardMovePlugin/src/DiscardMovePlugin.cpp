@@ -264,9 +264,10 @@ bool DiscardMovePlugin::IsDiscarded(int actionType) const
 bool DiscardMovePlugin::OnForceCreationDiscard(AvailableParkourAction& action)
 {
     const int type = GetTypeIntSafe(&action);
-    const bool willDiscard = IsActive() && IsDiscarded(type);
+    const bool onList = IsDiscarded(type);
+    const bool willDiscard = IsActive() && onList;
     const int slot = ((m_DiagWriteIdx.fetch_add(1, std::memory_order_relaxed) % kDiagCount) + kDiagCount) % kDiagCount;
-    m_Diag[slot] = { type, willDiscard, willDiscard };
+    m_Diag[slot] = { type, onList, willDiscard };
     return willDiscard;
 }
 
@@ -502,7 +503,9 @@ void DiscardMovePlugin::OnImGuiRender()
         ImGui::PopID();
     }
     if (m_DiscardList.empty())
-        ImGui::TextDisabled("(empty - no moves are discarded)");
+        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f),
+            "List is EMPTY - pick a move in the dropdown above and click\n"
+            "'Add move to discard list', otherwise nothing gets discarded.");
 
     ImGui::Separator();
     ImGui::Checkbox("Diagnostics: last actions seen at the discard hook", &m_ShowDiagnostics);
@@ -530,7 +533,8 @@ void DiscardMovePlugin::OnImGuiRender()
             ImGui::Text(e.type < 0 ? "(unreadable)" 
                 : enum_reflection<EnumParkourAction>::GetString((EnumParkourAction)e.type));
             ImGui::TableNextColumn();
-            ImGui::Text(e.discardApplied ? "YES" : "no");
+            ImGui::Text(e.discardApplied ? "YES"
+                : (e.onList ? "on list (inactive)" : "not on list"));
         }
         ImGui::EndTable();
     }
