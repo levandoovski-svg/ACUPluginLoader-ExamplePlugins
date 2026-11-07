@@ -155,3 +155,12 @@ Crash stack top frames (`0x1400EEC05`, `0x1400E9A3A`, `0x141D591FD`, `0x141D4400
 - Gate/status/ImGui/INI text updated accordingly, and the debug readout now shows `DetachingFromWall` and labels `Walling` as `ClimbFacade/Walling`. `StateGateRequireValid=1` now also accepts walling.
 - Caveat: at the HumanStates level this allows force-freefall during any `Walling` sub-cycle (climb, hang, overhang), not only a vertical facade climb; separating those would require reading the `WhileOnWallSystem` testers instead of the human-state tree.
 
+## SESSION 6 — DETACH FROM SWING VALID; WALLING NO LONGER VALID (game 1.5.0)
+- Tester request: add `DetachFromSwing` as a valid human state, and remove `Walling` from the valid states.
+- `DetachFromSwing` Enter = **0x141AE07F0** (ACUFixes 1.5.0 `LoggingTheHumanStates.cpp`; sibling `InSwingBackAndForth` = 0x141AE0EC0).
+- VALID (allow): `InSafeJumpOrLoweringToHang`=0x141ADD2D0, `WallrunUp`=0x141A8CF40, `DetachingFromWall`=0x141A4BC20, `DetachFromSwing`=0x141AE07F0.
+- INVALID (block) unchanged: `OnGroundLowProfile`, `OnGroundHighProfile`, `OnPeakOrLedge`.
+- `Walling` (0x141A4EC10) is now in **neither** list, per the literal request to remove it from valid. It is not hard-blocked: with the default permissive gate it can still pass; with `StateGateRequireValid=1` it is refused. Keeping it out of the INVALID list is required because `DetachingFromWall` appears as its child during a detach — putting `Walling` in INVALID would block the detaching states again.
+- Gate status/ImGui/INI text updated; debug readout shows `ClimbFacade/Walling`, `DetachingFromWall` and `DetachFromSwing`.
+
+

@@ -539,11 +539,13 @@ namespace
     // or hanging on a wall/facade. ACUFixes' own state-tree dump ("When just
     // hanging on a wall" / "During a safe backeject") shows the climb-facade
     // cycle as this node with DetachingFromWall as its child; there is no
-    // separate ClimbFacade functor in this build.
+    // separate ClimbFacade functor in this build. Walling is intentionally in
+    // neither the valid nor the invalid list (see ProbeStateGate).
     constexpr uintptr_t kStateWalling = 0x141A4EC10;
     constexpr uintptr_t kStateInSafeJumpOrLoweringToHang = 0x141ADD2D0;
     constexpr uintptr_t kStateWallrunUp = 0x141A8CF40;
     constexpr uintptr_t kStateDetachingFromWall = 0x141A4BC20;
+    constexpr uintptr_t kStateDetachFromSwing = 0x141AE07F0;
 
     struct ActiveHumanStates
     {
@@ -554,6 +556,7 @@ namespace
         bool inSafeJumpOrLoweringToHang = false;
         bool wallrunUp = false;
         bool detachingFromWall = false;
+        bool detachFromSwing = false;
         int nodeCount = 0;
     };
 
@@ -575,6 +578,7 @@ namespace
         case kStateInSafeJumpOrLoweringToHang:     out.inSafeJumpOrLoweringToHang = true; break;
         case kStateWallrunUp:                      out.wallrunUp = true; break;
         case kStateDetachingFromWall:              out.detachingFromWall = true; break;
+        case kStateDetachFromSwing:                out.detachFromSwing = true; break;
         default: break;
         }
 
@@ -654,11 +658,11 @@ namespace
              << "// While held: 0 = re-issue the request every frame.\n"
              << "BreakfallHoldIntervalMs=0\n"
              << "// Human-state gate: block while the player is in OnGroundLowProfile,\n"
-             << "// OnGroundHighProfile or OnPeakOrLedge. Walling (the climb-facade\n"
-             << "// cycle) and DetachingFromWall are allowed.\n"
+             << "// OnGroundHighProfile or OnPeakOrLedge.\n"
              << "StateGateEnabled=1\n"
              << "// Also block unless the player is in InSafeJumpOrLoweringToHang,\n"
-             << "// WallrunUp, Walling (climb facade) or DetachingFromWall.\n"
+             << "// WallrunUp, DetachingFromWall or DetachFromSwing.\n"
+             << "// Walling (climb facade) is neither valid nor blocked by default.\n"
              << "StateGateRequireValid=0\n"
              << "// Minimum milliseconds between two force-freefall/teleport attempts.\n"
              << "ForceCooldownMs=300\n"
@@ -1267,6 +1271,7 @@ bool ExactPositionTeleportPlugin::ProbeStateGate()
     m_LastStateOnPeakOrLedge = states.onPeakOrLedge;
     m_LastStateWalling = states.walling;
     m_LastStateDetachingFromWall = states.detachingFromWall;
+    m_LastStateDetachFromSwing = states.detachFromSwing;
     m_LastStateSafeJumpOrLowering = states.inSafeJumpOrLoweringToHang;
     m_LastStateWallrunUp = states.wallrunUp;
 
@@ -1280,15 +1285,18 @@ bool ExactPositionTeleportPlugin::ProbeStateGate()
         return !m_LastStateGateBlocked;
     }
 
-    // Walling (the climb-facade cycle) and DetachingFromWall are intentionally
-    // VALID now: force-freefall is allowed while climbing a facade or while
-    // detaching from it.
+    // Detaching states are VALID: force-freefall is allowed while detaching
+    // from a wall or from a swing. Walling itself is deliberately in neither
+    // list: it is not an explicitly valid state, but it is not blocked either
+    // (DetachingFromWall appears as its child during a detach, so blocking
+    // Walling would block that valid state too). With StateGateRequireValid=1,
+    // Walling alone is refused.
     const bool inInvalidState =
         states.onGroundLowProfile || states.onGroundHighProfile ||
         states.onPeakOrLedge;
     const bool inValidState =
         states.inSafeJumpOrLoweringToHang || states.wallrunUp ||
-        states.walling || states.detachingFromWall;
+        states.detachingFromWall || states.detachFromSwing;
 
     if (inInvalidState)
     {
@@ -1312,8 +1320,8 @@ bool ExactPositionTeleportPlugin::ProbeStateGate()
         SetStatus(std::string("State gate: valid (") +
             (states.inSafeJumpOrLoweringToHang ? "InSafeJumpOrLoweringToHang " : "") +
             (states.wallrunUp ? "WallrunUp " : "") +
-            (states.walling ? "ClimbFacade/Walling " : "") +
-            (states.detachingFromWall ? "DetachingFromWall " : "") + ")");
+            (states.detachingFromWall ? "DetachingFromWall " : "") +
+            (states.detachFromSwing ? "DetachFromSwing " : "") + ")");
         return true;
     }
 
@@ -1684,8 +1692,8 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     {
         ImGui::SetTooltip(
             "When on, the force-freefall is also blocked unless the player is in\n"
-            "InSafeJumpOrLoweringToHang, WallrunUp, ClimbFacade/Walling or\n"
-            "DetachingFromWall.");
+            "InSafeJumpOrLoweringToHang, WallrunUp, DetachingFromWall or\n"
+            "DetachFromSwing. Walling (climb facade) is neither valid nor blocked.");
     }
 
     int cooldownMs = m_ForceCooldownMs;
@@ -1786,12 +1794,13 @@ void ExactPositionTeleportPlugin::OnImGuiRender()
     ImGui::Text("State gate: %s",
         !m_LastStateGateEvaluated ? "unread"
         : (m_LastStateGateBlocked ? "BLOCKED" : "allowed"));
-    ImGui::Text("  active: %s%s%s%s%s%s%s",
+    ImGui::Text("  active: %s%s%s%s%s%s%s%s",
         m_LastStateOnGroundLow ? "GroundLow " : "",
         m_LastStateOnGroundHigh ? "GroundHigh " : "",
         m_LastStateOnPeakOrLedge ? "PeakOrLedge " : "",
         m_LastStateWalling ? "ClimbFacade/Walling " : "",
         m_LastStateDetachingFromWall ? "DetachingFromWall " : "",
+        m_LastStateDetachFromSwing ? "DetachFromSwing " : "",
         m_LastStateSafeJumpOrLowering ? "SafeJump/Lowering " : "",
         m_LastStateWallrunUp ? "WallrunUp" : "");
     ImGui::Text("Last transform applied: %s", m_LastTransformApplied ? "yes" : "no");
