@@ -8,6 +8,7 @@
 #include "ACU/basic_types.h"
 #include "AvailableParkourAction.h"
 #include "EnumParkourAction.h"
+#include <unordered_map>
 
 static constexpr uint64 k_Type52FancyVTable_Runtime = 0x143A522F0;      // 1.5.0 verified
 static constexpr uint64 k_Type52FancyVTable_TransientBase = 0x143A41930;
@@ -67,16 +68,33 @@ inline int GetTypeIntSafe(const AvailableParkourAction* action)
     if (!action) return -1;
     const uint64 table = (uint64)action->fancyVTable;
     if (!table) return -1;
+    // shortcut: vtable->type cache skips the VirtualQuery plausibility gate and
+    // the type vfunc call entirely once a table is known. Table identity is
+    // stable for real tables; only risk is a stale type for a table whose
+    // memory got freed and reused between cycles - wrong branch at worst, never
+    // a wild call (calls only happen on the cache-miss path). Upgrade if any
+    // stale-misread ever matters.
+    static std::unordered_map<uint64, int> s_TypeCache;
+    if (auto it = s_TypeCache.find(table); it != s_TypeCache.end())
+        return it->second;
     // Readability alone is NOT enough: a readable garbage "table" holds a
     // garbage fn pointer, and calling it is the wild-call crash we chased.
     if (!IsPlausibleFancyTable(table)) return -1;
     const FancyVFunction& slot = action->fancyVTable->fancyVirtuals[ParkourActionKnownFancyVFuncs::GetEnumParkourAction::idx];
+    int type;
     if (!slot.fn)
     {
         if (table == k_Type52FancyVTable_Runtime ||
             table == k_Type52FancyVTable_TransientBase)
-            return (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
-        return -1;
+            type = (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
+        else
+            type = -1;
     }
-    return (int)GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)((AvailableParkourAction*)action);
+    else
+    {
+        type = (int)GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)((AvailableParkourAction*)action);
+    }
+    if (type >= 0)
+        s_TypeCache.emplace(table, type); // only trust real tables
+    return type;
 }
