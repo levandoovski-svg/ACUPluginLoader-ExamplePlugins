@@ -70,7 +70,7 @@ private:
     bool IsBoundKeyDown() const;   // hold-mode: bound key/pad held right now
     bool IsPadCode(int key) const;
     void UpdatePadStates();
-    void CaptureBinding(const std::array<bool, WallrunPadCode_COUNT>& padEdges);
+    void CaptureBinding(const std::array<bool, WallrunPad_COUNT>& padEdges);
     void LoadSettings();
     void SaveSettings() const;
 
@@ -85,8 +85,8 @@ private:
     bool m_WaitingForKey = false;
 
     // Rising-edge input tracking (0x01..0xFE keyboard/mouse + pad codes).
-    std::array<bool, WallrunPadCode_COUNT> m_PadDown {};
+    std::array<bool, WallrunPad_COUNT> m_PadDown {};
     std::array<bool, 0xFF> m_KbDownPrev {};
     std::array<bool, 0xFF> m_KbPressed {};
-    std::array<bool, WallrunPadCode_COUNT> m_PadDownPrev {};
+    std::array<bool, WallrunPad_COUNT> m_PadDownPrev {};
 };

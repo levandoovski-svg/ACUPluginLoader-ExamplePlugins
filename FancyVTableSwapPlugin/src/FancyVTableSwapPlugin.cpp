@@ -44,6 +44,7 @@ static std::string GetLegacyIniPath()
 // Gamepad (XInput) input, same mechanism as FreeJumpPlugin /
 // ExactPositionTeleportPlugin. Dynamic load: the game already
 // imports xinput1_3.dll, so an XInput-capable pad is supported.
+namespace {
 struct XInputPadState
 {
     uint32_t packetNumber;
@@ -291,7 +292,7 @@ void FancyVTableSwapPlugin::OnUpdate()
         m_KbPressed[vk] = down && !m_KbDownPrev[vk];
         m_KbDownPrev[vk] = down;
     }
-    std::array<bool, WallrunPadCode_COUNT> padEdges {};
+    std::array<bool, WallrunPad_COUNT> padEdges {};
     for (int c = 0; c < WallrunPad_COUNT; ++c)
     {
         padEdges[c] = m_PadDown[c] && !m_PadDownPrev[c];
@@ -317,7 +318,7 @@ void FancyVTableSwapPlugin::OnUpdate()
     }
 }
 
-void FancyVTableSwapPlugin::CaptureBinding(const std::array<bool, WallrunPadCode_COUNT>& padEdges)
+void FancyVTableSwapPlugin::CaptureBinding(const std::array<bool, WallrunPad_COUNT>& padEdges)
 {
     for (int vk = 1; vk <= 0xFE; ++vk)
     {
