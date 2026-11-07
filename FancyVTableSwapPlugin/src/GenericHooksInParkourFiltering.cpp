@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "ParkourDebugging/GenericHooksInParkourFiltering.h"
+#include <atomic>
+#include <cstdio>
 #include "ACU/basic_types.h"
 #include "ACU/Memory/ACUAllocs.h"
 #include "ParkourDebugging/AvailableParkourAction.h"
@@ -337,6 +339,52 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
     return result;
 }
 
+// SEH guard around the whole selection pipeline. The surviving wild-call class
+// (crash inside the game's own FinalFilter1 — e.g. under FreeJump's dynamically
+// installed fallback cave — on a candidate whose table/internal data is stale)
+// cannot be caught by validating pointers from outside: the game's fn itself
+// dispatches slots we can't enumerate. Swallow the exception, skip the cycle,
+// count it (UI + debug output). The wrapper must stay free of C++ objects that
+// need unwinding for __try to be legal.
+static std::atomic<int> g_SortPipelineExceptions{ 0 };
+int SortPipeline_ExceptionCount()
+{
+    return g_SortPipelineExceptions.load(std::memory_order_relaxed);
+}
+
+static int SortPipeline_LogException(unsigned int code, EXCEPTION_POINTERS*)
+{
+    g_SortPipelineExceptions.fetch_add(1, std::memory_order_relaxed);
+    char buf[64];
+    sprintf_s(buf, "FVTS: pipeline exception swallowed (code 0x%X)\n", code);
+    OutputDebugStringA(buf);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static int SortAndSelect_Guarded(
+    ParkourTester* parkourTester,
+    __m128* p_locationOfOrigin,
+    uint64 a3,
+    __m128* p_directionOfMovementInputWorldSpace,
+    float a5,
+    int a6,
+    char a7,
+    __int64 a8,
+    SmallArray<AvailableParkourAction*>& p_parkourSensorsResults,
+    std::shared_ptr<ParkourCycleLogged>* currentCycle)
+{
+    __try
+    {
+        return SortAndSelectBestMatchingAction_FullReplacement_inner(
+            parkourTester, p_locationOfOrigin, a3, p_directionOfMovementInputWorldSpace,
+            a5, a6, a7, a8, p_parkourSensorsResults, *currentCycle);
+    }
+    __except (SortPipeline_LogException(GetExceptionCode(), GetExceptionInformation()))
+    {
+        return RESULT_OF_PARKOUR_SORT_AND_SELECT__NO_ACTIONS_ACCEPTED;
+    }
+}
+
 int SortAndSelectBestMatchingAction_FullReplacement(
     ParkourTester* parkourTester,
     __m128* p_locationOfOrigin,
@@ -349,13 +397,13 @@ int SortAndSelectBestMatchingAction_FullReplacement(
     SmallArray<AvailableParkourAction*>& p_parkourSensorsResults)
 {
     std::shared_ptr<ParkourCycleLogged> currentCycle = GetCurrentLoggedParkourCycle();
-    int selectedIdx = SortAndSelectBestMatchingAction_FullReplacement_inner(
+    int selectedIdx = SortAndSelect_Guarded(
         parkourTester,
         p_locationOfOrigin,
         a3, p_directionOfMovementInputWorldSpace,
         a5, a6, a7, a8,
         p_parkourSensorsResults,
-        currentCycle
+        &currentCycle
     );
     if (selectedIdx != RESULT_OF_PARKOUR_SORT_AND_SELECT__NO_ACTIONS_ACCEPTED)
     {

@@ -70,6 +70,9 @@ struct ParkourCallbacks
     float m_CallbackPriority;
     const char* m_Name = nullptr;
 };
+// SEH guard stats: exceptions swallowed inside the sort&select pipeline
+// (wild calls in game code we cannot validate from outside).
+int SortPipeline_ExceptionCount();
 class GenericHooksInParkourFiltering
 {
 public:

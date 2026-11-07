@@ -288,6 +288,10 @@ void FancyVTableSwapPlugin::OnImGuiRender()
         }
     }
     ImGui::Text("Scanner (creation hook): %d live actions, last cycle", scannedActions);
+    const int swallowed = SortPipeline_ExceptionCount();
+    if (swallowed)
+        ImGui::TextColored(ImVec4(1, 0.9f, 0.2f, 1.0f),
+            "Pipeline exceptions swallowed: %d (a bad candidate skipped a cycle)", swallowed);
 
     // Discovered tables (scanner fallback if the sort hook never fires).
     std::vector<DiscoveredVTable> disc;
