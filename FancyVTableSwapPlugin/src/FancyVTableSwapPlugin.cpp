@@ -7,7 +7,7 @@
 #include "ParkourDebugging/GetTypeIntSafe.h"
 #include "ACU/ACUGetSingletons.h"
 #include "ACU/Human.h"
-#include "ACU/BaseEntity.h"
+#include "ACU/Entity.h"
 #include "ACU_DefineNativeFunction.h"
 #include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include "imgui/imgui.h"
@@ -65,6 +65,9 @@ static Human* GetPlayerHumanSafely()
     __try { return Human::GetForPlayer(); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
+
+static void ServiceLift();
+static void ServeLiftStart(); // defined below; ServiceLift (the hook body) calls it
 
 // Per-frame game-thread hook ("safe injection" pattern from ExactTeleport:
 // FOV site 0x141F3FE3B, 6 stolen bytes) — the game expects movement mutations
