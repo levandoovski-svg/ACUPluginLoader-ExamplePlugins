@@ -68,10 +68,14 @@ public:
     AvailableParkourAction* OnChooseAfterSorting(
         SmallArray<AvailableParkourAction*>& allActionsSorted,
         AvailableParkourAction* selectedByGame);
+    // Separate mode: swap the stepDownWaistHeight fancy table for the
+    // jumpIntoWindow one, BEFORE any type-specific creation call runs.
+    void OnPostConstruct(AvailableParkourAction& newAction);
 
 private:
     bool IsActive() const;          // discard gating (m_Hotkey, hold/toggle)
     bool IsEnforceActive() const;   // enforce gating (m_EnforceHotkey, hold)
+    bool IsSwapActive() const;      // vtable-swap gating (m_SwapHotkey, hold/toggle)
     bool IsBoundKeyDown() const;   // hold-mode: bound key/pad held right now
     bool IsPadCode(int key) const;
     void UpdatePadStates();
@@ -99,10 +103,14 @@ private:
     bool m_Enabled = true;
     int m_Hotkey = 0x77; // F8 - discard key
     int m_EnforceHotkey = 0x76; // F7 - enforce jumpIntoWindow while held
+    int m_SwapHotkey = 0x75;    // F6 - vtable-swap stepDownWaistHeight->jumpIntoWindow
     bool m_HoldMode = true;
     bool m_ToggleState = false;
     bool m_WaitingForKey = false;
     bool m_EnforceWaitingForKey = false;
+    bool m_SwapHoldMode = true;
+    bool m_SwapToggleState = false;
+    bool m_SwapWaitingForKey = false;
 
     // The moves to discard, persisted to INI as enum names.
     std::vector<EnumParkourAction> m_DiscardList;

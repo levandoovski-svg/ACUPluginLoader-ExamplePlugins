@@ -112,6 +112,9 @@ DiscardMovePlugin::DiscardMovePlugin()
     m_Callbacks.ChooseAfterSorting_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame) -> AvailableParkourAction* {
         return static_cast<DiscardMovePlugin*>(userData)->OnChooseAfterSorting(actions, selectedByGame);
     };
+    m_Callbacks.PostConstruct_fnp = [](void* userData, AvailableParkourAction& newAction) {
+        static_cast<DiscardMovePlugin*>(userData)->OnPostConstruct(newAction);
+    };
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 4.0f;
     m_Callbacks.m_Name = "DiscardMovePlugin_DiscardChosenMoves";
@@ -171,6 +174,19 @@ bool DiscardMovePlugin::IsEnforceActive() const
     return (GetAsyncKeyState(m_EnforceHotkey) & 0x8000) != 0;
 }
 
+// Vtable-swap mode: switch in the menu is Hold/Toggle; default Hold.
+bool DiscardMovePlugin::IsSwapActive() const
+{
+    if (!m_Enabled) return false;
+    if (m_SwapHoldMode)
+    {
+        if (IsPadCode(m_SwapHotkey))
+            return m_PadDown[m_SwapHotkey - kDiscardPadKeyBase];
+        return (GetAsyncKeyState(m_SwapHotkey) & 0x8000) != 0;
+    }
+    return m_SwapToggleState;
+}
+
 void DiscardMovePlugin::LoadSettings()
 {
     std::ifstream file(GetIniPath());
@@ -189,6 +205,12 @@ void DiscardMovePlugin::LoadSettings()
                 try { m_Hotkey = std::stoi(line.substr(7), nullptr, 16); } catch (...) {}
             else if (line.rfind("EnforceHotkey=", 0) == 0)
                 try { m_EnforceHotkey = std::stoi(line.substr(14), nullptr, 16); } catch (...) {}
+            else if (line.rfind("SwapHotkey=", 0) == 0)
+                try { m_SwapHotkey = std::stoi(line.substr(11), nullptr, 16); } catch (...) {}
+            else if (line.rfind("SwapHoldMode=", 0) == 0)
+                try { m_SwapHoldMode = std::stoi(line.substr(13)) != 0; } catch (...) {}
+            else if (line.rfind("SwapToggleState=", 0) == 0)
+                try { m_SwapToggleState = std::stoi(line.substr(16)) != 0; } catch (...) {}
             else if (line.rfind("Enabled=", 0) == 0)
                 m_Enabled = (line.substr(8) == "1");
             else if (line.rfind("HoldMode=", 0) == 0)
@@ -224,6 +246,8 @@ void DiscardMovePlugin::LoadSettings()
     if ((m_Hotkey < 1 || m_Hotkey > 0xFE) && !padKey) m_Hotkey = 0x77;
     const bool padKeyEnforce = m_EnforceHotkey >= kDiscardPadKeyBase && m_EnforceHotkey < kDiscardPadKeyBase + DiscardPad_COUNT;
     if ((m_EnforceHotkey < 1 || m_EnforceHotkey > 0xFE) && !padKeyEnforce) m_EnforceHotkey = 0x76;
+    const bool padKeySwap = m_SwapHotkey >= kDiscardPadKeyBase && m_SwapHotkey < kDiscardPadKeyBase + DiscardPad_COUNT;
+    if ((m_SwapHotkey < 1 || m_SwapHotkey > 0xFE) && !padKeySwap) m_SwapHotkey = 0x75;
 }
 
 void DiscardMovePlugin::SaveSettings() const
@@ -235,6 +259,9 @@ void DiscardMovePlugin::SaveSettings() const
         {
             file << "Hotkey=" << std::hex << m_Hotkey << std::dec << "\n";
             file << "EnforceHotkey=" << std::hex << m_EnforceHotkey << std::dec << "\n";
+            file << "SwapHoldMode=" << (m_SwapHoldMode ? 1 : 0) << "\n";
+            file << "SwapToggleState=" << (m_SwapToggleState ? 1 : 0) << "\n";
+            file << "SwapHotkey=" << std::hex << m_SwapHotkey << std::dec << "\n";
             file << "Enabled=" << (m_Enabled ? 1 : 0) << "\n";
             file << "HoldMode=" << (m_HoldMode ? 1 : 0) << "\n";
             file << "ToggleState=" << (m_ToggleState ? 1 : 0) << "\n";
@@ -296,6 +323,26 @@ AvailableParkourAction* DiscardMovePlugin::OnChooseAfterSorting(
         return action;
     }
     return nullptr;
+}
+
+// Fancy vtable addresses from the ACU parkour debugger "Copy to clipboard"
+// (ACU 1.5.0 image, constant for the loaded module).
+static constexpr uint64 k_StepDownWaistHeight_FancyVTable = 0x143A19880;
+static constexpr uint64 k_JumpIntoWindow_FancyVTable      = 0x143A15AB0;
+
+// Separate mode: while the swap gate is ACTIVE, every freshly created
+// stepDownWaistHeight (8) becomes a jumpIntoWindow (123) by table swap.
+// This runs at PostConstruct - BEFORE Set2FloatsAfterCreation and
+// InitialTestIfActionFits - so every later creation step runs with the FINAL
+// table (the swap-after-creation order is what made converted actions behave
+// unpredictably in the FailedWallRunPlugin experiments). Identity-check the
+// source table by address: no type vfunc call, no cache, no false positives.
+void DiscardMovePlugin::OnPostConstruct(AvailableParkourAction& newAction)
+{
+    if (!IsSwapActive()) return;
+    if ((uint64)newAction.fancyVTable != k_StepDownWaistHeight_FancyVTable) return;
+    if (!IsPlausibleFancyTable(k_JumpIntoWindow_FancyVTable)) return;
+    newAction.fancyVTable = (ParkourAction_FancyVTable*)k_JumpIntoWindow_FancyVTable;
 }
 
 void DiscardMovePlugin::UpdatePadStates()
@@ -368,6 +415,10 @@ void DiscardMovePlugin::OnUpdate()
     {
         CaptureBinding(&m_EnforceHotkey, padEdges);
     }
+    if (m_SwapWaitingForKey)
+    {
+        CaptureBinding(&m_SwapHotkey, padEdges);
+    }
 
     if (m_Enabled && !m_HoldMode)
     {
@@ -377,6 +428,18 @@ void DiscardMovePlugin::OnUpdate()
         if (pressed)
         {
             m_ToggleState = !m_ToggleState;
+            SaveSettings();
+        }
+    }
+
+    if (m_Enabled && !m_SwapHoldMode)
+    {
+        const bool pressedSwap = IsPadCode(m_SwapHotkey)
+            ? padEdges[m_SwapHotkey - kDiscardPadKeyBase]
+            : m_KbPressed[m_SwapHotkey];
+        if (pressedSwap)
+        {
+            m_SwapToggleState = !m_SwapToggleState;
             SaveSettings();
         }
     }
@@ -406,6 +469,7 @@ void DiscardMovePlugin::CaptureBinding(int* targetKey, const std::array<bool, Di
             *targetKey = vk;
             m_WaitingForKey = false;
             m_EnforceWaitingForKey = false;
+            m_SwapWaitingForKey = false;
             SaveSettings();
             return;
         }
@@ -417,6 +481,7 @@ void DiscardMovePlugin::CaptureBinding(int* targetKey, const std::array<bool, Di
             *targetKey = kDiscardPadKeyBase + c;
             m_WaitingForKey = false;
             m_EnforceWaitingForKey = false;
+            m_SwapWaitingForKey = false;
             SaveSettings();
             return;
         }
@@ -456,6 +521,23 @@ void DiscardMovePlugin::OnImGuiRender()
     if (m_EnforceWaitingForKey)
         ImGui::TextWrapped("Press a keyboard key, mouse button or gamepad button to bind it...");
     ImGui::TextDisabled("Hold the enforce key while baiting the jump: jumpIntoWindow is\nkept alive even if vanilla rejected it and wins over every other move.");
+
+    ImGui::Separator();
+    ImGui::Text("VTable swap stepDownWaistHeight->jumpIntoWindow: %s", IsSwapActive() ? "ACTIVE" : "inactive");
+    bool swapHoldMode = m_SwapHoldMode;
+    if (ImGui::RadioButton("Hold##swap", swapHoldMode)) { m_SwapHoldMode = true; SaveSettings(); }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Toggle##swap", !swapHoldMode)) { m_SwapHoldMode = false; SaveSettings(); }
+    ImGui::Text("Swap key: %s", KeyCodeLabel(m_SwapHotkey).c_str());
+    ImGui::SameLine();
+    if (ImGui::Button(m_SwapWaitingForKey ? "Cancel rebind" : "Rebind swap"))
+        m_SwapWaitingForKey = !m_SwapWaitingForKey;
+    if (m_SwapWaitingForKey)
+        ImGui::TextWrapped("Press a keyboard key, mouse button or gamepad button to bind it...");
+    ImGui::TextColored(ImVec4(1.f, 0.85f, 0.3f, 1.f),
+        "EXPERIMENTAL: every created stepDownWaistHeight (8) is rebuilt as a\n"
+        "jumpIntoWindow at PostConstruct (before any type-specific setup).\n"
+        "At waist-height steps away from windows this WILL look/behave wrong.");
 
     ImGui::Separator();
     ImGui::TextWrapped("Moves discarded at creation while the hotkey is ACTIVE:");
