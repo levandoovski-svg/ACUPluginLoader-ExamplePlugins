@@ -4,7 +4,7 @@
 #include "ACU/SmallArray.h"
 #include "ParkourDebugging/GenericHooksInParkourFiltering.h"
 #include <memory>
-#include <mutex>
+#include <set>
 
 class AvailableParkourAction;
 
@@ -47,8 +47,7 @@ private:
     bool m_ToggleState = false;
     bool m_WaitingForKey = false;
 
-    // Counters (written on game thread, read by UI).
-    mutable std::mutex m_Mutex;
-    int m_KeptAlive = 0;
-    int m_Discarded = 0;
+    // Keys held at the moment "Rebind" was clicked - rebinding accepts only
+    // fresh presses (keys NOT in this set), ignoring stale transition bits.
+    std::set<int> m_KeysDownAtCapture;
 };

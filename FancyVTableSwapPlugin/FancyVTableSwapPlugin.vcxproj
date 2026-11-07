@@ -21,9 +21,9 @@
     <VCProjectVersion>16.0</VCProjectVersion>
 
     <ProjectGuid>{d2a7c1e0-1f2a-4a8b-9c3d-111111111111}</ProjectGuid>
-    <RootNamespace>FancyVTableSwapPlugin</RootNamespace>
+    <RootNamespace>FreeFormWallrun</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>FancyVTableSwapPlugin</ProjectName>
+    <ProjectName>FreeFormWallrun</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">

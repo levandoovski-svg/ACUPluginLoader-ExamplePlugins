@@ -1,6 +1,4 @@
-name: Build FancyVTableSwapPlugin
-
-on:
+name: Build FreeFormWallrun
   push:
     branches: [ "**" ]
     paths:
@@ -41,7 +39,7 @@ jobs:
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
 
-    - name: Build FancyVTableSwapPlugin
+    - name: Build FreeFormWallrun
       shell: pwsh
       run: |
         $root = "${{ github.workspace }}"
@@ -50,7 +48,7 @@ jobs:
     - name: Upload DLL
       uses: actions/upload-artifact@v4
       with:
-        name: FancyVTableSwapPlugin
+        name: FreeFormWallrun
         path: |
-          s/FancyVTableSwapPlugin/build/x64/Release/plugins/FancyVTableSwapPlugin.dll
-          s/FancyVTableSwapPlugin/**/FancyVTableSwapPlugin.map
+          s/FancyVTableSwapPlugin/build/x64/Release/plugins/FreeFormWallrun.dll
+          s/FancyVTableSwapPlugin/**/FreeFormWallrun.map

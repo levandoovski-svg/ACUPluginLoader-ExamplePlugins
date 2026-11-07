@@ -7,6 +7,7 @@
 #include <fstream>
 #include <shlobj.h>
 #include <cstdio>
+#include <set>
 
 // Passive freeform-wallrun plugin (the proven mode):
 // while the hotkey is ACTIVE, the game's own wallrun candidates are discarded
@@ -27,6 +28,14 @@ static std::string GetIniPath()
 {
     char docs[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, docs)))
+        return std::string(docs) + "\\Assassin's Creed Unity\\FreeFormWallrun.ini";
+    return "FreeFormWallrun.ini";
+}
+// Pre-rename INI, read once on load so existing hotkey settings survive.
+static std::string GetLegacyIniPath()
+{
+    char docs[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, docs)))
         return std::string(docs) + "\\Assassin's Creed Unity\\FancyVTableSwapPlugin.ini";
     return "FancyVTableSwapPlugin.ini";
 }
@@ -41,7 +50,7 @@ FancyVTableSwapPlugin::FancyVTableSwapPlugin()
     };
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 4.0f;
-    m_Callbacks.m_Name = "FancyVTableSwapPlugin_DiscardWallruns";
+    m_Callbacks.m_Name = "FreeFormWallrun_DiscardWallruns";
     LoadSettings();
 }
 
@@ -78,6 +87,7 @@ bool FancyVTableSwapPlugin::IsActive() const
 void FancyVTableSwapPlugin::LoadSettings()
 {
     std::ifstream file(GetIniPath());
+    if (!file) { file.clear(); file.open(GetLegacyIniPath()); }
     if (!file) return;
     std::string line;
     while (std::getline(file, line))
@@ -120,12 +130,7 @@ void FancyVTableSwapPlugin::SaveSettings() const
 bool FancyVTableSwapPlugin::OnCreationDiscardOverride(AvailableParkourAction& action)
 {
     if (!IsActive()) return false;
-    if (GetTypeIntSafe(&action) != (int)EnumParkourAction::wallrunUpFromGroundFailed_mb) return false;
-    {
-        std::lock_guard lk(m_Mutex);
-        ++m_KeptAlive;
-    }
-    return true;
+    return GetTypeIntSafe(&action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
 }
 
 // While armed, discard every naturally-created 53 (wallrunUpFromGround) and 54
@@ -136,14 +141,8 @@ bool FancyVTableSwapPlugin::OnForceCreationDiscard(AvailableParkourAction& actio
 {
     if (!IsActive()) return false;
     const int type = GetTypeIntSafe(&action);
-    const bool discard = type == (int)EnumParkourAction::wallrunUpFromGround_mb
-                      || type == (int)EnumParkourAction::wallrunUpToHang;
-    if (discard)
-    {
-        std::lock_guard lk(m_Mutex);
-        ++m_Discarded;
-    }
-    return discard;
+    return type == (int)EnumParkourAction::wallrunUpFromGround_mb
+        || type == (int)EnumParkourAction::wallrunUpToHang;
 }
 
 void FancyVTableSwapPlugin::OnUpdate()
@@ -152,10 +151,15 @@ void FancyVTableSwapPlugin::OnUpdate()
     {
         for (int vk = 1; vk <= 0xFE; ++vk)
         {
-            if (GetAsyncKeyState(vk) & 1)
+            // Held RIGHT NOW and NOT already down when capture was armed =
+            // a genuinely fresh press. The old `& 1` transition bit carries
+            // stray edge states from previous frames, which made rebinding
+            // cycle through random keys.
+            if ((GetAsyncKeyState(vk) & 0x8000) && !m_KeysDownAtCapture.count(vk))
             {
                 m_Hotkey = vk;
                 m_WaitingForKey = false;
+                m_KeysDownAtCapture.clear();
                 SaveSettings();
                 break;
             }
@@ -172,7 +176,7 @@ void FancyVTableSwapPlugin::OnUpdate()
 void FancyVTableSwapPlugin::OnImGuiRender()
 {
     bool enabled = m_Enabled;
-    if (ImGui::Checkbox("Enable Wallrun Discarder (passive: natural freeform 52 only, hotkey ACTIVE)", &enabled))
+    if (ImGui::Checkbox("Enable FreeFormWallrun (passive: natural freeform 52 only, hotkey ACTIVE)", &enabled))
     {
         m_Enabled = enabled;
         SaveSettings();
@@ -189,14 +193,18 @@ void FancyVTableSwapPlugin::OnImGuiRender()
     ImGui::Text("Hotkey: 0x%02X", m_Hotkey);
     ImGui::SameLine();
     if (ImGui::Button(m_WaitingForKey ? "Cancel" : "Rebind"))
-        m_WaitingForKey = !m_WaitingForKey;
-    if (m_WaitingForKey) ImGui::Text("Press any key...");
-
-    ImGui::Separator();
     {
-        std::lock_guard lk(m_Mutex);
-        ImGui::Text("Kept alive: %d natural freeform 52s this session", m_KeptAlive);
-        ImGui::Text("Discarded: %d wallrun 53/54 candidates this session", m_Discarded);
+        if (!m_WaitingForKey)
+        {
+            // Snapshot keys already down (including the mouse button that
+            // just clicked this Rebind button): rebinding only accepts
+            // presses that start AFTER this moment.
+            m_KeysDownAtCapture.clear();
+            for (int vk = 1; vk <= 0xFE; ++vk)
+                if (GetAsyncKeyState(vk) & 0x8000)
+                    m_KeysDownAtCapture.insert(vk);
+        }
+        m_WaitingForKey = !m_WaitingForKey;
     }
-    ImGui::TextWrapped("While armed: wallrun (53) and wallrun-to-overhang (54) candidates are destroyed at creation via the vanilla reject path; natural freeform 52s survive and the game picks them itself. The sort&&select site is never patched, so FreeJump keeps its own normal path. On non-standable objects nothing happens - use FreeJump's overrider there.");
+    if (m_WaitingForKey) ImGui::Text("Press any key to bind...");
 }
