@@ -5,10 +5,16 @@
 #include "ParkourDebugging/EnumParkourAction.h"
 #include "ParkourDebugging/ParkourLog.h"
 #include "ParkourDebugging/GetTypeIntSafe.h"
+#include "ACU/ACUGetSingletons.h"
+#include "ACU/Human.h"
+#include "ACU/BaseEntity.h"
+#include "ACU_DefineNativeFunction.h"
+#include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include "imgui/imgui.h"
 #include <fstream>
 #include <shlobj.h>
 #include <unordered_map>
+#include <set>
 #include <algorithm>
 #include <cstdio>
 
@@ -29,6 +35,95 @@ bool FVTS_ShouldSkipFitnessCull(AvailableParkourAction* action)
         && GetTypeIntSafe(action) == (int)EnumParkourAction::wallrunUpFromGroundFailed_mb;
 }
 
+// Candidates we converted from 53 to 52 THIS cycle (fallback path). Selection
+// prefers natural-born 52s; the set is single-cycle (actions die with their
+// cycle), cleared after each force-select.
+static std::set<AvailableParkourAction*> s_ConvertedThisCycle;
+
+// ── Force lift ───────────────────────────────────────────────────────────────
+// The freeform wallrun's own height depends on the wall context and is often
+// tiny. While the hotkey is held and a freeform 52 was force-selected, lift
+// the player straight up (exact-teleport style position write + one HSTE
+// reset at the cap) until the configured height above lift-start is reached.
+// shortcut: lift settings are file statics, not INI-persisted.
+DEFINE_GAME_FUNCTION(Human__Dispatch_HSTE_ResetBehavior, 0x14131A530, char, __fastcall, (Human* a1));
+static bool   g_LiftEnabledOn = true;
+static float  g_LiftHeight = 6.0f;   // meters above lift-start
+static float  g_LiftSpeed  = 4.0f;   // meters/second
+static bool   g_LiftShouldStart = false;   // set by force-select, served by hook
+static bool   g_LiftActive = false;
+static float  g_LiftTargetZ = 0.0f;
+static ULONGLONG g_LiftLastTickMs = 0;
+
+static Entity* GetPlayerSafely()
+{
+    __try { return ACU::GetPlayer(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+static Human* GetPlayerHumanSafely()
+{
+    __try { return Human::GetForPlayer(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+// Per-frame game-thread hook ("safe injection" pattern from ExactTeleport:
+// FOV site 0x141F3FE3B, 6 stolen bytes) — the game expects movement mutations
+// here, never on the Present thread.
+static void ServiceLift()
+{
+    ServeLiftStart();
+    if (!g_LiftActive || !FVTS_IsEnforcing()) { g_LiftActive = false; return; }
+    const ULONGLONG now = GetTickCount64();
+    const float dt = float(now - g_LiftLastTickMs) / 1000.0f;
+    g_LiftLastTickMs = now;
+    if (dt <= 0.0f || dt > 0.05f) return; // tolerate first/mostly-paused ticks
+    Entity* player = GetPlayerSafely();
+    if (!player) return;
+    __try
+    {
+        Vector3f& pos = player->GetPosition();
+        pos.z += g_LiftSpeed * dt;
+        if (pos.z >= g_LiftTargetZ)
+        {
+            pos.z = g_LiftTargetZ;
+            g_LiftActive = false;
+            if (Human* human = GetPlayerHumanSafely())
+                Human__Dispatch_HSTE_ResetBehavior(human); // re-evaluate parkour state
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_LiftActive = false; }
+}
+
+struct DeferredLiftHook : AutoAssemblerCodeHolder_Base
+{
+    DeferredLiftHook()
+    {
+        constexpr uintptr_t whenSettingFOVforFrame = 0x141F3FE3B;
+        PresetScript_CCodeInTheMiddle(whenSettingFOVforFrame, 6,
+            [](AllRegisters*) { ServiceLift(); });
+    }
+};
+static std::unique_ptr<AutoAssembleWrapper<DeferredLiftHook>> s_LiftHook;
+
+static void StartLiftIfNeeded()
+{
+    if (!g_LiftEnabledOn || g_LiftActive) return;
+    g_LiftShouldStart = true;
+    g_LiftLastTickMs = 0;
+}
+
+static void ServeLiftStart()
+{
+    if (!g_LiftShouldStart) return;
+    g_LiftShouldStart = false;
+    Entity* player = GetPlayerSafely();
+    if (!player) return;
+    const Vector3f& pos = player->GetPosition();
+    g_LiftTargetZ = pos.z + g_LiftHeight;
+    g_LiftActive = true;
+    g_LiftLastTickMs = GetTickCount64();
+}
+
 static std::string GetIniPath()
 {
     char docs[MAX_PATH];
@@ -47,6 +142,9 @@ FancyVTableSwapPlugin::FancyVTableSwapPlugin()
     };
     m_Callbacks.OverrideCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool {
         return static_cast<FancyVTableSwapPlugin*>(userData)->OnCreationDiscardOverride(action);
+    };
+    m_Callbacks.PostConstruct_fnp = [](void* userData, AvailableParkourAction& action) -> void {
+        static_cast<FancyVTableSwapPlugin*>(userData)->OnPostConstruct(action);
     };
     // Priority before ACUFixes' enforcer (10000).
     m_Callbacks.m_UserData = this;
@@ -71,6 +169,11 @@ void FancyVTableSwapPlugin::OnBeforeActivate()
     gph->Subscribe(m_Callbacks);
     m_Activator = gph->RequestGPHSortAndSelect();
     m_ActivatorCreation = gph->RequestGPHCreation();
+    if (!s_LiftHook)
+    {
+        s_LiftHook = std::make_unique<AutoAssembleWrapper<DeferredLiftHook>>();
+        s_LiftHook->Activate();
+    }
 }
 
 bool FancyVTableSwapPlugin::IsActive() const
@@ -143,6 +246,21 @@ AvailableParkourAction* FancyVTableSwapPlugin::ChooseBeforeFiltering(SmallArray<
     return nullptr; // diagnostics only; never force-select
 }
 
+// Enforce-52 fallback path (post-construct): the game always creates natural
+// 53s — including on non-standable objects where native 52s never appear —
+// so while armed we convert them to 52 as backup candidates. Selection still
+// prefers natural-born 52s when any exist (their trajectory data is coherent).
+void FancyVTableSwapPlugin::OnPostConstruct(AvailableParkourAction& action)
+{
+    s_EnforceActive = m_Enabled && IsActive();
+    if (!s_EnforceActive) return;
+    if (GetTypeIntSafe(&action) != (int)EnumParkourAction::wallrunUpFromGround_mb) return;
+    action.fancyVTable = (ParkourAction_FancyVTable*)k_Type52FancyVTable_Runtime;
+    s_ConvertedThisCycle.insert(&action);
+    std::lock_guard lk(m_Mutex);
+    ++m_EnforceConverted;
+}
+
 // Enforce-52 stage 1 (discard override): keep natural type-52s alive even
 // when the vanilla verdict rejects them — on handhold walls the freeform
 // wallrun gets discarded here, which is exactly what we waive. NO vtable
@@ -160,61 +278,79 @@ bool FancyVTableSwapPlugin::OnCreationDiscardOverride(AvailableParkourAction& ac
     return true;
 }
 
-// Enforce-52 stage 3 (force-select): prefer a type-52 that passed both final
-// filters; fall back to the first 52 if none passed (ACUFixes' own enforcer
-// also forces unfiltered picks). Stages 1 (keep at creation) and 2 (weight
-// boost in the ParkourLog weights hook) get at least one 52 into the sorted
-// array even on handhold walls.
+// Enforce-52 stage 3 (force-select): prefer a NATURAL-BORN type-52 that passed
+// both final filters; fall back to the first natural 52, then to a converted
+// (fallback-path) 52 for walls where the game never creates the native move
+// (non-standable objects). The scanner tells born-as apart via the conversion
+// set. Stages 1 (keep at creation) and 2 (weight boost in the ParkourLog
+// weights hook) get at least one 52 into the sorted array even on handhold
+// walls.
 AvailableParkourAction* FancyVTableSwapPlugin::ChooseAfterSorting(
     SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame)
 {
     (void)selectedByGame;
     s_EnforceActive = m_Enabled && IsActive();
-    if (!s_EnforceActive) return nullptr;
-
-    // Final-filter verdicts for THIS cycle's actions, from the scanner.
-    auto cycle = ParkourLog::GetSingleton().GetCurrentLoggedParkourCycle();
-    std::unordered_map<AvailableParkourAction*, std::pair<bool, bool>> filterResults;
-    if (cycle)
+    AvailableParkourAction* pick = nullptr;
+    if (s_EnforceActive)
     {
-        std::lock_guard cycleLock(cycle->m_Mutex);
-        for (auto& record : cycle->m_Actions)
+        // Final-filter verdicts for THIS cycle's actions, from the scanner.
+        auto cycle = ParkourLog::GetSingleton().GetCurrentLoggedParkourCycle();
+        std::unordered_map<AvailableParkourAction*, std::pair<bool, bool>> filterResults;
+        if (cycle)
         {
-            if (!record) continue;
-            filterResults.emplace(record->m_ActionPtr,
-                std::make_pair(record->m_ResultOfFinalFilter1.value_or(true),
-                               record->m_ResultOfFinalFilter2.value_or(true)));
+            std::lock_guard cycleLock(cycle->m_Mutex);
+            for (auto& record : cycle->m_Actions)
+            {
+                if (!record) continue;
+                filterResults.emplace(record->m_ActionPtr,
+                    std::make_pair(record->m_ResultOfFinalFilter1.value_or(true),
+                                   record->m_ResultOfFinalFilter2.value_or(true)));
+            }
         }
-    }
-    auto IsPassedBoth = [&](AvailableParkourAction* action) {
-        auto it = filterResults.find(action);
-        return it != filterResults.end() && it->second.first && it->second.second;
-    };
+        auto IsPassedBoth = [&](AvailableParkourAction* action) {
+            auto it = filterResults.find(action);
+            return it != filterResults.end() && it->second.first && it->second.second;
+        };
 
-    AvailableParkourAction* first52 = nullptr;
-    for (AvailableParkourAction* action : actions)
-    {
-        if (!action) continue;
-        if (GetTypeIntSafe(action) != (int)EnumParkourAction::wallrunUpFromGroundFailed_mb) continue;
-        if (!first52)
+        AvailableParkourAction* naturalPassing = nullptr;
+        AvailableParkourAction* naturalFirst = nullptr;
+        AvailableParkourAction* convertedFirst = nullptr;
+        for (AvailableParkourAction* action : actions)
         {
-            std::lock_guard lk(m_Mutex);
-            first52 = action;
-            m_EnforceLastSelectedVTable = (uint64)action->fancyVTable;
+            if (!action) continue;
+            if (GetTypeIntSafe(action) != (int)EnumParkourAction::wallrunUpFromGroundFailed_mb) continue;
+            if (s_ConvertedThisCycle.count(action))
+            {
+                if (!convertedFirst) convertedFirst = action;
+                continue;
+            }
+            if (!naturalFirst)
+            {
+                naturalFirst = action;
+                m_EnforceLastSelectedVTable = (uint64)action->fancyVTable;
+            }
+            if (!naturalPassing && IsPassedBoth(action))
+                naturalPassing = action;
         }
-        if (IsPassedBoth(action))
+        pick = naturalPassing ? naturalPassing
+             : naturalFirst   ? naturalFirst
+             :                 convertedFirst;
+        if (pick)
         {
             std::lock_guard lk(m_Mutex);
             m_EnforceLastSelectedType = 52;
-            m_EnforceLastSelectedVTable = (uint64)action->fancyVTable;
-            return action;
+            m_EnforceLastSelectedVTable = (uint64)pick->fancyVTable;
         }
+        else
+        {
+            std::lock_guard lk(m_Mutex);
+            m_EnforceLastSelectedType = -1;
+        }
+        // A freeform 52 is about to execute while armed — arm the lift.
+        if (pick) StartLiftIfNeeded();
     }
-    {
-        std::lock_guard lk(m_Mutex);
-        m_EnforceLastSelectedType = first52 ? 52 : -1;
-        return first52; // nullptr when no 52 survived into the sorted array
-    }
+    s_ConvertedThisCycle.clear(); // conversions are single-cycle (stage 0 comment)
+    return pick; // nullptr when no 52 survived into the sorted array
 }
 
 void FancyVTableSwapPlugin::OnUpdate()
@@ -234,6 +370,12 @@ void FancyVTableSwapPlugin::OnUpdate()
         return;
     }
     s_EnforceActive = m_Enabled && IsActive();
+    // Hotkey released → any armed lift dies; the hook re-checks too.
+    if (!s_EnforceActive)
+    {
+        g_LiftShouldStart = false;
+        g_LiftActive = false;
+    }
     if (m_Enabled && !m_HoldMode && (GetAsyncKeyState(m_Hotkey) & 1))
     {
         m_ToggleState = !m_ToggleState;
@@ -266,6 +408,7 @@ void FancyVTableSwapPlugin::OnImGuiRender()
 
     ImGui::Separator();
     ImGui::Text("Native 52s kept alive: %d this session", m_EnforceKeptAlive);
+    ImGui::Text("Fallback 53->52 conversions: %d this session (non-standable walls)", m_EnforceConverted);
     if (m_EnforceLastSelectedType == 52)
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "  Last sort: selected type 52 (vtable 0x%llX)",
             (unsigned long long)m_EnforceLastSelectedVTable);
@@ -275,6 +418,16 @@ void FancyVTableSwapPlugin::OnImGuiRender()
         ImGui::Text("  Last sort: no selection this cycle");
 
     ImGui::Text("Last filtered cycle (sort&select hook): %d actions", m_LastActionsSeen);
+
+    ImGui::Separator();
+    ImGui::Checkbox("Force lift while freeform runs (exact-teleport style)", &g_LiftEnabledOn);
+    if (g_LiftEnabledOn)
+    {
+        ImGui::SliderFloat("Lift height (m)", &g_LiftHeight, 0.5f, 20.0f, "%.1f");
+        ImGui::SliderFloat("Lift speed (m/s)", &g_LiftSpeed, 0.5f, 20.0f, "%.1f");
+        ImGui::TextWrapped("Starts above wherever you were when a freeform 52 was force-selected with the hotkey held; ends with one parkour-state reset at the cap.");
+        ImGui::Text("Lift status: %s", g_LiftActive ? "LIFTING" : g_LiftShouldStart ? "waiting for next tick" : "idle");
+    }
 
     // Scanner diagnostics: actions logged at creation.
     int scannedActions = 0;

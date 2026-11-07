@@ -32,6 +32,12 @@ public:
     AvailableParkourAction* ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions);
 
     // Enforce-52 stages:
+    // Enforce-52 stages:
+    // 0 fallback post-construct convert: while armed, convert naturally-created
+    //   53 -> 52. The game always creates 53s (also on non-standable objects
+    //   where native 52s never appear), so this is the backup path; selection
+    //   still prefers natural-born 52s when the game made some itself.
+    void OnPostConstruct(AvailableParkourAction& action);
     // 1 creation-discard override: keep naturally-created 52s alive despite
     // the vanilla "InitialTestIfActionFits" reject. No vtable swapping: the
     // freeform wallrun must use the 52 the game created itself.
@@ -73,6 +79,7 @@ private:
     bool m_ChooseFired = false;
 
     // Enforce-52 counters (UI-only).
+    int m_EnforceConverted = 0;      // cumulative fallback 53->52 conversions
     int m_EnforceKeptAlive = 0;      // cumulative native 52s kept alive
     int m_EnforceLastSelectedType = -1;
     uint64 m_EnforceLastSelectedVTable = 0;
