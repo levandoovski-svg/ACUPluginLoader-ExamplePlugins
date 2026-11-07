@@ -206,7 +206,8 @@ private:
     bool m_LastStateOnGroundLow = false;
     bool m_LastStateOnGroundHigh = false;
     bool m_LastStateOnPeakOrLedge = false;
-    bool m_LastStateWalling = false;
+    bool m_LastStateWalling = false; // == climb facade (see ProbeStateGate)
+    bool m_LastStateDetachingFromWall = false;
     bool m_LastStateSafeJumpOrLowering = false;
     bool m_LastStateWallrunUp = false;
 

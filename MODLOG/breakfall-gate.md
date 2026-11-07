@@ -147,3 +147,11 @@ Crash stack top frames (`0x1400EEC05`, `0x1400E9A3A`, `0x141D591FD`, `0x141D4400
 - Added a **`ForceCooldownMs` (default 300)** buffer: after a teleport is actually performed, another force-freefall/teleport is refused until the buffer elapses. This is the direct mitigation for the suspected rapid-press crash.
 - New INI/ImGui: StateGateEnabled, StateGateRequireValid, ForceCooldownMs; ImGui readout shows the current observed states and whether the state gate blocked.
 - Residual: the raycast ledge geometry still needs in-game calibration via the existing sliders; the human-state list is explicitly "for a start" per the tester.
+
+## SESSION 5 — DETACHING FROM WALL + CLIMB FACADE ARE VALID (ExactPositionTeleportPlugin, game 1.5.0)
+- Tester request: make "detaching from wall" and "climb facade" valid states for force-freefall.
+- Evidence from ACUFixes 1.5.0 `ParkourDebugging/LoggingTheHumanStates.cpp` state-tree examples: the wall/climb cycle is the single `Walling` functor (`Enter`=0x141A4EC10). "When just hanging on a wall" shows only `Walling`; "During a safe backeject" shows `Walling` with child `DetachingFromWall` (0x141A4BC20). There is no separate `ClimbFacade` human state (the "Climb Facade" string at dump 0x2E84420 belongs to the `WhileOnWallSystem` parkour testers, not HumanStates).
+- Change: `Walling` moved from the INVALID list to the VALID list (so the climb-facade cycle is allowed); `DetachingFromWall` was already in the VALID list since v0.4.1. INVALID is now OnGroundLowProfile / OnGroundHighProfile / OnPeakOrLedge.
+- Gate/status/ImGui/INI text updated accordingly, and the debug readout now shows `DetachingFromWall` and labels `Walling` as `ClimbFacade/Walling`. `StateGateRequireValid=1` now also accepts walling.
+- Caveat: at the HumanStates level this allows force-freefall during any `Walling` sub-cycle (climb, hang, overhang), not only a vertical facade climb; separating those would require reading the `WhileOnWallSystem` testers instead of the human-state tree.
+
