@@ -3,10 +3,43 @@
 #include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include "ACU/SmallArray.h"
 #include "ParkourDebugging/GenericHooksInParkourFiltering.h"
+#include <array>
 #include <memory>
-#include <set>
 
 class AvailableParkourAction;
+
+// Gamepad bindable codes, 0x1000+ range (same pattern as
+// ExactPositionTeleportPlugin/FreeJumpPlugin: keyboard/mouse live in the Win32
+// virtual-key range 0x01..0xFE, pads here). XInput is polled by the plugin.
+enum WallrunPadCode
+{
+    WallrunPad_DPadUp = 0,
+    WallrunPad_DPadDown,
+    WallrunPad_DPadLeft,
+    WallrunPad_DPadRight,
+    WallrunPad_Start,
+    WallrunPad_Back,
+    WallrunPad_L3,
+    WallrunPad_R3,
+    WallrunPad_LB,
+    WallrunPad_RB,
+    WallrunPad_A,
+    WallrunPad_B,
+    WallrunPad_X,
+    WallrunPad_Y,
+    WallrunPad_LeftTrigger,
+    WallrunPad_RightTrigger,
+    WallrunPad_LeftStickUp,
+    WallrunPad_LeftStickDown,
+    WallrunPad_LeftStickLeft,
+    WallrunPad_LeftStickRight,
+    WallrunPad_RightStickUp,
+    WallrunPad_RightStickDown,
+    WallrunPad_RightStickLeft,
+    WallrunPad_RightStickRight,
+    WallrunPad_COUNT
+};
+constexpr int kWallrunPadKeyBase = 0x1000;
 
 // Passive freeform-wallrun plugin. While the hotkey is ACTIVE:
 //   - natural freeform 52s (wallrunUpFromGroundFailed_mb) are kept alive at
@@ -25,7 +58,7 @@ public:
 
     void OnBeforeActivate();
     void RefreshHookOwnership();
-    void OnUpdate();        // per-frame: key + rebind
+    void OnUpdate();        // per-frame: input polling + edges + rebind
     void OnImGuiRender();   // ACUPluginLoader menu panel
 
     // Creation-stage hooks only (see class comment for why).
@@ -34,6 +67,10 @@ public:
 
 private:
     bool IsActive() const;
+    bool IsBoundKeyDown() const;   // hold-mode: bound key/pad held right now
+    bool IsPadCode(int key) const;
+    void UpdatePadStates();
+    void CaptureBinding(const std::array<bool, WallrunPadCode_COUNT>& padEdges);
     void LoadSettings();
     void SaveSettings() const;
 
@@ -47,7 +84,9 @@ private:
     bool m_ToggleState = false;
     bool m_WaitingForKey = false;
 
-    // Keys held at the moment "Rebind" was clicked - rebinding accepts only
-    // fresh presses (keys NOT in this set), ignoring stale transition bits.
-    std::set<int> m_KeysDownAtCapture;
+    // Rising-edge input tracking (0x01..0xFE keyboard/mouse + pad codes).
+    std::array<bool, WallrunPadCode_COUNT> m_PadDown {};
+    std::array<bool, 0xFF> m_KbDownPrev {};
+    std::array<bool, 0xFF> m_KbPressed {};
+    std::array<bool, WallrunPadCode_COUNT> m_PadDownPrev {};
 };
