@@ -32,20 +32,30 @@ public:
     AvailableParkourAction* ChooseBeforeFiltering(SmallArray<AvailableParkourAction*>& actions);
 
     // Enforce-52 stages:
-    // Enforce-52 stages:
     // 0 fallback post-construct convert: while armed, convert naturally-created
     //   53 -> 52. The game always creates 53s (also on non-standable objects
     //   where native 52s never appear), so this is the backup path; selection
     //   still prefers natural-born 52s when the game made some itself.
+    //   (Skipped in passive mode.)
     void OnPostConstruct(AvailableParkourAction& action);
     // 1 creation-discard override: keep naturally-created 52s alive despite
     // the vanilla "InitialTestIfActionFits" reject. No vtable swapping: the
     // freeform wallrun must use the 52 the game created itself.
     bool OnCreationDiscardOverride(AvailableParkourAction& action);
+    // 1b force creation-discard (passive mode only): while armed AND passive,
+    // discard every naturally-created 53 upon creation via the vanilla destroy
+    // path. The survivors (natural 52s) are then picked by the game itself —
+    // no sort&select takeover, so FreeJump keeps its own cheap clear-the-list
+    // path instead of its FinalFilter1 fallback cave.
+    bool OnForceCreationDiscard(AvailableParkourAction& action);
     // 3 force-select: return the best type-52 in the sorted array (prefer one
     // that passed both final filters; the game's own pick is ignored while
-    // armed).
+    // armed). Not subscribed in passive mode.
     AvailableParkourAction* ChooseAfterSorting(SmallArray<AvailableParkourAction*>& actions, AvailableParkourAction* selectedByGame);
+
+    // Request/release the GPH hooks to match the current mode so FreeJump never
+    // sees the sort&select site patched while passive.
+    void RefreshHookOwnership();
 
     struct DiscoveredVTable
     {
@@ -66,6 +76,7 @@ private:
 
     // Config (persisted to INI)
     bool m_Enabled = true;
+    bool m_PassiveDiscard53 = false; // passive mode: discard 53 at creation, no sort ownership
     int m_Hotkey = 0x77; // F8
     bool m_HoldMode = true;
     bool m_ToggleState = false;

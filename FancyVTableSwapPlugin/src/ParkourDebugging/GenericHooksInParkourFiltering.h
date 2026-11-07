@@ -66,6 +66,11 @@ struct ParkourCallbacks
     // every later creation step runs with the FINAL table. (Project-local
     // addition, like OverrideCreationDiscard_fnp above.)
     void (*PostConstruct_fnp)(void* userData, AvailableParkourAction& newAction) = nullptr;
+    // Force-discard override. Invoked AFTER all keep-alive overrides so it wins:
+    //   return true  -> the action is discarded via the vanilla destroy path
+    //                   (same shape as a native InitialTestIfActionFits reject);
+    //   return false -> no force-discard. (Project-local addition.)
+    bool (*ForceCreationDiscard_fnp)(void* userData, AvailableParkourAction& action) = nullptr;
     void* m_UserData = nullptr;
     float m_CallbackPriority;
     const char* m_Name = nullptr;

@@ -28,7 +28,10 @@ ParkourActionLogged::ParkourActionLogged(AvailableParkourAction& action, size_t 
 
 void ParkourCycleLogged::LogActionInitialCreation(AvailableParkourAction& newAction, bool& isDiscarded_immediatelyAfterCreation)
 {
-    if (m_IsDisabled) return;
+    // Records only exist for the enforcement pipeline (ChooseAfterSorting reads
+    // them). Logging every created action while idle/passive allocates + locks
+    // per action per cycle for nothing - that was a real chunk of the lag.
+    if (m_IsDisabled || !FVTS_IsEnforcing()) return;
     std::lock_guard _lock{ m_Mutex };
     m_IsSortingDirty = true;
     ParkourActionLogged& record = *m_Actions.emplace_back(

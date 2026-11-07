@@ -88,6 +88,15 @@ static void RunCreationDiscardOverrides(AvailableParkourAction& newAction, bool&
         if (parkourCallbacks->OverrideCreationDiscard_fnp(parkourCallbacks->m_UserData, newAction))
             isDiscarded = false;
     }
+    // Force-discards run last: they win over every keep-alive above, and the
+    // vanilla discard branch (destroy + deallocate) handles them identically
+    // to a native InitialTestIfActionFits reject.
+    for (ParkourCallbacks* parkourCallbacks : allParkourCallbacks)
+    {
+        if (!parkourCallbacks->ForceCreationDiscard_fnp) continue;
+        if (parkourCallbacks->ForceCreationDiscard_fnp(parkourCallbacks->m_UserData, newAction))
+            isDiscarded = true;
+    }
 }
 
 static void RunPostConstruct(AvailableParkourAction& newAction)

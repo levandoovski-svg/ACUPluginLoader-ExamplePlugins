@@ -40,91 +40,6 @@ bool FVTS_ShouldSkipFitnessCull(AvailableParkourAction* action)
 // cycle), cleared after each force-select.
 static std::set<AvailableParkourAction*> s_ConvertedThisCycle;
 
-// ── Force lift ───────────────────────────────────────────────────────────────
-// The freeform wallrun's own height depends on the wall context and is often
-// tiny. While the hotkey is held and a freeform 52 was force-selected, lift
-// the player straight up (exact-teleport style position write + one HSTE
-// reset at the cap) until the configured height above lift-start is reached.
-// shortcut: lift settings are file statics, not INI-persisted.
-// Thread split (proven by ExactTeleportPlugin): transform WRITES are safe from
-// the render thread (that plugin teleports from its OnUpdate/Present path),
-// but the HSTE state reset mutates state objects the render frame does not
-// expect to change, so it runs deferred on our existing game-thread
-// sort&select hook. Do NOT patch the FOV site 0x141F3FE3B for this — ACUFixes'
-// FreezeFOV owns the same 6 bytes and the collision crashes at startup.
-DEFINE_GAME_FUNCTION(BaseEntity__SetTransform, 0x1425DE360, void, __fastcall,
-    (Entity* entity, const Matrix4f* newTransform));
-DEFINE_GAME_FUNCTION(Human__Dispatch_HSTE_ResetBehavior, 0x14131A530, char, __fastcall, (Human* a1));
-static bool   g_LiftEnabledOn = true;
-static float  g_LiftHeight = 6.0f;   // meters above lift-start
-static float  g_LiftSpeed  = 4.0f;   // meters/second
-static bool   g_LiftShouldStart = false;   // armed by force-select, started by OnUpdate
-static bool   g_LiftActive = false;
-static float  g_LiftTargetZ = 0.0f;
-static ULONGLONG g_LiftLastTickMs = 0;
-static bool   g_PendingHSTE = false;   // reset at cap, consumed on next game-thread parkour cycle
-
-static Entity* GetPlayerSafely()
-{
-    __try { return ACU::GetPlayer(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-}
-static Human* GetPlayerHumanSafely()
-{
-    __try { return Human::GetForPlayer(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-}
-
-// Start/step, called every frame from OnUpdate (render thread).
-static void ServiceLiftOnFrame()
-{
-    if (g_LiftShouldStart)
-    {
-        g_LiftShouldStart = false;
-        if (Entity* player = GetPlayerSafely())
-            g_LiftTargetZ = player->GetPosition().z + g_LiftHeight;
-        g_LiftActive = true;
-        g_LiftLastTickMs = GetTickCount64();
-    }
-    if (!g_LiftActive) return;
-    const ULONGLONG now = GetTickCount64();
-    float dt = float(now - g_LiftLastTickMs) / 1000.0f;
-    g_LiftLastTickMs = now;
-    if (dt <= 0.0f || dt > 0.1f) return; // paused/loading frames: skip, keep clock
-    if (Entity* player = GetPlayerSafely())
-    {
-        __try
-        {
-            Vector3f& pos = player->GetPosition();
-            pos.z += g_LiftSpeed * dt;
-            if (pos.z >= g_LiftTargetZ)
-                pos.z = g_LiftTargetZ;
-            BaseEntity__SetTransform(player, &player->GetTransform());
-            if (pos.z >= g_LiftTargetZ)
-            {
-                g_LiftActive = false;
-                g_PendingHSTE = true; // game-thread hook performs the reset
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { g_LiftActive = false; }
-    }
-}
-
-// Game-thread reset, consumed inside ChooseAfterSorting (sort&select hook).
-static void ServicePendingHSTE()
-{
-    if (!g_PendingHSTE) return;
-    g_PendingHSTE = false;
-    if (Human* human = GetPlayerHumanSafely())
-        Human__Dispatch_HSTE_ResetBehavior(human);
-}
-
-static void StartLiftIfNeeded()
-{
-    if (!g_LiftEnabledOn || g_LiftActive) return;
-    g_LiftShouldStart = true;
-}
-
 static std::string GetIniPath()
 {
     char docs[MAX_PATH];
@@ -147,6 +62,9 @@ FancyVTableSwapPlugin::FancyVTableSwapPlugin()
     m_Callbacks.PostConstruct_fnp = [](void* userData, AvailableParkourAction& action) -> void {
         static_cast<FancyVTableSwapPlugin*>(userData)->OnPostConstruct(action);
     };
+    m_Callbacks.ForceCreationDiscard_fnp = [](void* userData, AvailableParkourAction& action) -> bool {
+        return static_cast<FancyVTableSwapPlugin*>(userData)->OnForceCreationDiscard(action);
+    };
     // Priority before ACUFixes' enforcer (10000).
     m_Callbacks.m_UserData = this;
     m_Callbacks.m_CallbackPriority = 4.0f;
@@ -168,9 +86,22 @@ void FancyVTableSwapPlugin::OnBeforeActivate()
 {
     auto gph = GenericHooksInParkourFiltering::GetSingleton();
     gph->Subscribe(m_Callbacks);
-    m_Activator = gph->RequestGPHSortAndSelect();
-    m_ActivatorCreation = gph->RequestGPHCreation();
-    // (lift hook was here before — removed: FOV site is owned by ACUFixes)
+    RefreshHookOwnership();
+}
+
+void FancyVTableSwapPlugin::RefreshHookOwnership()
+{
+    auto gph = GenericHooksInParkourFiltering::GetSingleton();
+    // Passive mode must leave the sort&select site unpatched: FreeJump goes
+    // into its FinalFilter1 fallback cave (per-candidate decide calls, the
+    // lag + crash source) whenever that site is machine-patched. Creation
+    // hooks stay subscribed in both modes (discard + keep-alive live there).
+    if (m_PassiveDiscard53 || !m_Enabled)
+        m_Activator.reset();
+    else if (!m_Activator)
+        m_Activator = gph->RequestGPHSortAndSelect();
+    if (!m_ActivatorCreation)
+        m_ActivatorCreation = gph->RequestGPHCreation();
 }
 
 bool FancyVTableSwapPlugin::IsActive() const
@@ -197,6 +128,8 @@ void FancyVTableSwapPlugin::LoadSettings()
                 try { m_HoldMode = std::stoi(line.substr(9)) != 0; } catch (...) {}
             else if (line.rfind("ToggleState=", 0) == 0)
                 try { m_ToggleState = std::stoi(line.substr(12)) != 0; } catch (...) {}
+            else if (line.rfind("PassiveDiscard53=", 0) == 0)
+                try { m_PassiveDiscard53 = std::stoi(line.substr(17)) != 0; } catch (...) {}
         }
         catch (...) {}
     }
@@ -214,6 +147,7 @@ void FancyVTableSwapPlugin::SaveSettings() const
             file << "Enabled=" << (m_Enabled ? 1 : 0) << "\n";
             file << "HoldMode=" << (m_HoldMode ? 1 : 0) << "\n";
             file << "ToggleState=" << (m_ToggleState ? 1 : 0) << "\n";
+            file << "PassiveDiscard53=" << (m_PassiveDiscard53 ? 1 : 0) << "\n";
         }
     } catch (...) {}
 }
@@ -250,12 +184,26 @@ AvailableParkourAction* FancyVTableSwapPlugin::ChooseBeforeFiltering(SmallArray<
 void FancyVTableSwapPlugin::OnPostConstruct(AvailableParkourAction& action)
 {
     s_EnforceActive = m_Enabled && IsActive();
-    if (!s_EnforceActive) return;
+    if (!s_EnforceActive || m_PassiveDiscard53) return;
     if (GetTypeIntSafe(&action) != (int)EnumParkourAction::wallrunUpFromGround_mb) return;
     action.fancyVTable = (ParkourAction_FancyVTable*)k_Type52FancyVTable_Runtime;
     s_ConvertedThisCycle.insert(&action);
     std::lock_guard lk(m_Mutex);
     ++m_EnforceConverted;
+}
+
+// Enforce-52 stage 1b (passive mode): while armed (and NOT converting), discard
+// every naturally-created 53 upon creation. The vanilla discard path (destroy +
+// deallocate, identical to a native reject) then removes it. Natural 52s kept
+// alive by stage 1 survive and the game picks among them itself - no sort&select
+// takeover, no weight boost, no force-select, and FreeJump keeps its own cheap
+// GPH path (its fallback FinalFilter1 cave only engages when this plugin owns
+// the sort site, which passive mode never does).
+bool FancyVTableSwapPlugin::OnForceCreationDiscard(AvailableParkourAction& action)
+{
+    s_EnforceActive = m_Enabled && IsActive();
+    if (!s_EnforceActive || !m_PassiveDiscard53) return false;
+    return GetTypeIntSafe(&action) == (int)EnumParkourAction::wallrunUpFromGround_mb;
 }
 
 // Enforce-52 stage 1 (discard override): keep natural type-52s alive even
@@ -343,11 +291,7 @@ AvailableParkourAction* FancyVTableSwapPlugin::ChooseAfterSorting(
             std::lock_guard lk(m_Mutex);
             m_EnforceLastSelectedType = -1;
         }
-        // A freeform 52 is about to execute while armed — arm the lift.
-        if (pick) StartLiftIfNeeded();
     }
-    // Pending HSTE reset from a finished lift runs on the game thread here.
-    ServicePendingHSTE();
     s_ConvertedThisCycle.clear(); // conversions are single-cycle (stage 0 comment)
     return pick; // nullptr when no 52 survived into the sorted array
 }
@@ -369,17 +313,6 @@ void FancyVTableSwapPlugin::OnUpdate()
         return;
     }
     s_EnforceActive = m_Enabled && IsActive();
-    // Hotkey released → any armed lift dies.
-    if (!s_EnforceActive)
-    {
-        g_LiftShouldStart = false;
-        g_LiftActive = false;
-    }
-    else if (!m_WaitingForKey)
-    {
-        // Present thread: transform writes proven safe (ExactTeleport pattern).
-        ServiceLiftOnFrame();
-    }
     if (m_Enabled && !m_HoldMode && (GetAsyncKeyState(m_Hotkey) & 1))
     {
         m_ToggleState = !m_ToggleState;
@@ -422,15 +355,25 @@ void FancyVTableSwapPlugin::OnImGuiRender()
         ImGui::Text("  Last sort: no selection this cycle");
 
     ImGui::Text("Last filtered cycle (sort&select hook): %d actions", m_LastActionsSeen);
+    if (m_PassiveDiscard53)
+        ImGui::Text("(passive: hook not held; this stays at the pre-passive count)");
 
     ImGui::Separator();
-    ImGui::Checkbox("Force lift while freeform runs (exact-teleport style)", &g_LiftEnabledOn);
-    if (g_LiftEnabledOn)
+    bool passive = m_PassiveDiscard53;
+    if (ImGui::Checkbox("Passive mode: discard 53 at creation (recommended with FreeJump loaded)", &passive))
     {
-        ImGui::SliderFloat("Lift height (m)", &g_LiftHeight, 0.5f, 20.0f, "%.1f");
-        ImGui::SliderFloat("Lift speed (m/s)", &g_LiftSpeed, 0.5f, 20.0f, "%.1f");
-        ImGui::TextWrapped("Starts above wherever you were when a freeform 52 was force-selected with the hotkey held; at the cap the parkour-state reset applies on the game thread's next parkour evaluation.");
-        ImGui::Text("Lift status: %s", g_LiftActive ? "LIFTING" : g_LiftShouldStart ? "waiting for next tick" : "idle");
+        m_PassiveDiscard53 = passive;
+        RefreshHookOwnership();
+        SaveSettings();
+    }
+    if (m_PassiveDiscard53)
+    {
+        ImGui::TextWrapped("While armed, every naturally-created wallrun (53) is destroyed at creation via the vanilla reject path. Natural freeform 52s survive and the game picks them itself. No sort takeover, no scanner churn, no lift - and FreeJump no longer needs its slow FinalFilter1 fallback. Non-standable objects get nothing (use FreeJump's own overrider there).");
+        ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "Sort and select hook: NOT held (FreeJump runs its normal path)");
+    }
+    else
+    {
+        ImGui::TextWrapped("Force mode: 52s kept alive, converted from 53 as backup, weight-boosted and force-selected. WARNING: owning the sort&select site pushes FreeJump into its FinalFilter1 fallback cave (heavy, lag-prone). Passive mode avoids that entirely.");
     }
 
     // Scanner diagnostics: actions logged at creation.
