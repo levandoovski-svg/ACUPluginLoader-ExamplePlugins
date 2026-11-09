@@ -49,15 +49,14 @@
 //     Hook D (0x1401584B0, the type-39 action CONSTRUCTOR - vanilla, one
 //     caller: the type-39 case of the creation factory) intercepts every
 //     sidehop construction. While the hotkey is held it substitutes the probe
-//     point (r8): by default the destination is built ABSOLUTELY from the
-//     player's own position (Human::GetForPlayer()->entity->GetPosition())
-//     along the movement input at AimDistance, with AimHeight vertical offset,
-//     so ANY bearing works - including almost directly behind the player,
-//     which the scanner never probes and which pushing its own point could not
-//     reach. Unchecking "from player" falls back to shifting the scanner's
-//     point (v0.4.1 behaviour). The vanilla ctor builds the action from the
-//     substitute point (the scanner's buffers are never mutated), and the scan
-//     appends it exactly as it would the vanilla candidate.
+//     point (r8). Default style is a BEARING-ONLY override: the scanner's own
+//     radius and height are preserved (so the target is still the kind of point
+//     the game itself produced) and only the bearing is rotated onto the
+//     player's movement input - which makes targets behind the player reachable.
+//     The alternative "fixed distance/height" style builds the point from the
+//     player's position outright. Neither guesses at validation: the ctor only
+//     derives geometry from the point, so acceptance is still decided by
+//     QuickCheck (widened by Hook C) and the fit chain.
 //     The wrapper 0x1401D1CF0 that v0.4.0 tried to hook is owned by
 //     FreeFormWallrun.dll (live-verified: FF 25 + pointer to +0xAB90), and that
 //     plugin reimplements the wrapper; the ctor is untouched and is still
@@ -106,10 +105,13 @@ public:
     float m_NudgeDistance = 0.5f;    // meters
 
     // Mode 4 (aim by creation).
-    float m_AimDistance = 3.0f;      // meters from the player, in the input direction
-    float m_AimHeight = 0.0f;        // meters above the player's feet for the aimed point
-    bool  m_AimFromPlayer = true;    // true: absolute aim from the player (any bearing,
-                                     // including behind); false: shift the scanner's point
+    float m_AimDistance = 3.0f;      // meters from the player (absolute style only)
+    float m_AimHeight = 0.0f;        // meters above the player's feet (absolute style only)
+    float m_AimScale = 1.0f;         // scales the scanner's own radius (bearing style)
+    bool  m_AimAbsolute = false;     // false (default): keep the scanner's radius and
+                                     // height, change only the bearing - the closest to
+                                     // a "valid" probe, just rotated to where you push.
+                                     // true: fixed distance/height from the player.
 
     // Hook states (each hook installs independently).
     bool m_HooksInstalled = false;
@@ -142,4 +144,7 @@ public:
     long long m_TelSidehopCheckOverrides = 0; // Hook C overrides on the SIDEHOP only
                                               // (the check impl is shared by 118 types;
                                               // m_TelQuickCheckOverrides counts them all)
+    float     m_TelLastAimErrorDeg = 0.0f;    // angle between the aimed bearing and the
+                                              // built candidate's actual bearing (0 = the
+                                              // ctor really used our point)
 };

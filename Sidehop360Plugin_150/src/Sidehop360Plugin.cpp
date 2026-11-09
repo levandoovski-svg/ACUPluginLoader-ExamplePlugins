@@ -25,6 +25,13 @@
 // run, why widening the cone changes acceptance but never aiming, and a recipe.
 static Sidehop360Plugin* g_Plugin = nullptr;
 
+// Last input direction seen at Hook D (thread-local, same thread as the check
+// that follows the ctor), used to measure whether the built action really
+// points where we aimed.
+static thread_local float t_LastInputX = 0.0f;
+static thread_local float t_LastInputY = 0.0f;
+static thread_local bool  t_HasLastInput = false;
+
 // ============================================================================
 //  Hook A - set-ranges overrides (minCosAngle, Side_min/Max) + wall-normal
 //           cache + candidate redirect (mode 2). Site inside the sidehop's
@@ -179,7 +186,24 @@ void WidenQuickCheckRanges_Cave(AllRegisters* params)
     action->distanceMin = 0.05f;
     action->distanceMax = 40.0f;
     if (action->fancyVTable == reinterpret_cast<ParkourAction_FancyVTable*>(0x143A13130))
+    {
         plugin->m_TelSidehopCheckOverrides++;
+
+        // Mode 4 sanity check: how far off is the built candidate from the
+        // bearing we aimed at? 0 deg = the ctor really consumed our point.
+        if (plugin->m_Mode == 4 && t_HasLastInput)
+        {
+            const float dx = action->locationAnchorDest.x - action->locationAnchorSrc.x;
+            const float dy = action->locationAnchorDest.y - action->locationAnchorSrc.y;
+            const float len = sqrtf(dx * dx + dy * dy);
+            if (len > 1e-4f)
+            {
+                float dot = (dx / len) * t_LastInputX + (dy / len) * t_LastInputY;
+                dot = dot > 1.0f ? 1.0f : (dot < -1.0f ? -1.0f : dot);
+                plugin->m_TelLastAimErrorDeg = acosf(dot) * 57.2957795f;
+            }
+        }
+    }
     plugin->m_TelQuickCheckOverrides++;
 }
 
@@ -320,6 +344,7 @@ AutoAssembleWrapper<SidehopNudgeHook>& GetNudgeHook()
 // position-independent, so they can be re-executed after the callback.
 static thread_local __m128 t_AimPoint;
 
+
 void AimSidehopProbePoint_Cave(AllRegisters* params)
 {
     Sidehop360Plugin* plugin = g_Plugin;
@@ -368,34 +393,45 @@ void AimSidehopProbePoint_Cave(AllRegisters* params)
     }
     dirX /= len;
     dirY /= len;
+    t_LastInputX = dirX;
+    t_LastInputY = dirY;
+    t_HasLastInput = true;
 
-    if (plugin->m_AimFromPlayer)
+    Human* human = Human::GetForPlayer();
+    if (!human || !human->entity)
+        return;
+    const Vector3f& pos = human->entity->GetPosition();
+    if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2]))
+        return;
+
+    const float* op = reinterpret_cast<const float*>(&originalPoint);
+    const float aimW = op[3];
+
+    if (plugin->m_AimAbsolute)
     {
-        // ABSOLUTE aim: the destination is built from the player himself, so it
-        // can be at ANY bearing - including almost directly behind. The scanner
-        // point is only used for its w component; the old "shift the scanner
-        // point" behaviour could never leave the arc the scanner probed.
-        Human* human = Human::GetForPlayer();
-        if (!human || !human->entity)
-            return;
-        const Vector3f& pos = human->entity->GetPosition();
-        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2]))
-            return;
-
-        float aimX = pos[0] + dirX * plugin->m_AimDistance;
-        float aimY = pos[1] + dirY * plugin->m_AimDistance;
-        float aimZ = pos[2] + plugin->m_AimHeight;
-        float aimW = reinterpret_cast<const float*>(&originalPoint)[3];
-
-        t_AimPoint = _mm_setr_ps(aimX, aimY, aimZ, aimW);
+        // Fixed distance/height from the player.
+        t_AimPoint = _mm_setr_ps(pos[0] + dirX * plugin->m_AimDistance,
+                                 pos[1] + dirY * plugin->m_AimDistance,
+                                 pos[2] + plugin->m_AimHeight,
+                                 aimW);
     }
     else
     {
-        // Relative mode (v0.4.1 behaviour): push the scanner's own point.
-        t_AimPoint = originalPoint;
-        float* p = reinterpret_cast<float*>(&t_AimPoint);
-        p[0] += dirX * plugin->m_AimDistance;
-        p[1] += dirY * plugin->m_AimDistance;
+        // BEARING-ONLY override: keep the radius and the height of the scanner's
+        // own probe point (so the target is as "real" as the one the game made),
+        // but put it on the bearing the player is pushing. This is the closest
+        // thing to a valid probe that can still end up behind the player.
+        const float rx = op[0] - pos[0];
+        const float ry = op[1] - pos[1];
+        float radius = sqrtf(rx * rx + ry * ry);
+        if (!(radius > 0.2f))
+            radius = plugin->m_AimDistance; // degenerate scanner point
+        radius *= plugin->m_AimScale;
+
+        t_AimPoint = _mm_setr_ps(pos[0] + dirX * radius,
+                                 pos[1] + dirY * radius,
+                                 op[2],          // keep the scanner point's height
+                                 aimW);
     }
 
     params->r8_ = reinterpret_cast<unsigned long long>(&t_AimPoint);
@@ -620,10 +656,11 @@ void Sidehop360Plugin::LoadSettings()
         ParseFloat("NudgeDistance=",    m_NudgeDistance);
         ParseFloat("AimDistance=",      m_AimDistance);
         ParseFloat("AimHeight=",        m_AimHeight);
+        ParseFloat("AimScale=",         m_AimScale);
         {
-            int fromPlayer = m_AimFromPlayer ? 1 : 0;
-            ParseInt("AimFromPlayer=", fromPlayer);
-            m_AimFromPlayer = fromPlayer != 0;
+            int absolute = m_AimAbsolute ? 1 : 0;
+            ParseInt("AimAbsolute=", absolute);
+            m_AimAbsolute = absolute != 0;
         }
     }
 }
@@ -646,7 +683,8 @@ void Sidehop360Plugin::SaveSettings()
         f << "NudgeDistance=" << m_NudgeDistance << "\n";
         f << "AimDistance=" << m_AimDistance << "\n";
         f << "AimHeight=" << m_AimHeight << "\n";
-        f << "AimFromPlayer=" << (m_AimFromPlayer ? 1 : 0) << "\n";
+        f << "AimScale=" << m_AimScale << "\n";
+        f << "AimAbsolute=" << (m_AimAbsolute ? 1 : 0) << "\n";
     } catch (...) {}
 }
 
@@ -756,12 +794,21 @@ void Sidehop360Plugin::OnImGuiRender()
             ImGui::Text("Sidehop constructions seen: %lld", m_TelAimCreateCalls);
             ImGui::Text("Probe points aimed: %lld", m_TelAimRewrites);
             ImGui::Text("Aimed candidates reaching the sidehop check: %lld", m_TelSidehopCheckOverrides);
+            ImGui::Text("Aim error (aimed vs built bearing): %.1f deg", m_TelLastAimErrorDeg);
             ImGui::TextDisabled("(Hook C's check impl is shared: %lld overrides across all action "
                                 "types while held - that counter is not sidehop-specific.)",
                                 m_TelQuickCheckOverrides);
-            ImGui::TextDisabled("If 'constructions seen' climbs but 'reaching the sidehop check' "
-                                "stays 0, the shifted point is rejected inside the ctor - the next "
-                                "lever is the ctor body itself.");
+            if (m_TelAimCreateCalls == 0)
+                ImGui::TextColored(inactiveColor, "Hook is installed but NO sidehop construction "
+                                                  "has been seen: the game is not building the move "
+                                                  "through this ctor right now.");
+            else if (m_TelAimRewrites == 0)
+                ImGui::TextColored(inactiveColor, "Constructions happen but nothing is rewritten - "
+                                                  "make sure the hotkey is held and the player is "
+                                                  "on a wall.");
+            else
+                ImGui::TextColored(activeColor, "Aim is live: every sidehop is built on your "
+                                                "input bearing.");
         }
         ImGui::Unindent();
     }
@@ -852,21 +899,31 @@ void Sidehop360Plugin::OnImGuiRender()
         if (m_Mode == 4)
         {
             ImGui::Separator();
-            ImGui::SetNextItemWidth(240);
-            if (ImGui::SliderFloat("Aim distance##s360", &m_AimDistance, 0.5f, 8.0f, "%.2f m"))
+            if (ImGui::Checkbox("Fixed distance/height (absolute)##s360", &m_AimAbsolute))
                 SaveSettings();
-            ImGui::SameLine();
-            if (ImGui::Checkbox("from player (absolute)##s360", &m_AimFromPlayer))
-                SaveSettings();
-            ImGui::SetNextItemWidth(240);
-            if (ImGui::SliderFloat("Aim height##s360", &m_AimHeight, -3.0f, 3.0f, "%.2f m"))
-                SaveSettings();
-            ImGui::TextDisabled("Absolute aim builds the destination from YOUR position along the "
-                                "movement input, so any bearing works - including almost directly "
-                                "behind you. Uncheck to fall back to pushing the scanner's own point "
-                                "(v0.4.1 behaviour). Vanilla points are restored when the hotkey is "
-                                "released. Hooks the type-39 constructor, not the factory wrapper "
-                                "(that wrapper is owned by FreeFormWallrun.dll).");
+            if (!m_AimAbsolute)
+            {
+                ImGui::SetNextItemWidth(240);
+                if (ImGui::SliderFloat("Radius scale##s360", &m_AimScale, 0.5f, 3.0f, "%.2f x"))
+                    SaveSettings();
+                ImGui::TextDisabled("Keeps the scanner's own radius and height (the target the game "
+                                    "already considered 'real') and only rotates it onto the bearing "
+                                    "you push - including behind you. Scale > 1 reaches further.");
+            }
+            else
+            {
+                ImGui::SetNextItemWidth(240);
+                if (ImGui::SliderFloat("Aim distance##s360", &m_AimDistance, 0.5f, 8.0f, "%.2f m"))
+                    SaveSettings();
+                ImGui::SetNextItemWidth(240);
+                if (ImGui::SliderFloat("Aim height##s360", &m_AimHeight, -3.0f, 3.0f, "%.2f m"))
+                    SaveSettings();
+                ImGui::TextDisabled("Builds the destination at a fixed distance/height from the player, "
+                                    "on the bearing you push. Try this when the scanner's radius is too "
+                                    "short to reach.");
+            }
+            ImGui::TextDisabled("Hooks the type-39 constructor, not the factory wrapper (owned by "
+                                "FreeFormWallrun.dll). Vanilla points return when the hotkey is released.");
 
             ImGui::SetNextItemWidth(240);
             if (ImGui::SliderFloat("minCosAngle##s360aim", &m_MinCosAngle, -1.0f, 1.0f, "%.3f"))
