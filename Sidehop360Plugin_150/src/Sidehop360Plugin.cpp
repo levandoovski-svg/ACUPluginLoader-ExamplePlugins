@@ -17,6 +17,9 @@
 // no definition. See SidehopContextPlugin.cpp for the inline-definition
 // pattern should this plugin ever need to call it.
 
+// Mechanism reference, written for reuse in future parkour plugins:
+// MODLOG/sidehop-angle-widen.md - the sites/fields below in the order they must
+// run, why widening the cone changes acceptance but never aiming, and a recipe.
 static Sidehop360Plugin* g_Plugin = nullptr;
 
 // ============================================================================
