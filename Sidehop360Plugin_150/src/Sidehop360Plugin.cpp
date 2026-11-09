@@ -20,7 +20,9 @@
 static Sidehop360Plugin* g_Plugin = nullptr;
 
 // ============================================================================
-//  Hook A - widen the sidehop acceptance cone (minCosAngle, +0x1E8)
+//  Hook A - set-ranges overrides (minCosAngle, Side_min/Max) + wall-normal
+//           cache + candidate redirect (mode 2). Site inside the sidehop's
+//           SetExpectedDistanceRangesAccordingToParkourMode impl.
 // ============================================================================
 
 // 0x140148500 is the sidehop's SetExpectedDistanceRangesAccordingToParkourMode
@@ -30,29 +32,23 @@ static Sidehop360Plugin* g_Plugin = nullptr;
 // The hook sits on the NEXT instruction (0x140148553, a clean 10-byte
 // `mov [rcx+0x1ec], 0x3f800000`, re-executed after the callback), so the
 // callback sees minCosAngle exactly as vanilla wrote it and can override it
-// before InitialTestIfActionFits (slot 0x4B = 0x1401b4900, which calls slot
-// 0x64 first) or anything else consumes it. rcx is the action (`mov rdx,rcx`
+// before the fit chain consumes it. rcx is the action (`mov rdx,rcx`
 // at the impl's entry).
+// NOTE: the per-parkour-mode block LATER in this same function rewrites
+// heightDifferenceMin/Max (+0x1D0/+0x1D4) - those cannot be overridden here
+// (they run after this cave, via the mode jump table). Hook C handles them.
 void WidenSidehopAngle_Cave(AllRegisters* params)
 {
     Sidehop360Plugin* plugin = g_Plugin;
-    if (!plugin || !plugin->m_Enabled || !plugin->ShouldWidenAngle())
+    if (!plugin || plugin->m_Mode == 0 || !plugin->ShouldWidenAngle())
         return;
     auto* action = reinterpret_cast<AvailableParkourAction*>(params->rcx_);
     if (!action)
         return;
-    plugin->m_TelLastMinCosAngleSeen = action->minCosAngle;
-    action->minCosAngle = plugin->m_MinCosAngle;
 
-    // Test-1: the +-45 limit lives at candidate CREATION, not in the fit cone,
-    // and the sidehop expects a 2-3 m hop (set-ranges prologue writes
-    // +0x238=2.0, +0x23C=3.0). Loosen the range so farther hops pass.
-    action->Side_min = plugin->m_ExpectedSideMin;
-    action->Side_max = plugin->m_ExpectedSideMax;
-
-    // Cache the wall's outward normal (XY, normalized) for redirect mode 2 and
-    // Hook B nudge mode 2. directionDestFacingOut (+0x40) points out of the
-    // wall toward the player's face.
+    // Cache the wall's outward normal (XY, normalized) - used by redirect
+    // sub-mode 2 and nudge direction mode 2. directionDestFacingOut (+0x40)
+    // points out of the wall toward the player's face.
     {
         const float nx = action->directionDestFacingOut.x;
         const float ny = action->directionDestFacingOut.y;
@@ -65,46 +61,61 @@ void WidenSidehopAngle_Cave(AllRegisters* params)
         }
     }
 
-    // Redirect: re-aim the candidate's target in the ground plane. Follows the
-    // proven MutateIntoSidehop pattern: only dir80 + anchors + distances matter
-    // (it never touches the SrcToDest vectors); keep dest.z/w from src.
-    if (plugin->m_RedirectMode > 0)
-    {
-        float destX, destY;
-        if (plugin->m_RedirectMode == 1)
-        {
-            // Mirror 180 degrees through the src anchor.
-            destX = 2.0f * action->locationAnchorSrc.x - action->locationAnchorDest.x;
-            destY = 2.0f * action->locationAnchorSrc.y - action->locationAnchorDest.y;
-            action->dir80.x = -action->dir80.x;
-            action->dir80.y = -action->dir80.y;
-            action->dir80.z = 0.0f;
-            action->dir80.w = 0.0f;
-        }
-        else
-        {
-            // Off the wall: place the target along the wall's outward normal
-            // (toward the roof across the alley), HopDistance meters out.
-            destX = action->locationAnchorSrc.x + plugin->m_WallNormalX * plugin->m_HopDistance;
-            destY = action->locationAnchorSrc.y + plugin->m_WallNormalY * plugin->m_HopDistance;
-            action->dir80.x = plugin->m_WallNormalX;
-            action->dir80.y = plugin->m_WallNormalY;
-            action->dir80.z = 0.0f;
-            action->dir80.w = 0.0f;
-        }
-        action->locationAnchorDest.x = destX;
-        action->locationAnchorDest.y = destY;
-        action->locationAnchorDest.z = action->locationAnchorSrc.z;
-        action->locationAnchorDest.w = action->locationAnchorSrc.w;
-        const float dx = destX - action->locationAnchorSrc.x;
-        const float dy = destY - action->locationAnchorSrc.y;
-        const float horizontalLen = sqrtf(dx * dx + dy * dy);
-        action->horizontalDifference = horizontalLen;
-        action->distance = horizontalLen;
-        plugin->m_TelRedirects++;
-    }
+    if (plugin->m_Mode == 3)
+        return; // nudge mode: Hook A is installed for the normal cache only
 
+    plugin->m_TelLastMinCosAngleSeen = action->minCosAngle;
+    action->minCosAngle = plugin->m_MinCosAngle;
+    action->Side_min = plugin->m_ExpectedSideMin;
+    action->Side_max = plugin->m_ExpectedSideMax;
     plugin->m_TelWidenApplications++;
+
+    if (plugin->m_Mode != 2 || plugin->m_RedirectSubMode <= 0)
+        return;
+
+    // Redirect: re-aim the candidate's target in the ground plane. All
+    // direction fields are rewritten so the candidate stays internally
+    // consistent when QuickCheck / the geometry tests consume it.
+    float destX, destY, dirX, dirY;
+    if (plugin->m_RedirectSubMode == 1)
+    {
+        // Mirror 180 degrees through the src anchor.
+        destX = 2.0f * action->locationAnchorSrc.x - action->locationAnchorDest.x;
+        destY = 2.0f * action->locationAnchorSrc.y - action->locationAnchorDest.y;
+        dirX = -action->dir80.x;
+        dirY = -action->dir80.y;
+    }
+    else
+    {
+        // Off the wall: target along the wall's outward normal (toward the
+        // roof across the alley), HopDistance meters out.
+        destX = action->locationAnchorSrc.x + plugin->m_WallNormalX * plugin->m_HopDistance;
+        destY = action->locationAnchorSrc.y + plugin->m_WallNormalY * plugin->m_HopDistance;
+        dirX = plugin->m_WallNormalX;
+        dirY = plugin->m_WallNormalY;
+    }
+    const float dirLen = sqrtf(dirX * dirX + dirY * dirY);
+    if (dirLen < 1e-6f)
+        return;
+    dirX /= dirLen;
+    dirY /= dirLen;
+
+    action->locationAnchorDest.x = destX;
+    action->locationAnchorDest.y = destY;
+    action->locationAnchorDest.z = action->locationAnchorSrc.z;
+    action->locationAnchorDest.w = action->locationAnchorSrc.w;
+    // Direction from src to new dest: XY unit, z = 0 (dest.z == src.z), w = 0.
+    action->dir80.x = dirX;  action->dir80.y = dirY;  action->dir80.z = 0.0f;  action->dir80.w = 0.0f;
+    action->directionSrcToDest.x = dirX; action->directionSrcToDest.y = dirY; action->directionSrcToDest.z = 0.0f; action->directionSrcToDest.w = 0.0f;
+    action->directionSrcToDestXYPlane.x = dirX; action->directionSrcToDestXYPlane.y = dirY; action->directionSrcToDestXYPlane.z = 0.0f; action->directionSrcToDestXYPlane.w = 0.0f;
+    action->directionSrcToDestXYPlane_A0.x = dirX; action->directionSrcToDestXYPlane_A0.y = dirY; action->directionSrcToDestXYPlane_A0.z = 0.0f; action->directionSrcToDestXYPlane_A0.w = 0.0f;
+
+    const float dx = destX - action->locationAnchorSrc.x;
+    const float dy = destY - action->locationAnchorSrc.y;
+    const float horizontalLen = sqrtf(dx * dx + dy * dy);
+    action->horizontalDifference = horizontalLen;
+    action->distance = horizontalLen;
+    plugin->m_TelRedirects++;
 }
 
 struct SidehopAngleWidenHook : AutoAssemblerCodeHolder_Base
@@ -124,7 +135,58 @@ AutoAssembleWrapper<SidehopAngleWidenHook>& GetAngleWidenHook()
 }
 
 // ============================================================================
-//  Hook B - breakfall-style position nudge (tunable extra, default off)
+//  Hook C - allowed-range overrides at QuickCheckAcceptableDistanceRanges
+// ============================================================================
+
+// 0x1401B5890 is QuickCheckAcceptableDistanceRanges (fancy vtable 0x143A13130
+// slot 0x70) for the sidehop. It tests, with epsilonForDistanceRange
+// (+0x1FC) tolerance:
+//   heightDifference (+0xC0)  in [ +0x1D0 - e , +0x1D0 + +0x1D4 ]
+//   horizontalDifference (+0xC4) in [ +0x1D8 - e , +0x1D8 + +0x1DC ]
+//   distance (+0xC8)          in [ +0x1E0 - e , +0x1E0 + +0x1E4 ]
+// then a dot-product cone (minCosAngle - epsilonForDotProd vs +0xCC) and more.
+// The +0x1D0..+0x1E4 ranges are written per parkour mode at the END of
+// set-ranges - AFTER Hook A's site - so only an override here (the function's
+// own entry, rcx = action) survives to the checks. Entry bytes are a clean
+// position-independent `push rbx; sub rsp,0x20; mov rbx,rcx` (9 bytes).
+// This impl may be shared by other action types' vtables: while the hotkey is
+// held those get permissive ranges too - accepted for a hold-gated test plugin.
+void WidenQuickCheckRanges_Cave(AllRegisters* params)
+{
+    Sidehop360Plugin* plugin = g_Plugin;
+    if (!plugin || (plugin->m_Mode != 1 && plugin->m_Mode != 2) || !plugin->ShouldWidenAngle())
+        return;
+    auto* action = reinterpret_cast<AvailableParkourAction*>(params->rcx_);
+    if (!action)
+        return;
+    // Upper bound is stored as an OFFSET from the min (check computes min+max).
+    action->heightDifferenceMin = plugin->m_HeightDiffMin;
+    action->heightDifferenceMax = plugin->m_HeightDiffMax - plugin->m_HeightDiffMin;
+    action->horizontalDifferenceMin = 0.05f;
+    action->horizontalDifferenceMax = 30.0f - 0.05f;
+    action->distanceMin = 0.05f;
+    action->distanceMax = 40.0f - 0.05f;
+    plugin->m_TelQuickCheckOverrides++;
+}
+
+struct SidehopQuickCheckRangesHook : AutoAssemblerCodeHolder_Base
+{
+    SidehopQuickCheckRangesHook()
+    {
+        PresetScript_CCodeInTheMiddle(
+            0x1401B5890, 9,
+            WidenQuickCheckRanges_Cave, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+    }
+};
+
+AutoAssembleWrapper<SidehopQuickCheckRangesHook>& GetQuickCheckRangesHook()
+{
+    static AutoAssembleWrapper<SidehopQuickCheckRangesHook> s_hook;
+    return s_hook;
+}
+
+// ============================================================================
+//  Hook B - breakfall-style position nudge (mode 3)
 // ============================================================================
 
 class ParkourAction_Commonbase;
@@ -148,7 +210,7 @@ DEFINE_GAME_FUNCTION(CreateParkourActionForParkourPointIfFits, 0x1401D1CF0, char
 void WhenScanClimbFacade_AlsoNudgedSidehop(AllRegisters* params)
 {
     Sidehop360Plugin* plugin = g_Plugin;
-    if (!plugin || !plugin->m_Enabled || !plugin->ShouldNudge())
+    if (!plugin || plugin->m_Mode != 3 || !plugin->ShouldWidenAngle())
         return;
 
     const __m128 originalPoint = *reinterpret_cast<__m128*>(params->rdi_);
@@ -242,11 +304,6 @@ bool Sidehop360Plugin::ShouldWidenAngle() const
         && (GetAsyncKeyState(m_Hotkey) & 0x8000) != 0;
 }
 
-bool Sidehop360Plugin::ShouldNudge() const
-{
-    return ShouldWidenAngle();
-}
-
 void Sidehop360Plugin::OnUpdate()
 {
     // -- Hotkey rebind capture: arm once every key is seen released, so the
@@ -279,37 +336,55 @@ void Sidehop360Plugin::OnUpdate()
         return;
     }
 
-    if (!m_Enabled)
+    // -- Hook A: modes 1-2 (overrides + redirect), mode 3 (cache-only). -----
+    if (m_Mode != 0)
     {
-        if (m_HooksInstalled)
+        if (m_HookARefused && !IsSiteTaken(0x140148553))
+            m_HookARefused = false;
+        if (!m_HookAInstalled && !m_HookARefused)
         {
-            GetAngleWidenHook().Deactivate();
-            GetNudgeHook().Deactivate();
-            m_HooksInstalled = false;
-            m_HookAInstalled = false;
-            m_HookBInstalled = false;
-        }
-        return;
-    }
-
-    if (!m_HookAInstalled && !m_HookARefused)
-    {
-        if (IsSiteTaken(0x140148553))
-        {
-            m_HookARefused = true;
-        }
-        else
-        {
-            GetAngleWidenHook().Activate();
-            m_HookAInstalled = true;
+            if (IsSiteTaken(0x140148553))
+                m_HookARefused = true;
+            else
+            {
+                GetAngleWidenHook().Activate();
+                m_HookAInstalled = true;
+            }
         }
     }
+    else if (m_HookAInstalled)
+    {
+        GetAngleWidenHook().Deactivate();
+        m_HookAInstalled = false;
+    }
 
-    // Hook B follows its own toggle and refuses on its own when ACUFixes'
-    // "Parkour helpers" patch owns the site (it hooks 0x140135230 itself, in
-    // Request_Spindescent.cpp). When that patch is toggled off in ACUFixes'
-    // menu, the site frees up - so keep retrying while the nudge is enabled.
-    if (m_NudgeEnabled)
+    // -- Hook C: modes 1-2 only. --------------------------------------------
+    if (m_Mode == 1 || m_Mode == 2)
+    {
+        if (m_HookCRefused && !IsSiteTaken(0x1401B5890))
+            m_HookCRefused = false;
+        if (!m_HookCInstalled && !m_HookCRefused)
+        {
+            if (IsSiteTaken(0x1401B5890))
+                m_HookCRefused = true;
+            else
+            {
+                GetQuickCheckRangesHook().Activate();
+                m_HookCInstalled = true;
+            }
+        }
+    }
+    else if (m_HookCInstalled)
+    {
+        GetQuickCheckRangesHook().Deactivate();
+        m_HookCInstalled = false;
+    }
+
+    // -- Hook B: mode 3 only. The site is owned by ACUFixes' "Parkour
+    //    helpers" patch whenever that is enabled; keep retrying while the
+    //    nudge mode is selected so toggling Parkour helpers OFF frees the
+    //    site and the hook installs on its own.
+    if (m_Mode == 3)
     {
         if (!m_HookBInstalled && !m_HookBRefused)
         {
@@ -331,7 +406,8 @@ void Sidehop360Plugin::OnUpdate()
         GetNudgeHook().Deactivate();
         m_HookBInstalled = false;
     }
-    m_HooksInstalled = m_HookAInstalled || m_HookBInstalled;
+
+    m_HooksInstalled = m_HookAInstalled || m_HookBInstalled || m_HookCInstalled;
 }
 
 // ============================================================================
@@ -363,18 +439,16 @@ void Sidehop360Plugin::LoadSettings()
         auto ParseFloat = [&](const char* key, float& out) {
             if (line.rfind(key, 0) == 0) { try { out = std::stof(line.substr(strlen(key))); } catch (...) {} }
         };
-        auto ParseBool = [&](const char* key, bool& out) {
-            if (line.rfind(key, 0) == 0) out = line.substr(strlen(key)) == "1";
-        };
 
-        ParseBool ("Enabled=",          m_Enabled);
+        ParseInt  ("Mode=",             m_Mode);
         ParseInt  ("Hotkey=",           m_Hotkey);
         ParseFloat("MinCosAngle=",      m_MinCosAngle);
-        ParseInt  ("RedirectMode=",     m_RedirectMode);
-        ParseFloat("HopDistance=",      m_HopDistance);
         ParseFloat("ExpectedSideMin=",  m_ExpectedSideMin);
         ParseFloat("ExpectedSideMax=",  m_ExpectedSideMax);
-        ParseBool ("NudgeEnabled=",     m_NudgeEnabled);
+        ParseFloat("HeightDiffMin=",    m_HeightDiffMin);
+        ParseFloat("HeightDiffMax=",    m_HeightDiffMax);
+        ParseInt  ("RedirectSubMode=",  m_RedirectSubMode);
+        ParseFloat("HopDistance=",      m_HopDistance);
         ParseInt  ("NudgeDirection=",   m_NudgeDirectionMode);
         ParseFloat("NudgeDistance=",    m_NudgeDistance);
     }
@@ -385,14 +459,15 @@ void Sidehop360Plugin::SaveSettings()
     try {
         std::ofstream f(GetIniPath());
         if (!f) return;
-        f << "Enabled=" << (m_Enabled ? 1 : 0) << "\n";
+        f << "Mode=" << m_Mode << "\n";
         f << "Hotkey=0x" << std::hex << m_Hotkey << std::dec << "\n";
         f << "MinCosAngle=" << m_MinCosAngle << "\n";
-        f << "RedirectMode=" << m_RedirectMode << "\n";
-        f << "HopDistance=" << m_HopDistance << "\n";
         f << "ExpectedSideMin=" << m_ExpectedSideMin << "\n";
         f << "ExpectedSideMax=" << m_ExpectedSideMax << "\n";
-        f << "NudgeEnabled=" << (m_NudgeEnabled ? 1 : 0) << "\n";
+        f << "HeightDiffMin=" << m_HeightDiffMin << "\n";
+        f << "HeightDiffMax=" << m_HeightDiffMax << "\n";
+        f << "RedirectSubMode=" << m_RedirectSubMode << "\n";
+        f << "HopDistance=" << m_HopDistance << "\n";
         f << "NudgeDirection=" << m_NudgeDirectionMode << "\n";
         f << "NudgeDistance=" << m_NudgeDistance << "\n";
     } catch (...) {}
@@ -442,42 +517,38 @@ void Sidehop360Plugin::OnImGuiRender()
 
     ImGui::Text("Sidehop 360 (ACU 1.5.0)");
     ImGui::Separator();
-    ImGui::TextWrapped("While wall-climbing, hold the hotkey to let the sidehop target "
-                       "any angle (vanilla: only +-45 degrees to your sides). "
-                       "The nudge is an extra, breakfall-style mechanism.");
 
-    bool enabled = m_Enabled;
-    if (ImGui::Checkbox("Enable Sidehop 360", &enabled))
-    {
-        m_Enabled = enabled;
+    static const char* modes[] = { "Off", "Angle widen (main)", "Redirect", "Nudge" };
+    ImGui::SetNextItemWidth(240);
+    if (ImGui::Combo("Mode##s360", &m_Mode, modes, IM_ARRAYSIZE(modes)))
         SaveSettings();
-    }
+    ImGui::TextDisabled("Modes are exclusive so each mechanism can be tested alone. "
+                        "All are gated by the hold-hotkey while wall-climbing.");
 
     // -- Hook status -------------------------------------------------------
     if (ImGui::CollapsingHeader("Hook status", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Indent();
-        ImGui::Text("Hook A - angle widen (0x140148553):");
-        ImGui::SameLine();
-        if (m_HookARefused)
-            ImGui::TextColored(inactiveColor, "REFUSED - site patched by another plugin");
-        else if (m_HooksInstalled && m_Enabled)
-            ImGui::TextColored(activeColor, "INSTALLED");
-        else
-            ImGui::TextColored(inactiveColor, "not installed");
-        ImGui::Text("Hook B - position nudge (0x140135230):");
-        ImGui::SameLine();
-        if (m_HookBRefused)
-            ImGui::TextColored(inactiveColor,
-                "REFUSED - site owned by ACUFixes' \"Parkour helpers\" patch "
-                "(not ACU_ParkourPatches - corrected in v0.2.1). To test the "
-                "nudge: turn Parkour helpers OFF in ACUFixes' menu, then this "
-                "hook installs on its own. Do not re-enable Parkour helpers "
-                "while the nudge is on.");
-        else if (m_NudgeEnabled && m_HooksInstalled && m_Enabled)
-            ImGui::TextColored(activeColor, "INSTALLED");
-        else
-            ImGui::TextColored(inactiveColor, "off");
+        auto HookLine = [&](const char* label, bool refused, bool installed, bool usedByMode, const char* refusedMsg) {
+            ImGui::Text("%s:", label);
+            ImGui::SameLine();
+            if (refused)
+                ImGui::TextColored(inactiveColor, "%s", refusedMsg);
+            else if (installed)
+                ImGui::TextColored(activeColor, "INSTALLED");
+            else if (usedByMode)
+                ImGui::TextColored(inactiveColor, "pending...");
+            else
+                ImGui::TextColored(inactiveColor, "not used by this mode");
+        };
+        HookLine("Hook A - set-ranges (0x140148553)", m_HookARefused, m_HookAInstalled, m_Mode != 0,
+            "REFUSED - site patched by another plugin");
+        HookLine("Hook C - quick-check ranges (0x1401B5890)", m_HookCRefused, m_HookCInstalled, m_Mode == 1 || m_Mode == 2,
+            "REFUSED - site patched by another plugin");
+        HookLine("Hook B - nudge (0x140135230)", m_HookBRefused, m_HookBInstalled, m_Mode == 3,
+            "REFUSED - owned by ACUFixes' \"Parkour helpers\". Turn Parkour "
+            "helpers OFF in ACUFixes' menu and this installs on its own. "
+            "Do not re-enable Parkour helpers while the nudge is on.");
         ImGui::Unindent();
     }
 
@@ -489,10 +560,16 @@ void Sidehop360Plugin::OnImGuiRender()
         ImGui::Text("Hotkey held:");
         ImGui::SameLine();
         ImGui::TextColored(held ? activeColor : inactiveColor, held ? "YES" : "no");
-        ImGui::Text("Angle overrides applied: %lld", m_TelWidenApplications);
-        ImGui::Text("Vanilla minCosAngle seen: %.4f (cos45 = 0.7071)", m_TelLastMinCosAngleSeen);
-        ImGui::Text("Redirects applied: %lld (mode %d)", m_TelRedirects, m_RedirectMode);
-        ImGui::Text("Nudge: %lld calls, %lld sidehops created", m_TelNudgeCalls, m_TelNudgeCreated);
+        if (m_Mode == 1 || m_Mode == 2)
+        {
+            ImGui::Text("Angle overrides applied: %lld", m_TelWidenApplications);
+            ImGui::Text("Vanilla minCosAngle seen: %.4f (cos45 = 0.7071)", m_TelLastMinCosAngleSeen);
+            ImGui::Text("QuickCheck range overrides: %lld", m_TelQuickCheckOverrides);
+        }
+        if (m_Mode == 2)
+            ImGui::Text("Redirects applied: %lld (sub-mode %d)", m_TelRedirects, m_RedirectSubMode);
+        if (m_Mode == 3)
+            ImGui::Text("Nudge: %lld calls, %lld sidehops created", m_TelNudgeCalls, m_TelNudgeCreated);
         ImGui::Unindent();
     }
 
@@ -516,66 +593,67 @@ void Sidehop360Plugin::OnImGuiRender()
             m_CaptureArmed = false;
         }
 
-        ImGui::SetNextItemWidth(240);
-        if (ImGui::SliderFloat("minCosAngle##s360", &m_MinCosAngle, -1.0f, 1.0f, "%.3f"))
-            SaveSettings();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("360##s360")) { m_MinCosAngle = -1.0f; SaveSettings(); }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("vanilla##s360")) { m_MinCosAngle = 0.7071f; SaveSettings(); }
-        ImGui::TextDisabled("-1 = full 360 degrees. Vanilla writes cos45 (0.7071).");
+        if (m_Mode == 1 || m_Mode == 2)
+        {
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("minCosAngle##s360", &m_MinCosAngle, -1.0f, 1.0f, "%.3f"))
+                SaveSettings();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("360##s360")) { m_MinCosAngle = -1.0f; SaveSettings(); }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("vanilla##s360")) { m_MinCosAngle = 0.7071f; SaveSettings(); }
+            ImGui::TextDisabled("-1 = full 360 degrees. Vanilla writes cos45 (0.7071).");
 
-        ImGui::Separator();
-        ImGui::Text("Redirect & reach (test-1: candidates exist, but are aimed/near)");
-        const char* redirectModes[] = { "Off (widen only)", "Mirror 180 degrees", "Off the wall" };
-        ImGui::SetNextItemWidth(240);
-        if (ImGui::Combo("Redirect##s360", &m_RedirectMode, redirectModes, IM_ARRAYSIZE(redirectModes)))
-            SaveSettings();
-        ImGui::SetNextItemWidth(240);
-        if (ImGui::SliderFloat("Hop distance##s360", &m_HopDistance, 0.5f, 10.0f, "%.2f m"))
-            SaveSettings();
-        ImGui::SetNextItemWidth(240);
-        float sideMin = m_ExpectedSideMin;
-        if (ImGui::SliderFloat("Expected hop min##s360", &sideMin, 0.0f, 5.0f, "%.2f m"))
-        {
-            m_ExpectedSideMin = sideMin;
-            SaveSettings();
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("vanilla##s360min")) { m_ExpectedSideMin = 2.0f; SaveSettings(); }
-        ImGui::SetNextItemWidth(240);
-        float sideMax = m_ExpectedSideMax;
-        if (ImGui::SliderFloat("Expected hop max##s360", &sideMax, 1.0f, 15.0f, "%.2f m"))
-        {
-            m_ExpectedSideMax = sideMax;
-            SaveSettings();
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("vanilla##s360max")) { m_ExpectedSideMax = 3.0f; SaveSettings(); }
-        ImGui::TextDisabled("Side_min/Max: hop length the sidehop accepts (vanilla 2-3 m). "
-                            "Raise the max to reach farther roofs. Mirror flips the "
-                            "candidate's target; Off-the-wall places it Hop distance "
-                            "out along the wall normal.");
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Expected hop min##s360", &m_ExpectedSideMin, 0.0f, 5.0f, "%.2f m"))
+                SaveSettings();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("vanilla##s360min")) { m_ExpectedSideMin = 2.0f; SaveSettings(); }
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Expected hop max##s360", &m_ExpectedSideMax, 1.0f, 15.0f, "%.2f m"))
+                SaveSettings();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("vanilla##s360max")) { m_ExpectedSideMax = 3.0f; SaveSettings(); }
 
-        ImGui::Separator();
-        bool nudge = m_NudgeEnabled;
-        if (ImGui::Checkbox("Enable position nudge (extra)", &nudge))
-        {
-            m_NudgeEnabled = nudge;
-            SaveSettings();
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Allowed height min##s360", &m_HeightDiffMin, -30.0f, 0.0f, "%.1f m"))
+                SaveSettings();
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Allowed height max##s360", &m_HeightDiffMax, 0.0f, 30.0f, "%.1f m"))
+                SaveSettings();
+            ImGui::TextDisabled("Hook C: the allowed dest-height window QuickCheck accepts "
+                                "(vanilla sidehop: -1.0..+1.5 m - the gate that killed "
+                                "cross-alley targets). Horizontal/distance windows are "
+                                "widened to 30/40 m automatically.");
         }
-        if (m_NudgeEnabled)
+
+        if (m_Mode == 2)
         {
-            ImGui::Indent();
-            const char* modes[] = { "Opposite of movement input", "Along movement input", "Off the wall (uses Hook A's cached normal)" };
-            if (ImGui::Combo("Nudge direction##s360", &m_NudgeDirectionMode, modes, IM_ARRAYSIZE(modes)))
+            ImGui::Separator();
+            const char* subModes[] = { "Off (ranges only)", "Mirror 180 degrees", "Off the wall" };
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::Combo("Redirect##s360", &m_RedirectSubMode, subModes, IM_ARRAYSIZE(subModes)))
+                SaveSettings();
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Hop distance##s360", &m_HopDistance, 0.5f, 10.0f, "%.2f m"))
+                SaveSettings();
+            ImGui::TextDisabled("Off-the-wall places every sidehop target Hop distance out "
+                                "along the wall normal (toward the roof across the alley); "
+                                "Mirror flips the target to the opposite side.");
+        }
+
+        if (m_Mode == 3)
+        {
+            ImGui::Separator();
+            const char* nudgeModes[] = { "Opposite of movement input", "Along movement input", "Off the wall (uses Hook A's cached normal)" };
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::Combo("Nudge direction##s360", &m_NudgeDirectionMode, nudgeModes, IM_ARRAYSIZE(nudgeModes)))
                 SaveSettings();
             ImGui::SetNextItemWidth(240);
             if (ImGui::SliderFloat("Nudge distance##s360", &m_NudgeDistance, 0.0f, 3.0f, "%.2f m"))
                 SaveSettings();
             ImGui::TextDisabled("Creates ONE extra sidehop candidate from a point "
-                                "moved along/against the movement input, or off the wall.");
-            ImGui::Unindent();
+                                "moved off the wall or along/against the movement input.");
         }
 
         ImGui::Unindent();
