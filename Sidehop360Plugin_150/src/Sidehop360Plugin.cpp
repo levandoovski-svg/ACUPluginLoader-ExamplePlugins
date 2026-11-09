@@ -305,8 +305,10 @@ void Sidehop360Plugin::OnUpdate()
         }
     }
 
-    // Hook B follows its own toggle and refuses on its own when
-    // ACU_ParkourPatches owns the site (expected on this install).
+    // Hook B follows its own toggle and refuses on its own when ACUFixes'
+    // "Parkour helpers" patch owns the site (it hooks 0x140135230 itself, in
+    // Request_Spindescent.cpp). When that patch is toggled off in ACUFixes'
+    // menu, the site frees up - so keep retrying while the nudge is enabled.
     if (m_NudgeEnabled)
     {
         if (!m_HookBInstalled && !m_HookBRefused)
@@ -318,6 +320,10 @@ void Sidehop360Plugin::OnUpdate()
                 GetNudgeHook().Activate();
                 m_HookBInstalled = true;
             }
+        }
+        else if (m_HookBRefused && !IsSiteTaken(0x140135230))
+        {
+            m_HookBRefused = false; // site freed - install on the next pass
         }
     }
     else if (m_HookBInstalled)
@@ -463,8 +469,11 @@ void Sidehop360Plugin::OnImGuiRender()
         ImGui::SameLine();
         if (m_HookBRefused)
             ImGui::TextColored(inactiveColor,
-                "REFUSED - site owned by ACU_ParkourPatches. Remove/rename that "
-                "plugin (and ACUFixes' Parkour Helpers) to test the nudge.");
+                "REFUSED - site owned by ACUFixes' \"Parkour helpers\" patch "
+                "(not ACU_ParkourPatches - corrected in v0.2.1). To test the "
+                "nudge: turn Parkour helpers OFF in ACUFixes' menu, then this "
+                "hook installs on its own. Do not re-enable Parkour helpers "
+                "while the nudge is on.");
         else if (m_NudgeEnabled && m_HooksInstalled && m_Enabled)
             ImGui::TextColored(activeColor, "INSTALLED");
         else

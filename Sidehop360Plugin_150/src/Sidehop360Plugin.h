@@ -22,7 +22,9 @@
 //     in the ground plane, and asks CreateParkourActionForParkourPointIfFits
 //     (0x1401D1CF0) to create ONE extra sidehop from the nudged point. The
 //     vanilla call still runs right after via the stolen bytes. Refuses to
-//     install when another plugin (e.g. ACU_ParkourPatches) owns the site.
+//     install when the site is already hooked - on any ACUFixes install this
+//     is ACUFixes' own "Parkour helpers" patch (Request_Spindescent.cpp);
+//     toggling Parkour helpers off frees the site.
 class Sidehop360Plugin
 {
 public:
@@ -62,7 +64,7 @@ public:
     float m_ExpectedSideMax = 8.0f;  // vanilla writes 3.0 (+0x23C)
 
     // Hook B.
-    bool  m_NudgeEnabled = false;    // default off: tunable extra, site usually owned by ACU_ParkourPatches
+    bool  m_NudgeEnabled = false;    // default off: extra; site owned by ACUFixes' "Parkour helpers" patch
     int   m_NudgeDirectionMode = 0;  // 0 = opposite of the movement input, 1 = along it, 2 = off the wall
     float m_NudgeDistance = 0.5f;    // meters
 
