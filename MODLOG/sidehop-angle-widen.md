@@ -304,3 +304,11 @@ If the third counter stays at 0 while the first climbs, the point is rejected **
 ctor (before any range gate) — the next lever is that ctor body, or the tester table swap in fact 1.
 If it climbs but the hop still does not appear where aimed, the remaining gates are the fit chain
 (`0x140149CC0`) and the sort (`0x140133B00`).
+
+**Reaching "behind" (v0.5.0).** Shifting the scanner's own probe point cannot produce a bearing the
+scanner never probed — a shift moves an existing destination, it does not create a new one. So mode 4
+now builds the point **absolutely**: `Human::GetForPlayer()->entity->GetPosition()` (Human `entity` at
+`+0x1E8`; `BaseEntity::GetPosition` = `mainTransform+0x30`) `+ normalize(inputXY) * AimDistance`, plus
+an `AimHeight` offset. The ctor only *derives* geometry from the point (it calls the player-position
+getter `0x1401D2500`, then does vector math; it performs no validity test), so any bearing — including
+almost directly behind — is constructed, and acceptance is left to QuickCheck and the fit chain.

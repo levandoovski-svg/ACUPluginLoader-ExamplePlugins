@@ -49,12 +49,15 @@
 //     Hook D (0x1401584B0, the type-39 action CONSTRUCTOR - vanilla, one
 //     caller: the type-39 case of the creation factory) intercepts every
 //     sidehop construction. While the hotkey is held it substitutes the probe
-//     point (r8) with a copy shifted along the player's movement input by
-//     AimDistance, then lets the vanilla ctor build the action from that point
-//     (the pointer is swapped, so the scanner's own buffers are never
-//     mutated). This is the first mechanism that acts at CREATION stage - the
-//     stage the widen experiments proved is the real +-45-degree gate - so it
-//     is the path toward omnidirectional targeting.
+//     point (r8): by default the destination is built ABSOLUTELY from the
+//     player's own position (Human::GetForPlayer()->entity->GetPosition())
+//     along the movement input at AimDistance, with AimHeight vertical offset,
+//     so ANY bearing works - including almost directly behind the player,
+//     which the scanner never probes and which pushing its own point could not
+//     reach. Unchecking "from player" falls back to shifting the scanner's
+//     point (v0.4.1 behaviour). The vanilla ctor builds the action from the
+//     substitute point (the scanner's buffers are never mutated), and the scan
+//     appends it exactly as it would the vanilla candidate.
 //     The wrapper 0x1401D1CF0 that v0.4.0 tried to hook is owned by
 //     FreeFormWallrun.dll (live-verified: FF 25 + pointer to +0xAB90), and that
 //     plugin reimplements the wrapper; the ctor is untouched and is still
@@ -103,7 +106,10 @@ public:
     float m_NudgeDistance = 0.5f;    // meters
 
     // Mode 4 (aim by creation).
-    float m_AimDistance = 2.5f;      // meters the probe point is pushed along the movement input
+    float m_AimDistance = 3.0f;      // meters from the player, in the input direction
+    float m_AimHeight = 0.0f;        // meters above the player's feet for the aimed point
+    bool  m_AimFromPlayer = true;    // true: absolute aim from the player (any bearing,
+                                     // including behind); false: shift the scanner's point
 
     // Hook states (each hook installs independently).
     bool m_HooksInstalled = false;

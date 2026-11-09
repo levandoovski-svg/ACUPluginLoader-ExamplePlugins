@@ -3,6 +3,8 @@
 #include "ParkourDebugging/AvailableParkourAction.h"
 #include "ParkourDebugging/EnumParkourAction.h"
 #include "ParkourDebugging/FancyVFunctionDescription.h"
+#include "ACU/Human.h"
+#include "ACU/Entity.h"
 #include "ACU/Memory/ACUAllocs.h"
 #include "AutoAssemblerKinda/AutoAssemblerKinda.h"
 #include "ACU_DefineNativeFunction.h"
@@ -11,6 +13,7 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <xmmintrin.h>
 
 // GetEnumParkourAction() is declared by AvailableParkourAction.h but never
 // called here, so (not compiling GenericHooksInParkourFiltering.cpp) it needs
@@ -366,10 +369,34 @@ void AimSidehopProbePoint_Cave(AllRegisters* params)
     dirX /= len;
     dirY /= len;
 
-    t_AimPoint = originalPoint;
-    float* p = reinterpret_cast<float*>(&t_AimPoint);
-    p[0] += dirX * plugin->m_AimDistance;
-    p[1] += dirY * plugin->m_AimDistance;
+    if (plugin->m_AimFromPlayer)
+    {
+        // ABSOLUTE aim: the destination is built from the player himself, so it
+        // can be at ANY bearing - including almost directly behind. The scanner
+        // point is only used for its w component; the old "shift the scanner
+        // point" behaviour could never leave the arc the scanner probed.
+        Human* human = Human::GetForPlayer();
+        if (!human || !human->entity)
+            return;
+        const Vector3f& pos = human->entity->GetPosition();
+        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2]))
+            return;
+
+        float aimX = pos[0] + dirX * plugin->m_AimDistance;
+        float aimY = pos[1] + dirY * plugin->m_AimDistance;
+        float aimZ = pos[2] + plugin->m_AimHeight;
+        float aimW = reinterpret_cast<const float*>(&originalPoint)[3];
+
+        t_AimPoint = _mm_setr_ps(aimX, aimY, aimZ, aimW);
+    }
+    else
+    {
+        // Relative mode (v0.4.1 behaviour): push the scanner's own point.
+        t_AimPoint = originalPoint;
+        float* p = reinterpret_cast<float*>(&t_AimPoint);
+        p[0] += dirX * plugin->m_AimDistance;
+        p[1] += dirY * plugin->m_AimDistance;
+    }
 
     params->r8_ = reinterpret_cast<unsigned long long>(&t_AimPoint);
     plugin->m_TelAimRewrites++;
@@ -592,6 +619,12 @@ void Sidehop360Plugin::LoadSettings()
         ParseInt  ("NudgeDirection=",   m_NudgeDirectionMode);
         ParseFloat("NudgeDistance=",    m_NudgeDistance);
         ParseFloat("AimDistance=",      m_AimDistance);
+        ParseFloat("AimHeight=",        m_AimHeight);
+        {
+            int fromPlayer = m_AimFromPlayer ? 1 : 0;
+            ParseInt("AimFromPlayer=", fromPlayer);
+            m_AimFromPlayer = fromPlayer != 0;
+        }
     }
 }
 
@@ -612,6 +645,8 @@ void Sidehop360Plugin::SaveSettings()
         f << "NudgeDirection=" << m_NudgeDirectionMode << "\n";
         f << "NudgeDistance=" << m_NudgeDistance << "\n";
         f << "AimDistance=" << m_AimDistance << "\n";
+        f << "AimHeight=" << m_AimHeight << "\n";
+        f << "AimFromPlayer=" << (m_AimFromPlayer ? 1 : 0) << "\n";
     } catch (...) {}
 }
 
@@ -818,13 +853,20 @@ void Sidehop360Plugin::OnImGuiRender()
         {
             ImGui::Separator();
             ImGui::SetNextItemWidth(240);
-            if (ImGui::SliderFloat("Aim distance##s360", &m_AimDistance, 0.0f, 6.0f, "%.2f m"))
+            if (ImGui::SliderFloat("Aim distance##s360", &m_AimDistance, 0.5f, 8.0f, "%.2f m"))
                 SaveSettings();
-            ImGui::TextDisabled("Pushes each sidehop probe point along your movement input "
-                                "before the action is built, so the hop is created toward the "
-                                "direction you steer (wall normal when the stick is centred). "
-                                "0.0 m = vanilla points. Hooks the type-39 constructor, not the "
-                                "factory wrapper (that wrapper is owned by FreeFormWallrun.dll).");
+            ImGui::SameLine();
+            if (ImGui::Checkbox("from player (absolute)##s360", &m_AimFromPlayer))
+                SaveSettings();
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Aim height##s360", &m_AimHeight, -3.0f, 3.0f, "%.2f m"))
+                SaveSettings();
+            ImGui::TextDisabled("Absolute aim builds the destination from YOUR position along the "
+                                "movement input, so any bearing works - including almost directly "
+                                "behind you. Uncheck to fall back to pushing the scanner's own point "
+                                "(v0.4.1 behaviour). Vanilla points are restored when the hotkey is "
+                                "released. Hooks the type-39 constructor, not the factory wrapper "
+                                "(that wrapper is owned by FreeFormWallrun.dll).");
 
             ImGui::SetNextItemWidth(240);
             if (ImGui::SliderFloat("minCosAngle##s360aim", &m_MinCosAngle, -1.0f, 1.0f, "%.3f"))
