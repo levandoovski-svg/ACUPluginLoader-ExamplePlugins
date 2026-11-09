@@ -71,8 +71,8 @@ public:
     float m_MinCosAngle = -1.0f;     // -1 = accept from any angle; vanilla cos45 = 0.7071
     float m_ExpectedSideMin = 0.5f;  // vanilla writes 2.0 (+0x238)
     float m_ExpectedSideMax = 8.0f;  // vanilla writes 3.0 (+0x23C)
-    float m_HeightDiffMin = -10.0f;  // allowed dest height offset below src (+0x1D0)
-    float m_HeightDiffMax = 10.0f;   // above src (+0x1D4 is stored as offset from min)
+    float m_HeightDiffMin = -10.0f;  // allowed dest height offset below src (+0x1D0, absolute)
+    float m_HeightDiffMax = 10.0f;   // above src (+0x1D4, absolute too - the check does e+max)
 
     // Mode 2 (redirect). Sub-mode: 1 = mirror 180 deg, 2 = off the wall.
     int   m_RedirectSubMode = 2;

@@ -46,9 +46,9 @@ All offsets are `AvailableParkourAction` (see `Sidehop360Plugin_150/src/ParkourD
 |-------|--------|------------------------|-----------|
 | `minCosAngle` (the ±45° cone) | `+0x1E8` | `0x3F3504F3` = cos 45° | set-ranges `0x140148549` (`C7 81 E8 01 00 00 F3 04 35 3F`) |
 | `Side_min` / `Side_max` (expected hop length) | `+0x238` / `+0x23C` | 2.0 / 3.0 m | set-ranges prologue, `mov [rcx+0x238], 0x40000000` / `[rcx+0x23C], 0x40400000` |
-| `heightDifferenceMin` / `heightDifferenceMax` | `+0x1D0` / `+0x1D4` | per-mode, e.g. mode 0: `-1.0` / `+2.5` (**upper = min + offset = +1.5 m**) | per-mode jump table at the **END** of `0x140148500` |
-| `horizontalDifferenceMin` / `Max` | `+0x1D8` / `+0x1DC` | 0.25 / 12.0 (upper = 12.25 m) | set-ranges header |
-| `distanceMin` / `distanceMax` | `+0x1E0` / `+0x1E4` | 0.25 / 17.0 (upper = 17.25 m) | set-ranges header |
+| `heightDifferenceMin` / `heightDifferenceMax` | `+0x1D0` / `+0x1D4` | per-mode, e.g. mode 0: `-1.0` / `+2.5` (**absolute** bounds) | per-mode jump table at the **END** of `0x140148500` |
+| `horizontalDifferenceMin` / `Max` | `+0x1D8` / `+0x1DC` | 0.25 / 12.0 (**absolute**) | set-ranges header |
+| `distanceMin` / `distanceMax` | `+0x1E0` / `+0x1E4` | 0.25 / 17.0 (**absolute**) | set-ranges header |
 | `epsilonForDistanceRange` | `+0x1FC` | small tolerance added to every window | set-ranges |
 | `epsilonForDotProd` | `+0x200` | tolerance subtracted from the cone (`minCosAngle - epsilon` vs `+0xCC`) | set-ranges |
 | `directionDestFacingOut` | `+0x40` | wall's outward normal (XY, normalized) | creation, per candidate |
@@ -56,16 +56,20 @@ All offsets are `AvailableParkourAction` (see `Sidehop360Plugin_150/src/ParkourD
 Checks in `QuickCheckAcceptableDistanceRanges` (`0x1401B5890`, fancy slot 0x70):
 
 ```
-heightDifference          (+0xC0) in [ +0x1D0 - e , +0x1D0 + 0x1D4 ]
-horizontalDifference      (+0xC4) in [ +0x1D8 - e , +0x1D8 + 0x1DC ]
-distance                  (+0xC8) in [ +0x1E0 - e , +0x1E0 + 0x1E4 ]
+heightDifference          (+0xC0) in [ +0x1D0 - e , +0x1D4 + e ]
+horizontalDifference      (+0xC4) in [ +0x1D8 - e , +0x1DC + e ]
+distance                  (+0xC8) in [ +0x1E0 - e , +0x1E4 + e ]
 cone:  +0xCC  vs  (minCosAngle - +0x200)
-then 0x1401CBCD0 and a +0x1F4 / +0xD4 check
+then 0x1401CBCD0, a +0x1F4 / +0xD4 check, and fancy slot 0x71
 ```
 
-**`+0x1D4/+0x1DC/+0x1E4` are stored as offsets from their min, not absolute maxima.** Writing an
-absolute upper bound into them silently makes the window `min + upper`; that is the #1 way to get
-"widen applied, nothing changed".
+**`+0x1D4/+0x1DC/+0x1E4` are ABSOLUTE upper bounds, not offsets from their mins.**
+Confirmed from the comparison order in the disassembly: `min - e <= value` and
+`value <= e + max`. An earlier revision of this note (and of Sidehop360's comments) claimed they were
+offsets and that the real ceiling was `min + max`; that was wrong and made Sidehop360's Hook C write
+`max - min` into `+0x1D4`, so its effective ceiling was `min + max`. The behaviour was still
+"permissive enough", which is why the plugin appeared to work, but the slider did not mean what the
+UI said.
 
 ## 4. The two seams (verified bytes)
 
@@ -143,7 +147,7 @@ noted `wallEjectToHang` (type 17) as the plausible move for that geometry.
    `minCosAngle` and `Side_*` there, and cache the wall normal from `+0x40` if you need it.
 4. **Seam C** at the range check's entry (`push rbx; sub rsp,0x20; mov rbx,rcx` — 9 position-independent
    bytes); write `heightDifferenceMin/Max`, `horizontalDifferenceMin/Max`, `distanceMin/Max` as
-   `min` + **offset**.
+   absolute bounds.
 5. **Gate it and prove ordering.** Keep the whole thing behind a hold-key during testing, and log the
    *vanilla* value you read (`m_TelLastMinCosAngleSeen`) — that is what distinguishes "hook didn't
    run" from "hook ran but nothing consumes it". A counter is not evidence of effect; only gameplay
@@ -167,14 +171,14 @@ struct HookA : AutoAssemblerCodeHolder_Base {
                 RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true); }
 };
 
-// Hook C: the windows that actually decide acceptance; upper bounds are OFFSETS.
+// Hook C: the windows that actually decide acceptance; bounds are ABSOLUTE.
 void RangesCave(AllRegisters* p) {
     if (!ok()) return;
     auto* a = (AvailableParkourAction*)p->rcx_;
     a->heightDifferenceMin     = -10.0f;
-    a->heightDifferenceMax     =  10.0f - (-10.0f);  // stored as offset from min
-    a->horizontalDifferenceMin = 0.05f;  a->horizontalDifferenceMax = 30.0f - 0.05f;
-    a->distanceMin             = 0.05f;  a->distanceMax             = 40.0f - 0.05f;
+    a->heightDifferenceMax     =  10.0f;             // absolute ceiling, not an offset
+    a->horizontalDifferenceMin = 0.05f;  a->horizontalDifferenceMax = 30.0f;
+    a->distanceMin             = 0.05f;  a->distanceMax             = 40.0f;
 }
 struct HookC : AutoAssemblerCodeHolder_Base {
     HookC() { PresetScript_CCodeInTheMiddle(0x1401B5890, 9, RangesCave,
@@ -200,8 +204,40 @@ Freeform 2.0's, and ACUFixes' "Parkour helpers" toggle owns it on other installs
 
 - Code: `Sidehop360Plugin_150/src/Sidehop360Plugin.cpp` (+ `.h` for the mode/version comments).
 - Field layout: `Sidehop360Plugin_150/src/ParkourDebugging/AvailableParkourAction.h` (1.5.0-correct copy).
-- Session log with all test results: `ExamplePlugin/src/PROGRESS.md` sessions 21-24.
+- Session log with all test results: `ExamplePlugin/src/PROGRESS.md` sessions 21-25.
 - Dump + sweep tooling: `MODLOG/scripts/ACU_dumped.bin`, `MODLOG/scripts/acu_sweep.py`.
   **Caveat:** the dump is contaminated at `0x140135230` by an old Freeform 2.0 hook baked in at
   capture time; treat that one site's bytes as non-vanilla.
 - Sibling mechanism doc (same style): `MODLOG/breakfall-gate.md`.
+
+## 10. Worked example: swing-to-swing (type 49), and why a table-slot swap beats a code cave
+
+`SwingToSwingWidenPlugin_150` applies this mechanism to `swing_31_swingToSwing_mb` (enum 49). Findings
+that matter for the next reuse:
+
+| Fact | Value |
+|------|-------|
+| Fancy vtable of type 49 | `0x143A77E90` (in `.data`, writable — no code patching needed) |
+| Its `GetEnumParkourAction` (slot 0x45) | `0x1401B59F0` = `mov eax,0x31; ret` |
+| Its set-ranges (slot 0x64) | `0x1401B60A0`, **type-exclusive** |
+| Its range check (slot 0x70) | `0x1401B5890` — the **shared** check, used by 118 action types |
+| Vanilla cone | mode 1 = cos30 (0.866), mode 2 = cos45 (0.7071), mode 3 = cos15 (0.966); mode 0/4+ never writes it |
+| Vanilla height window | mode 1 `-2..+1`, mode 2 `-1..0`, mode 3 `-12..0` |
+
+Because the check impl is shared, a byte hook there would leak to 118 types and would also collide with
+Sidehop360's Hook C. The type's own set-ranges is exclusive but splits into per-mode branches with no
+single post-write seam. The plugin therefore **repoints just slot 0x70 in the type-49 table** to a thunk
+that applies the overrides and then calls `0x1401B5890`. Consequences:
+
+- **No game code bytes are modified**, so it coexists with Freeform 2.0 (which owns `0x140135230` /
+  `0x140133B00`) and with Sidehop360 (whose cave at `0x1401B5890` is still executed, because the thunk
+  calls that address).
+- Only type 49 candidates are affected; other moves keep vanilla acceptance even while the hotkey is held.
+- Installation is a single aligned 8-byte pointer write, restored when the mode is switched off; no
+  `VirtualProtect` is required (`.data` is RW) but one is done anyway so a future layout change cannot
+  crash.
+- Ordering: the same caveat as §5 applies — this widens acceptance of candidates that already exist, it
+  does not make the swing choose a direction the scanner never probed.
+
+This is the pattern to prefer for any move that **shares** `0x1401B5890`: swap its table slot instead of
+hooking shared code. Use a byte cave only when the function you need to influence is type-exclusive.

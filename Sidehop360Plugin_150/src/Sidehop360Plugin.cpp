@@ -144,10 +144,15 @@ AutoAssembleWrapper<SidehopAngleWidenHook>& GetAngleWidenHook()
 // 0x1401B5890 is QuickCheckAcceptableDistanceRanges (fancy vtable 0x143A13130
 // slot 0x70) for the sidehop. It tests, with epsilonForDistanceRange
 // (+0x1FC) tolerance:
-//   heightDifference (+0xC0)  in [ +0x1D0 - e , +0x1D0 + +0x1D4 ]
-//   horizontalDifference (+0xC4) in [ +0x1D8 - e , +0x1D8 + +0x1DC ]
-//   distance (+0xC8)          in [ +0x1E0 - e , +0x1E0 + +0x1E4 ]
+//   heightDifference (+0xC0)  in [ +0x1D0 - e , +0x1D4 + e ]
+//   horizontalDifference (+0xC4) in [ +0x1D8 - e , +0x1DC + e ]
+//   distance (+0xC8)          in [ +0x1E0 - e , +0x1E4 + e ]
 // then a dot-product cone (minCosAngle - epsilonForDotProd vs +0xCC) and more.
+// NOTE: +0x1D4/+0x1DC/+0x1E4 are ABSOLUTE upper bounds, not offsets from the
+// mins (verified from the comparison order: min-e <= value, value <= e+max).
+// Up to v0.3.1 this cave wrote `Max - Min` into +0x1D4 because of a wrong
+// "stored as offset" note, so the real ceiling was Min+Max (-10..+20 m). Now
+// the sliders mean exactly what they say.
 // The +0x1D0..+0x1E4 ranges are written per parkour mode at the END of
 // set-ranges - AFTER Hook A's site - so only an override here (the function's
 // own entry, rcx = action) survives to the checks. Entry bytes are a clean
@@ -162,13 +167,12 @@ void WidenQuickCheckRanges_Cave(AllRegisters* params)
     auto* action = reinterpret_cast<AvailableParkourAction*>(params->rcx_);
     if (!action)
         return;
-    // Upper bound is stored as an OFFSET from the min (check computes min+max).
     action->heightDifferenceMin = plugin->m_HeightDiffMin;
-    action->heightDifferenceMax = plugin->m_HeightDiffMax - plugin->m_HeightDiffMin;
+    action->heightDifferenceMax = plugin->m_HeightDiffMax;
     action->horizontalDifferenceMin = 0.05f;
-    action->horizontalDifferenceMax = 30.0f - 0.05f;
+    action->horizontalDifferenceMax = 30.0f;
     action->distanceMin = 0.05f;
-    action->distanceMax = 40.0f - 0.05f;
+    action->distanceMax = 40.0f;
     plugin->m_TelQuickCheckOverrides++;
 }
 
@@ -628,7 +632,7 @@ void Sidehop360Plugin::OnImGuiRender()
             if (ImGui::SliderFloat("Allowed height max##s360", &m_HeightDiffMax, 0.0f, 30.0f, "%.1f m"))
                 SaveSettings();
             ImGui::TextDisabled("Hook C: the allowed dest-height window QuickCheck accepts "
-                                "(vanilla sidehop: -1.0..+1.5 m - the gate that killed "
+                                "(vanilla sidehop: -1.0..+2.5 m - the gate that killed "
                                 "cross-alley targets). Horizontal/distance windows are "
                                 "widened to 30/40 m automatically.");
         }
