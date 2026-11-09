@@ -1,0 +1,47 @@
+name: Build SwingToWallWidenPlugin_150
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - "SwingToWallWidenPlugin_150/**"
+      - ".github/workflows/build-swingwall.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable Long Paths
+      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Checkout plugin repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        path: 's'
+        submodules: 'recursive'
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Clean build artifacts
+      shell: pwsh
+      run: |
+        $buildDir = "${{ github.workspace }}\s\SwingToWallWidenPlugin_150\build"
+        if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build SwingToWallWidenPlugin_150
+      shell: pwsh
+      run: |
+        $root = "${{ github.workspace }}"
+        & msbuild "$root\s\SwingToWallWidenPlugin_150\SwingToWallWidenPlugin_150.vcxproj" /p:Configuration=Release /p:Platform=x64
+
+    - name: Upload DLLs
+      uses: actions/upload-artifact@v4
+      with:
+        name: built-dlls-swingwall
+        path: |
+          s/SwingToWallWidenPlugin_150/build/x64/Release/plugins/SwingToWallWidenPlugin_150.dll

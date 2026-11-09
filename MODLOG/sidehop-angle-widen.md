@@ -241,3 +241,16 @@ that applies the overrides and then calls `0x1401B5890`. Consequences:
 
 This is the pattern to prefer for any move that **shares** `0x1401B5890`: swap its table slot instead of
 hooking shared code. Use a byte cave only when the function you need to influence is type-exclusive.
+
+Other swing moves that use the same shared check, widened the same way
+(`SwingToWallWidenPlugin_150`, hotkey F10):
+
+| Move | Enum | Fancy vtable(s) | Its set-ranges | Vanilla cone |
+|------|------|-----------------|----------------|--------------|
+| swing to front wall | 46 | `0x1439E6120`, `0x143A0B080` (both `0x140145C30`) and `0x143A66D20` (`0x1401A87D0`) | two different impls | cos15 prologue, then cos45/cos30/cos15 per mode |
+| swing to sidewall (incl. spindescent) | 47 | `0x143A3E170` | `0x140190DC0` | cos75 (`0x3E8483EE`) |
+
+Two lessons from the type-46 case: **one move can own several fancy vtables** (different creation
+contexts) — a slot swap must cover all of them or the move will still be rejected in the contexts you
+did not patch; and the tables of one move can even use **different set-ranges impls**, so the install
+check must validate per table, not per move.
