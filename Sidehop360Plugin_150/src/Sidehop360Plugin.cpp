@@ -43,6 +43,67 @@ void WidenSidehopAngle_Cave(AllRegisters* params)
         return;
     plugin->m_TelLastMinCosAngleSeen = action->minCosAngle;
     action->minCosAngle = plugin->m_MinCosAngle;
+
+    // Test-1: the +-45 limit lives at candidate CREATION, not in the fit cone,
+    // and the sidehop expects a 2-3 m hop (set-ranges prologue writes
+    // +0x238=2.0, +0x23C=3.0). Loosen the range so farther hops pass.
+    action->Side_min = plugin->m_ExpectedSideMin;
+    action->Side_max = plugin->m_ExpectedSideMax;
+
+    // Cache the wall's outward normal (XY, normalized) for redirect mode 2 and
+    // Hook B nudge mode 2. directionDestFacingOut (+0x40) points out of the
+    // wall toward the player's face.
+    {
+        const float nx = action->directionDestFacingOut.x;
+        const float ny = action->directionDestFacingOut.y;
+        const float len = sqrtf(nx * nx + ny * ny);
+        if (len > 1e-6f)
+        {
+            plugin->m_WallNormalX = nx / len;
+            plugin->m_WallNormalY = ny / len;
+            plugin->m_HasWallNormal = true;
+        }
+    }
+
+    // Redirect: re-aim the candidate's target in the ground plane. Follows the
+    // proven MutateIntoSidehop pattern: only dir80 + anchors + distances matter
+    // (it never touches the SrcToDest vectors); keep dest.z/w from src.
+    if (plugin->m_RedirectMode > 0)
+    {
+        float destX, destY;
+        if (plugin->m_RedirectMode == 1)
+        {
+            // Mirror 180 degrees through the src anchor.
+            destX = 2.0f * action->locationAnchorSrc.x - action->locationAnchorDest.x;
+            destY = 2.0f * action->locationAnchorSrc.y - action->locationAnchorDest.y;
+            action->dir80.x = -action->dir80.x;
+            action->dir80.y = -action->dir80.y;
+            action->dir80.z = 0.0f;
+            action->dir80.w = 0.0f;
+        }
+        else
+        {
+            // Off the wall: place the target along the wall's outward normal
+            // (toward the roof across the alley), HopDistance meters out.
+            destX = action->locationAnchorSrc.x + plugin->m_WallNormalX * plugin->m_HopDistance;
+            destY = action->locationAnchorSrc.y + plugin->m_WallNormalY * plugin->m_HopDistance;
+            action->dir80.x = plugin->m_WallNormalX;
+            action->dir80.y = plugin->m_WallNormalY;
+            action->dir80.z = 0.0f;
+            action->dir80.w = 0.0f;
+        }
+        action->locationAnchorDest.x = destX;
+        action->locationAnchorDest.y = destY;
+        action->locationAnchorDest.z = action->locationAnchorSrc.z;
+        action->locationAnchorDest.w = action->locationAnchorSrc.w;
+        const float dx = destX - action->locationAnchorSrc.x;
+        const float dy = destY - action->locationAnchorSrc.y;
+        const float horizontalLen = sqrtf(dx * dx + dy * dy);
+        action->horizontalDifference = horizontalLen;
+        action->distance = horizontalLen;
+        plugin->m_TelRedirects++;
+    }
+
     plugin->m_TelWidenApplications++;
 }
 
@@ -93,14 +154,24 @@ void WhenScanClimbFacade_AlsoNudgedSidehop(AllRegisters* params)
     const __m128 originalPoint = *reinterpret_cast<__m128*>(params->rdi_);
     const __m128 movementVec = *reinterpret_cast<__m128*>(params->r9_);
     const float* mv = reinterpret_cast<const float*>(&movementVec);
+    // Horizontal plane in ACU is x/y (z is up).
+    // Direction: 0 = opposite of the movement input, 1 = along it,
+    // 2 = off the wall (along the normal cached by Hook A).
     float dirX = mv[0], dirY = mv[1];
+    float sign = plugin->m_NudgeDirectionMode == 0 ? -1.0f : 1.0f;
+    if (plugin->m_NudgeDirectionMode == 2)
+    {
+        if (!plugin->m_HasWallNormal)
+            return;
+        dirX = plugin->m_WallNormalX;
+        dirY = plugin->m_WallNormalY;
+        sign = 1.0f;
+    }
     const float len = sqrtf(dirX * dirX + dirY * dirY);
     if (len < 1e-6f)
         return;
     dirX /= len;
     dirY /= len;
-    // Horizontal plane in ACU is x/y (z is up).
-    const float sign = plugin->m_NudgeDirectionMode == 0 ? -1.0f : 1.0f;
     __m128 nudgedPoint = originalPoint;
     float* np = reinterpret_cast<float*>(&nudgedPoint);
     np[0] += dirX * sign * plugin->m_NudgeDistance;
@@ -293,6 +364,10 @@ void Sidehop360Plugin::LoadSettings()
         ParseBool ("Enabled=",          m_Enabled);
         ParseInt  ("Hotkey=",           m_Hotkey);
         ParseFloat("MinCosAngle=",      m_MinCosAngle);
+        ParseInt  ("RedirectMode=",     m_RedirectMode);
+        ParseFloat("HopDistance=",      m_HopDistance);
+        ParseFloat("ExpectedSideMin=",  m_ExpectedSideMin);
+        ParseFloat("ExpectedSideMax=",  m_ExpectedSideMax);
         ParseBool ("NudgeEnabled=",     m_NudgeEnabled);
         ParseInt  ("NudgeDirection=",   m_NudgeDirectionMode);
         ParseFloat("NudgeDistance=",    m_NudgeDistance);
@@ -307,6 +382,10 @@ void Sidehop360Plugin::SaveSettings()
         f << "Enabled=" << (m_Enabled ? 1 : 0) << "\n";
         f << "Hotkey=0x" << std::hex << m_Hotkey << std::dec << "\n";
         f << "MinCosAngle=" << m_MinCosAngle << "\n";
+        f << "RedirectMode=" << m_RedirectMode << "\n";
+        f << "HopDistance=" << m_HopDistance << "\n";
+        f << "ExpectedSideMin=" << m_ExpectedSideMin << "\n";
+        f << "ExpectedSideMax=" << m_ExpectedSideMax << "\n";
         f << "NudgeEnabled=" << (m_NudgeEnabled ? 1 : 0) << "\n";
         f << "NudgeDirection=" << m_NudgeDirectionMode << "\n";
         f << "NudgeDistance=" << m_NudgeDistance << "\n";
@@ -403,6 +482,7 @@ void Sidehop360Plugin::OnImGuiRender()
         ImGui::TextColored(held ? activeColor : inactiveColor, held ? "YES" : "no");
         ImGui::Text("Angle overrides applied: %lld", m_TelWidenApplications);
         ImGui::Text("Vanilla minCosAngle seen: %.4f (cos45 = 0.7071)", m_TelLastMinCosAngleSeen);
+        ImGui::Text("Redirects applied: %lld (mode %d)", m_TelRedirects, m_RedirectMode);
         ImGui::Text("Nudge: %lld calls, %lld sidehops created", m_TelNudgeCalls, m_TelNudgeCreated);
         ImGui::Unindent();
     }
@@ -437,6 +517,38 @@ void Sidehop360Plugin::OnImGuiRender()
         ImGui::TextDisabled("-1 = full 360 degrees. Vanilla writes cos45 (0.7071).");
 
         ImGui::Separator();
+        ImGui::Text("Redirect & reach (test-1: candidates exist, but are aimed/near)");
+        const char* redirectModes[] = { "Off (widen only)", "Mirror 180 degrees", "Off the wall" };
+        ImGui::SetNextItemWidth(240);
+        if (ImGui::Combo("Redirect##s360", &m_RedirectMode, redirectModes, IM_ARRAYSIZE(redirectModes)))
+            SaveSettings();
+        ImGui::SetNextItemWidth(240);
+        if (ImGui::SliderFloat("Hop distance##s360", &m_HopDistance, 0.5f, 10.0f, "%.2f m"))
+            SaveSettings();
+        ImGui::SetNextItemWidth(240);
+        float sideMin = m_ExpectedSideMin;
+        if (ImGui::SliderFloat("Expected hop min##s360", &sideMin, 0.0f, 5.0f, "%.2f m"))
+        {
+            m_ExpectedSideMin = sideMin;
+            SaveSettings();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("vanilla##s360min")) { m_ExpectedSideMin = 2.0f; SaveSettings(); }
+        ImGui::SetNextItemWidth(240);
+        float sideMax = m_ExpectedSideMax;
+        if (ImGui::SliderFloat("Expected hop max##s360", &sideMax, 1.0f, 15.0f, "%.2f m"))
+        {
+            m_ExpectedSideMax = sideMax;
+            SaveSettings();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("vanilla##s360max")) { m_ExpectedSideMax = 3.0f; SaveSettings(); }
+        ImGui::TextDisabled("Side_min/Max: hop length the sidehop accepts (vanilla 2-3 m). "
+                            "Raise the max to reach farther roofs. Mirror flips the "
+                            "candidate's target; Off-the-wall places it Hop distance "
+                            "out along the wall normal.");
+
+        ImGui::Separator();
         bool nudge = m_NudgeEnabled;
         if (ImGui::Checkbox("Enable position nudge (extra)", &nudge))
         {
@@ -446,14 +558,14 @@ void Sidehop360Plugin::OnImGuiRender()
         if (m_NudgeEnabled)
         {
             ImGui::Indent();
-            const char* modes[] = { "Opposite of movement input", "Along movement input" };
+            const char* modes[] = { "Opposite of movement input", "Along movement input", "Off the wall (uses Hook A's cached normal)" };
             if (ImGui::Combo("Nudge direction##s360", &m_NudgeDirectionMode, modes, IM_ARRAYSIZE(modes)))
                 SaveSettings();
             ImGui::SetNextItemWidth(240);
             if (ImGui::SliderFloat("Nudge distance##s360", &m_NudgeDistance, 0.0f, 3.0f, "%.2f m"))
                 SaveSettings();
             ImGui::TextDisabled("Creates ONE extra sidehop candidate from a point "
-                                "moved along/against the movement input.");
+                                "moved along/against the movement input, or off the wall.");
             ImGui::Unindent();
         }
 

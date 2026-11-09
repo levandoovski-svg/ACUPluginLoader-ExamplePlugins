@@ -375,3 +375,30 @@ Checks primaryCallbackReceivers for any of 12 combat Enter addresses: Combat (0x
 | Build/runtime status | ? NOT compiled with MSVC v142, NOT runtime-verified. Push -> GitHub Actions `build-sidehop360.yml` -> install `Sidehop360Plugin_150.dll` into `ACUFixes\plugins`. |
 | Manual acceptance (decides the open questions) | 1) Wall-climb near a wall with a sidehop target BEHIND you, hold F8, press sideways+parkour: the sidehop should now fire toward it (this tests whether creation-stage respects the widened cone - the main open question). 2) Same without the hotkey: vanilla +-45 behavior must be unchanged. 3) Telemetry: "angle overrides applied" increments only while the hotkey is held; "vanilla minCosAngle seen" ~0.7071. 4) Hook B row shows "REFUSED - site owned by ACU_ParkourPatches" (expected). To test the nudge: remove/rename ACU_ParkourPatches (and ACUFixes' Parkour Helpers), restart, enable nudge in the panel, repeat 1) and tune direction/distance. 5) With the nudge installed, confirm no crashes and that a nudged sidehop plays the correct animation (this validates the untested nudge-direction semantics). |
 
+
+## Session 22 - Sidehop360 v0.1.0 test-1 results + v0.2.0 (redirect & reach)
+
+**In-game test 1 of v0.1.0.0 (user, with screenshot telemetry): angle-widening alone has NO effect; the nudge never ran (site owned by ACU_ParkourPatches). Telemetry read:**
+
+| Finding | Evidence | Conclusion |
+|---------|----------|-----------|
+| Hook A works perfectly | 5550 angle overrides applied; "vanilla minCosAngle seen" showed 0.7071 (cos45) each wall-approach | The override lands and is correct - yet zero behavioral change. The +-45-degree limit therefore does NOT live in the fit-test cone (`minCosAngle`, +0x1E8): it is enforced at candidate CREATION (the scanner only probes lateral wall points; no candidate pointing at a behind/off-wall target ever exists). Consistent with the session-21 sweep finding zero +0x1E8 readers in the fit chain. Widening the cone only affects candidates that already exist. |
+| Second blocker: sidehop range | Set-ranges prologue at `0x140148500` writes `[rcx+0x238]=0x40000000` (Side_min = 2.0) and `[rcx+0x23c]=0x40400000` (Side_max = 3.0) | The sidehop expects a 2-3 m hop. The user's test target (circled opposite roof edge across an alley, ~4-5 m) fails this check even if a candidate existed. |
+| Hook B never ran | Telemetry: 0 nudge calls | `0x140135230` is E9-patched by ACU_ParkourPatches (as predicted). The breakfall-style nudge mechanism is still untested - requires removing/renaming ACU_ParkourPatches.dll. |
+
+**v0.2.0.0 (this session): three mechanisms, all hotkey-gated, all in the Hook A cave (`WidenSidehopAngle_Cave`) except the nudge:**
+
+1. **Range loosen** (always on while hotkey held): write `action->Side_min = m_ExpectedSideMin` (default 0.5) and `action->Side_max = m_ExpectedSideMax` (default 8.0) right after vanilla's 2.0/3.0. Sliders + INI (`ExpectedSideMin=`/`ExpectedSideMax=`).
+2. **Redirect modes** (new `RedirectMode`, default 0 = off): re-aim the existing candidate's target in the ground plane, following the proven `MutateIntoSidehop` field pattern (only `dir80` + `locationAnchorSrc/Dest` + distances are rewritten; the SrcToDest vectors are left alone; `dest.z/w` copied from `src`):
+   - Mode 1 "Mirror 180": `dest.xy = 2*src.xy - dest.xy`; negate `dir80.xy` (zero z/w).
+   - Mode 2 "Off the wall": `dest.xy = src.xy + wallNormal.xy * m_HopDistance` (slider, default 2.5 m); `dir80.xy = wallNormal.xy`. Wall normal = `directionDestFacingOut` (+0x40) XY, normalized, cached EVERY Hook A callback into `m_WallNormalX/Y` + `m_HasWallNormal` (Hook A runs continuously - 5550 calls in test 1 - so the cache is fresh while walling).
+   - Both set `horizontalDifference` (+0xC4) and `distance` (+0xC8) to the new horizontal length. Telemetry counter `m_TelRedirects`.
+3. **Nudge direction mode 2 "off the wall"**: Hook B's `m_NudgeDirectionMode` gains mode 2 = nudge the probe point along the cached wall normal (uses `m_HasWallNormal` guard; modes 0/1 unchanged).
+
+**Redirect direction semantics**: while feet-on-wall, the held movement input is constrained (holding back detaches from the wall), so input-relative redirect is close to vanilla; fixed relative directions (mirror / off-the-wall) are the meaningful experiments. Off-the-wall points straight at the circled opposite roof across an alley.
+
+**UI/INI**: new "Redirect & reach" settings block (redirect combo, Hop distance slider, Expected hop min/max sliders with vanilla preset buttons); nudge direction combo has 3 entries; telemetry line "Redirects applied: N (mode M)". INI keys: `RedirectMode=`, `HopDistance=`, `ExpectedSideMin=`, `ExpectedSideMax=`. Version bumped to `MAKE_VERSION_NUMBER_UINT64(0, 2, 0, 0)`.
+
+**Validation**: clang++ -fsyntax-only (same include set as CI): 0 errors, only pre-existing warnings.
+
+**Test 2 plan (user)**: (a) Wall-climb facing the alley, hold hotkey, try sidehop with Redirect = "Off the wall" and Hop distance ~3-4 m, Expected hop max >= 8: telemetry "Redirects applied" must increment; whether the redirected candidate survives the fit chain (raycast/object-type validation of the redirected target - QuickCheckAcceptableTargetObjectType slot 0x72 - may reject a target in empty air) is exactly what this test answers; a "no effect" outcome with redirects incrementing would point at fit-chain validation of the new target. (b) Nudge modes still require removing/renaming ACU_ParkourPatches.dll first (site owned). (c) If redirect also fails, the alternative direction is that the target geometry needs `wallEjectToHang` (type 17) rather than sidehop - the user's ACU_ParkourPatches dive already provides something like it.
