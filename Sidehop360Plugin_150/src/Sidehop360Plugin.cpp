@@ -380,10 +380,12 @@ void Sidehop360Plugin::OnUpdate()
         m_HookCInstalled = false;
     }
 
-    // -- Hook B: mode 3 only. The site is owned by ACUFixes' "Parkour
-    //    helpers" patch whenever that is enabled; keep retrying while the
-    //    nudge mode is selected so toggling Parkour helpers OFF frees the
-    //    site and the hook installs on its own.
+    // -- Hook B: mode 3 only. The site is owned by Freeform 2.0, which hooks
+    //    the same climbFacade scan call site (verified live 2026-11-09: the
+    //    site's E9 cave dispatches into Freeform 2.0.dll; ACUFixes.dll is not
+    //    even loaded on this install). Keep retrying while the nudge mode is
+    //    selected so disabling Freeform 2.0 frees the site and the hook
+    //    installs on its own.
     if (m_Mode == 3)
     {
         if (!m_HookBInstalled && !m_HookBRefused)
@@ -546,9 +548,10 @@ void Sidehop360Plugin::OnImGuiRender()
         HookLine("Hook C - quick-check ranges (0x1401B5890)", m_HookCRefused, m_HookCInstalled, m_Mode == 1 || m_Mode == 2,
             "REFUSED - site patched by another plugin");
         HookLine("Hook B - nudge (0x140135230)", m_HookBRefused, m_HookBInstalled, m_Mode == 3,
-            "REFUSED - owned by ACUFixes' \"Parkour helpers\". Turn Parkour "
-            "helpers OFF in ACUFixes' menu and this installs on its own. "
-            "Do not re-enable Parkour helpers while the nudge is on.");
+            "REFUSED - owned by Freeform 2.0 (it hooks the same scan call site). "
+            "Disable Freeform 2.0 in the loader and this installs on its own "
+            "(no restart needed). Re-enabling Freeform 2.0 while the nudge is "
+            "installed would break Freeform's hook.");
         ImGui::Unindent();
     }
 

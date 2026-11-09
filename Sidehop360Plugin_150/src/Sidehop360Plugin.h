@@ -35,10 +35,13 @@
 //   Mode 3 "Nudge" = Hook B (0x140135230, the climbFacade scan's call to
 //     CreateParkourActionForParkourPointIfFits) adds ONE extra sidehop
 //     created from a nudged copy of the probe point. The site is owned by
-//     ACUFixes' "Parkour helpers" patch whenever that is enabled; Hook B
-//     refuses while taken and retries every pass - toggling Parkour helpers
-//     OFF in ACUFixes' menu frees the site and the hook installs on its own.
-//     Do not re-enable Parkour helpers while the nudge is on.
+//     Freeform 2.0, which hooks the same call site (live-verified: the E9
+//     cave dispatches into Freeform 2.0.dll; the "ACU_dumped.bin" bytes at
+//     this site are Freeform's hook, NOT vanilla - the dump was captured
+//     with Freeform running). Hook B refuses while taken and retries every
+//     pass - disabling Freeform 2.0 in the loader frees the site and the
+//     hook installs on its own. Do not re-enable Freeform 2.0 while the
+//     nudge is installed.
 //     Hook A also installs in Mode 3, cache-only: it caches the wall's
 //     outward normal for the nudge's "off the wall" direction.
 class Sidehop360Plugin

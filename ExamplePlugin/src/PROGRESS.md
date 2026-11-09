@@ -424,3 +424,15 @@ Checks primaryCallbackReceivers for any of 12 combat Enter addresses: Combat (0x
 5. Redirect sub-mode default flipped to 2 (off the wall - the user's actual goal); INI keys `RedirectSubMode=`/`HeightDiffMin=`/`HeightDiffMax=`; version 0.3.0.0.
 
 **Validation**: clang++ -fsyntax-only = 0 errors. Test-3 plan: Mode 1 (angle widen + Hook C ranges, redirect OFF) at the alley wall: if the sidehop now reaches/goes through, Hook C's height window was the missing gate; then Mode 2 for the redirect on top. Telemetry ground truth: "QuickCheck range overrides" and (mode 2) "Redirects applied" must increment while the hotkey is held.
+
+## Session 23 addendum - Hook B site owner IDENTIFIED: Freeform 2.0 (and the 1.5.0 dump is contaminated at 0x140135230)
+
+**User: "how is it getting refused, I don't even have ACUFixes installed anymore" - correct: live module enumeration (ReadProcessMemory on the running ACU.exe, PID 11204) shows NO ACUFixes.dll, only ACUFixes-PluginLoader.dll (in ACUFixes\, config: parkourHelper.isActive=false) + 9 plugins.**
+
+| Step | Result |
+|------|--------|
+| Literal scan of all plugin DLLs (disk) | NO module contains 0x140135230 as a 4-byte literal - methodology lesson: clang emits hook-site checks as RIP-relative displacements, so the absolute address never appears in the binary (our own DLL also "has no hits"). Literal-absence proves NOTHING. (Freeform 2.0.dll x2 and FreeFormWallrun.dll x1 do contain 0x140133B00 - the sort&select function-start replacement.) |
+| Live E9 at 0x140135230 | `E9 EB AE E0 FF` -> rel32 SIGNED -0x1F5115 -> cave 0x13FF40120 (~786 KB below ACU.exe base - classic VirtualAlloc cave territory). FIRST script used UNSIGNED rel32 and pointed at 0x23FF40120 (4 GB off) - remember rel32 is signed. |
+| Cave content | AutoAssemblerKinda layout: cave `call -0x125` -> ccode wrapper at 0x13FF40000 (pushfq/fxsave, save all GP regs, `call [rip+0x80]`, restore, ret) -> function pointer AT 0x13FF40118 = **0x7FFB92523280 = Freeform 2.0.dll + 0x3280**. OWNER: Freeform 2.0. Cave then re-executes the TRUE vanilla 12 stolen bytes (`49 8B 0C 24` mov rcx,[r12] + `F3 0F 10 85 08 01 00 00` movss xmm0,[rbp+0x108]) and jmps back near the site. |
+| DUMP CONTAMINATED | MODLOG/scripts/ACU_dumped.bin at 0x140135230 holds `E9 EB AE 90 FF` + exactly 7 NOPs - an OLDER Freeform hook baked into the "vanilla" dump (different cave rel byte: 90 vs E0). The session-21 "0x140135230 confirmed E9-taken" was circular - we verified our contaminated dump against live memory and concluded a hook existed; the TRUE vanilla bytes are the 12 stolen bytes preserved in Freeform's cave. Our Hook B (12-byte steal from ACUFixes-0.9.3 source) remains correct. The ACUFixes 1.5.0 source hooks the same site with 12 bytes - consistent. |
+| v0.3.1.0 | Refusal message + comments corrected: owner is Freeform 2.0; fix = disable Freeform 2.0 in the loader (no restart - Hook B retries every pass and self-installs). Warning: re-enabling Freeform 2.0 while the nudge is installed would leave Freeform's hook orphaned. |
