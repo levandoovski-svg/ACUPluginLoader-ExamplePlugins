@@ -175,6 +175,8 @@ void WidenQuickCheckRanges_Cave(AllRegisters* params)
     action->horizontalDifferenceMax = 30.0f;
     action->distanceMin = 0.05f;
     action->distanceMax = 40.0f;
+    if (action->fancyVTable == reinterpret_cast<ParkourAction_FancyVTable*>(0x143A13130))
+        plugin->m_TelSidehopCheckOverrides++;
     plugin->m_TelQuickCheckOverrides++;
 }
 
@@ -288,24 +290,31 @@ AutoAssembleWrapper<SidehopNudgeHook>& GetNudgeHook()
 }
 
 // ============================================================================
-//  Hook D - Aim (mode 4): substitute the probe point inside the factory
+//  Hook D - Aim (mode 4): substitute the probe point in the type-39 ctor
 // ============================================================================
 
-// 0x1401D1CF0 = the CreateParkourActionForParkourPointIfFits wrapper itself.
-// It is called from 89 sites (incl. the climbFacade scan helper) and is NOT
-// owned by Freeform 2.0 (which hooks 0x140135230 / 0x140133B00), so this seam
-// is usable with Freeform loaded - unlike Hook B.
-// ABI at entry: rcx = EnumParkourAction, rdx = context, r8 = pointer to the
-// probe point (__m128), r9 = pointer to the movement vector (world XY).
-// The first 5 bytes are `48 89 6C 24 10` = `mov qword ptr [rsp+0x10], rbp`,
-// position-independent, so they can be re-executed after the callback.
+// 0x1401584B0 is the constructor of the sidehop action (type 39). LIVE-VERIFIED
+// 2026-11-09: it has exactly ONE caller, the type-39 case of the creation
+// factory (0x1401CDD4F inside 0x1401CC990's jump table). Arguments at entry:
+//   rcx = the freshly allocated action (0x2A0 bytes, uninitialized),
+//   rdx = creation context, r8 = pointer to the probe point (__m128),
+//   r9 = pointer to the movement vector (world XY).
+// The ctor stores r8 -> r15 and r9 -> r14 and builds all of the action's
+// geometry from that point, so substituting the point here makes the VANILLA
+// construction produce an action aimed where we want, and the scan appends it
+// exactly as it would the vanilla candidate.
 //
-// The factory is a jump table on the action type; each case allocates the
-// type's action and runs its constructor with the point. Substituting the
-// point therefore makes the VANILLA construction produce an action whose
-// destination lies along the player's input direction, and the scan appends it
-// exactly as it would the vanilla candidate. Nothing is mutated in the caller:
-// the point is copied into a thread-local, shifted, and r8 repointed at it.
+// WHY NOT HOOK 0x1401D1CF0 (the version 0.4.0 attempt): LIVE-VERIFIED that site
+// is owned by FreeFormWallrun.dll+0xAB90 - its first bytes are
+// `FF 25 00 00 00 00` + an absolute pointer to that plugin. FreeFormWallrun
+// reimplements the wrapper (it neither calls 0x1401D1CF0 nor 0x1401CC990
+// directly), so it is BOTH unusable and owned. The ctor, by contrast, is
+// vanilla and is reached through the factory, which every creation path
+// (vanilla and FreeForm's) must go through - so this hook works with Freeform
+// loaded.
+//
+// First 8 bytes: `48 8B C4` (mov rax,rsp) + `48 89 58 08` (mov [rax+8],rbx),
+// position-independent, so they can be re-executed after the callback.
 static thread_local __m128 t_AimPoint;
 
 void AimSidehopProbePoint_Cave(AllRegisters* params)
@@ -313,7 +322,7 @@ void AimSidehopProbePoint_Cave(AllRegisters* params)
     Sidehop360Plugin* plugin = g_Plugin;
     if (!plugin || plugin->m_Mode != 4)
         return;
-    if (params->rcx_ != (unsigned long long)EnumParkourAction::climbFacade_fromWallDescentSidewaysToGround_alsoSidehop)
+    if (!params->rcx_) // the action object must exist
         return;
     plugin->m_TelAimCreateCalls++;
     if (!plugin->ShouldWidenAngle())
@@ -371,7 +380,7 @@ struct SidehopAimHook : AutoAssemblerCodeHolder_Base
     SidehopAimHook()
     {
         PresetScript_CCodeInTheMiddle(
-            0x1401D1CF0, 5,
+            0x1401584B0, 8,
             AimSidehopProbePoint_Cave, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
     }
 };
@@ -514,16 +523,16 @@ void Sidehop360Plugin::OnUpdate()
         m_HookBInstalled = false;
     }
 
-    // -- Hook D: mode 4 only. Unlike Hook B's site, this one is not owned by
-    //    Freeform 2.0 (it hooks 0x140135230 / 0x140133B00) - the factory
-    //    wrapper is free, which is why the aim mode works with Freeform loaded.
+    // -- Hook D: mode 4 only. The type-39 ctor is vanilla; the wrapper
+    //    (0x1401D1CF0) is owned by FreeFormWallrun.dll (live-verified), so
+    //    the ctor is the seam that still works with Freeform loaded. --------
     if (m_Mode == 4)
     {
-        if (m_HookDRefused && !IsSiteTaken(0x1401D1CF0))
+        if (m_HookDRefused && !IsSiteTaken(0x1401584B0))
             m_HookDRefused = false;
         if (!m_HookDInstalled && !m_HookDRefused)
         {
-            if (IsSiteTaken(0x1401D1CF0))
+            if (IsSiteTaken(0x1401584B0))
                 m_HookDRefused = true;
             else
             {
@@ -684,7 +693,7 @@ void Sidehop360Plugin::OnImGuiRender()
             "Disable Freeform 2.0 in the loader and this installs on its own "
             "(no restart needed). Re-enabling Freeform 2.0 while the nudge is "
             "installed would break Freeform's hook.");
-        HookLine("Hook D - creation factory (0x1401D1CF0)", m_HookDRefused, m_HookDInstalled, m_Mode == 4,
+        HookLine("Hook D - sidehop ctor (0x1401584B0)", m_HookDRefused, m_HookDInstalled, m_Mode == 4,
             "REFUSED - site patched by another plugin");
         ImGui::Unindent();
     }
@@ -709,12 +718,15 @@ void Sidehop360Plugin::OnImGuiRender()
             ImGui::Text("Nudge: %lld calls, %lld sidehops created", m_TelNudgeCalls, m_TelNudgeCreated);
         if (m_Mode == 4)
         {
-            ImGui::Text("Sidehop creations seen: %lld", m_TelAimCreateCalls);
+            ImGui::Text("Sidehop constructions seen: %lld", m_TelAimCreateCalls);
             ImGui::Text("Probe points aimed: %lld", m_TelAimRewrites);
-            ImGui::Text("Aimed candidates reaching QuickCheck: %lld", m_TelQuickCheckOverrides);
-            ImGui::TextDisabled("If 'creations seen' climbs but 'aimed candidates reaching "
-                                "QuickCheck' stays 0, the shifted point was rejected while the "
-                                "action was being built - the next lever is the type-39 ctor.");
+            ImGui::Text("Aimed candidates reaching the sidehop check: %lld", m_TelSidehopCheckOverrides);
+            ImGui::TextDisabled("(Hook C's check impl is shared: %lld overrides across all action "
+                                "types while held - that counter is not sidehop-specific.)",
+                                m_TelQuickCheckOverrides);
+            ImGui::TextDisabled("If 'constructions seen' climbs but 'reaching the sidehop check' "
+                                "stays 0, the shifted point is rejected inside the ctor - the next "
+                                "lever is the ctor body itself.");
         }
         ImGui::Unindent();
     }
@@ -811,8 +823,8 @@ void Sidehop360Plugin::OnImGuiRender()
             ImGui::TextDisabled("Pushes each sidehop probe point along your movement input "
                                 "before the action is built, so the hop is created toward the "
                                 "direction you steer (wall normal when the stick is centred). "
-                                "0.0 m = vanilla points. Works with Freeform 2.0 loaded: this "
-                                "seam is the factory wrapper, not Freeform's scan site.");
+                                "0.0 m = vanilla points. Hooks the type-39 constructor, not the "
+                                "factory wrapper (that wrapper is owned by FreeFormWallrun.dll).");
 
             ImGui::SetNextItemWidth(240);
             if (ImGui::SliderFloat("minCosAngle##s360aim", &m_MinCosAngle, -1.0f, 1.0f, "%.3f"))

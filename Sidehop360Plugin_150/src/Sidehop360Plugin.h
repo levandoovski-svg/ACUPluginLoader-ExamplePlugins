@@ -46,22 +46,24 @@
 //     outward normal for the nudge's "off the wall" direction.
 //
 //   Mode 4 "Aim (creation)" = Hook D + Hook A (cache-only) + Hook C.
-//     Hook D (0x1401D1CF0, the CreateParkourActionForParkourPointIfFits
-//     wrapper itself - an unowned site, 5 clean stolen bytes
-//     `mov [rsp+0x10], rbp`) intercepts EVERY candidate creation. For the
-//     sidehop type (39) only, while the hotkey is held, it substitutes the
-//     probe point with a copy shifted along the player's movement input by
-//     AimDistance, then lets the vanilla factory build the action from that
-//     point (pointers are swapped, so the scanner's own buffers are never
-//     mutated). This is the first mechanism that acts at CREATION stage -
-//     the stage the widen experiments proved is the real ±45-degree gate -
-//     so it is the path toward omnidirectional targeting.
+//     Hook D (0x1401584B0, the type-39 action CONSTRUCTOR - vanilla, one
+//     caller: the type-39 case of the creation factory) intercepts every
+//     sidehop construction. While the hotkey is held it substitutes the probe
+//     point (r8) with a copy shifted along the player's movement input by
+//     AimDistance, then lets the vanilla ctor build the action from that point
+//     (the pointer is swapped, so the scanner's own buffers are never
+//     mutated). This is the first mechanism that acts at CREATION stage - the
+//     stage the widen experiments proved is the real +-45-degree gate - so it
+//     is the path toward omnidirectional targeting.
+//     The wrapper 0x1401D1CF0 that v0.4.0 tried to hook is owned by
+//     FreeFormWallrun.dll (live-verified: FF 25 + pointer to +0xAB90), and that
+//     plugin reimplements the wrapper; the ctor is untouched and is still
+//     reached through the factory, so this hook works with Freeform loaded.
 //     Hook C stays installed so the shifted point can pass the range check.
-//     Telemetry separates the two failure modes: "create calls" (type-39
-//     constructions seen), "aim rewrites" (hook D actually substituted a
-//     point) and "QuickCheck overrides" (aimed candidates that reached the
-//     check - if this stays 0 the shifted point was rejected during
-//     construction, before any range gate).
+//     Telemetry separates the failure modes: "constructions seen" (ctor calls),
+//     "points aimed" (Hook D actually substituted) and "reaching the sidehop
+//     check" (sidehop-only Hook C count; if it stays 0 the shifted point was
+//     rejected inside the ctor, before any range gate).
 class Sidehop360Plugin
 {
 public:
@@ -129,6 +131,9 @@ public:
     long long m_TelRedirects = 0;
     long long m_TelNudgeCalls = 0;
     long long m_TelNudgeCreated = 0;
-    long long m_TelAimCreateCalls = 0;  // every type-39 creation attempt seen at Hook D
+    long long m_TelAimCreateCalls = 0;  // every type-39 construction attempt seen at Hook D
     long long m_TelAimRewrites = 0;     // probe points actually substituted
+    long long m_TelSidehopCheckOverrides = 0; // Hook C overrides on the SIDEHOP only
+                                              // (the check impl is shared by 118 types;
+                                              // m_TelQuickCheckOverrides counts them all)
 };

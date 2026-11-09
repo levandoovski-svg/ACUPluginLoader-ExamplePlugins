@@ -272,22 +272,35 @@ intervene where the candidate is **built**. Two facts discovered while looking f
    with the probe point. The wrapper is called from **89 sites** and is **not owned by Freeform 2.0**
    (which hooks `0x140135230` / `0x140133B00`), so it is a free seam.
 
-`Sidehop360Plugin` mode 4 "Aim (creation)" (v0.4.0) uses that wrapper: hook at `0x1401D1CF0`
-(5 stolen bytes `48 89 6C 24 10` = `mov [rsp+0x10], rbp`), and for type 39 while the hotkey is held,
-copy the probe point, shift its XY by `AimDistance` along the movement-input vector (r9), and repoint
-r8 at the copy. The vanilla factory then builds the aimed action and the scan appends it as usual.
-Nothing in the caller is mutated; both pointer reads go through `ReadProcessMemory` so a bad argument
-cannot crash the game.
+`Sidehop360Plugin` mode 4 "Aim (creation)" (v0.4.1) uses that seam. The first attempt hooked
+`0x1401D1CF0` and **failed in the field**: live inspection of the running game showed the wrapper
+starts `FF 25 00 00 00 00` + `0x7FFBDBC6AB90`, i.e. it is detoured by **`FreeFormWallrun.dll+0xAB90`**
+(not Freeform 2.0). That plugin reimplements the wrapper instead of trampolining it — its image
+contains no call to the real factory `0x1401CC990` and none to the ctor — so the wrapper is both
+unusable and owned.
+
+The working seam is the **type-39 constructor `0x1401584B0`**: vanilla, exactly one caller (the
+type-39 case of the factory at `0x1401CDD4F`), arguments rcx = new action, rdx = ctx, r8 = probe
+point, r9 = movement. Every creation path must pass through the factory's type-39 case, so this hook
+also catches FreeForm's cave-based trampoline. Hook D steals 8 bytes
+(`48 8B C4` = `mov rax,rsp`, `48 89 58 08` = `mov [rax+8],rbx`), copies the point, shifts its XY by
+`AimDistance` along the movement input (r9), and repoints r8 at the copy. The vanilla ctor builds the
+aimed action; the scan appends it as usual. Both pointer reads go through `ReadProcessMemory`, so a
+bad argument cannot crash the game.
 
 Telemetry is designed to localise the next failure instead of guessing:
 
 | Signal | Meaning |
 |--------|---------|
-| `Sidehop creations seen` | every type-39 call through the wrapper (hook is live) |
+| `Sidehop constructions seen` | every type-39 ctor call (hook is live) |
 | `Probe points aimed` | the substitution actually happened |
-| `Aimed candidates reaching QuickCheck` | the shifted point survived construction |
+| `Aimed candidates reaching the sidehop check` | Hook C, filtered to the sidehop's fancy vtable `0x143A13130` |
 
-If the last counter stays at 0 while the first climbs, the point is rejected **inside** the type-39
-constructor (before any range gate) — the next lever is that constructor, or the tester table swap in
-fact 1. If it climbs but the hop still does not appear where aimed, the remaining gate is the fit
-chain (`0x140149CC0`) or the sort (`0x140133B00`, owned by Freeform/ACUFixes).
+The third counter must be filtered **by vtable**, not by the cave: `0x1401B5890` is shared by 118
+action types, so the unfiltered counter reads thousands of unrelated overrides and is useless for
+diagnosis (that is exactly what the first in-game screenshot showed).
+
+If the third counter stays at 0 while the first climbs, the point is rejected **inside** the type-39
+ctor (before any range gate) — the next lever is that ctor body, or the tester table swap in fact 1.
+If it climbs but the hop still does not appear where aimed, the remaining gates are the fit chain
+(`0x140149CC0`) and the sort (`0x140133B00`).
