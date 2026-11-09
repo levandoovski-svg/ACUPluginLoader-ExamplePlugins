@@ -44,6 +44,24 @@
 //     nudge is installed.
 //     Hook A also installs in Mode 3, cache-only: it caches the wall's
 //     outward normal for the nudge's "off the wall" direction.
+//
+//   Mode 4 "Aim (creation)" = Hook D + Hook A (cache-only) + Hook C.
+//     Hook D (0x1401D1CF0, the CreateParkourActionForParkourPointIfFits
+//     wrapper itself - an unowned site, 5 clean stolen bytes
+//     `mov [rsp+0x10], rbp`) intercepts EVERY candidate creation. For the
+//     sidehop type (39) only, while the hotkey is held, it substitutes the
+//     probe point with a copy shifted along the player's movement input by
+//     AimDistance, then lets the vanilla factory build the action from that
+//     point (pointers are swapped, so the scanner's own buffers are never
+//     mutated). This is the first mechanism that acts at CREATION stage -
+//     the stage the widen experiments proved is the real ±45-degree gate -
+//     so it is the path toward omnidirectional targeting.
+//     Hook C stays installed so the shifted point can pass the range check.
+//     Telemetry separates the two failure modes: "create calls" (type-39
+//     constructions seen), "aim rewrites" (hook D actually substituted a
+//     point) and "QuickCheck overrides" (aimed candidates that reached the
+//     check - if this stays 0 the shifted point was rejected during
+//     construction, before any range gate).
 class Sidehop360Plugin
 {
 public:
@@ -60,7 +78,7 @@ private:
     static std::string GetIniPath();
 
 public:
-    // 0 = off, 1 = angle widen (main), 2 = redirect, 3 = nudge.
+    // 0 = off, 1 = angle widen (main), 2 = redirect, 3 = nudge, 4 = aim (creation).
     int m_Mode = 0;
 
     int m_Hotkey = VK_F8;            // hold
@@ -82,14 +100,19 @@ public:
     int   m_NudgeDirectionMode = 0;  // 0 = opposite of movement input, 1 = along it, 2 = off the wall
     float m_NudgeDistance = 0.5f;    // meters
 
+    // Mode 4 (aim by creation).
+    float m_AimDistance = 2.5f;      // meters the probe point is pushed along the movement input
+
     // Hook states (each hook installs independently).
     bool m_HooksInstalled = false;
     bool m_HookAInstalled = false;
     bool m_HookCInstalled = false;
     bool m_HookBInstalled = false;
+    bool m_HookDInstalled = false;
     bool m_HookARefused = false;     // 0x140148553 patched by someone else (unexpected)
     bool m_HookCRefused = false;     // 0x1401B5890 patched by someone else (unexpected)
     bool m_HookBRefused = false;     // 0x140135230 E9-patched by ACUFixes' Parkour helpers (expected)
+    bool m_HookDRefused = false;     // 0x1401D1CF0 patched by someone else (unexpected)
 
     // Wall's outward normal (XY, normalized), cached by the Hook A cave from
     // directionDestFacingOut (+0x40) of the most recent candidate. Hook A runs
@@ -106,4 +129,6 @@ public:
     long long m_TelRedirects = 0;
     long long m_TelNudgeCalls = 0;
     long long m_TelNudgeCreated = 0;
+    long long m_TelAimCreateCalls = 0;  // every type-39 creation attempt seen at Hook D
+    long long m_TelAimRewrites = 0;     // probe points actually substituted
 };

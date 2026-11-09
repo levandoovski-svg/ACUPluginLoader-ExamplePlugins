@@ -64,8 +64,8 @@ void WidenSidehopAngle_Cave(AllRegisters* params)
         }
     }
 
-    if (plugin->m_Mode == 3)
-        return; // nudge mode: Hook A is installed for the normal cache only
+    if (plugin->m_Mode == 3 || plugin->m_Mode == 4)
+        return; // nudge/aim modes: Hook A is installed for the normal cache only
 
     plugin->m_TelLastMinCosAngleSeen = action->minCosAngle;
     action->minCosAngle = plugin->m_MinCosAngle;
@@ -162,7 +162,9 @@ AutoAssembleWrapper<SidehopAngleWidenHook>& GetAngleWidenHook()
 void WidenQuickCheckRanges_Cave(AllRegisters* params)
 {
     Sidehop360Plugin* plugin = g_Plugin;
-    if (!plugin || (plugin->m_Mode != 1 && plugin->m_Mode != 2) || !plugin->ShouldWidenAngle())
+    if (!plugin || !plugin->ShouldWidenAngle())
+        return;
+    if (plugin->m_Mode != 1 && plugin->m_Mode != 2 && plugin->m_Mode != 4)
         return;
     auto* action = reinterpret_cast<AvailableParkourAction*>(params->rcx_);
     if (!action)
@@ -285,6 +287,101 @@ AutoAssembleWrapper<SidehopNudgeHook>& GetNudgeHook()
     return s_hook;
 }
 
+// ============================================================================
+//  Hook D - Aim (mode 4): substitute the probe point inside the factory
+// ============================================================================
+
+// 0x1401D1CF0 = the CreateParkourActionForParkourPointIfFits wrapper itself.
+// It is called from 89 sites (incl. the climbFacade scan helper) and is NOT
+// owned by Freeform 2.0 (which hooks 0x140135230 / 0x140133B00), so this seam
+// is usable with Freeform loaded - unlike Hook B.
+// ABI at entry: rcx = EnumParkourAction, rdx = context, r8 = pointer to the
+// probe point (__m128), r9 = pointer to the movement vector (world XY).
+// The first 5 bytes are `48 89 6C 24 10` = `mov qword ptr [rsp+0x10], rbp`,
+// position-independent, so they can be re-executed after the callback.
+//
+// The factory is a jump table on the action type; each case allocates the
+// type's action and runs its constructor with the point. Substituting the
+// point therefore makes the VANILLA construction produce an action whose
+// destination lies along the player's input direction, and the scan appends it
+// exactly as it would the vanilla candidate. Nothing is mutated in the caller:
+// the point is copied into a thread-local, shifted, and r8 repointed at it.
+static thread_local __m128 t_AimPoint;
+
+void AimSidehopProbePoint_Cave(AllRegisters* params)
+{
+    Sidehop360Plugin* plugin = g_Plugin;
+    if (!plugin || plugin->m_Mode != 4)
+        return;
+    if (params->rcx_ != (unsigned long long)EnumParkourAction::climbFacade_fromWallDescentSidewaysToGround_alsoSidehop)
+        return;
+    plugin->m_TelAimCreateCalls++;
+    if (!plugin->ShouldWidenAngle())
+        return;
+
+    // Both pointers come from the scanner, but they are read through
+    // ReadProcessMemory so a bad/stale argument can never crash the game.
+    __m128 originalPoint;
+    SIZE_T got = 0;
+    if (!params->r8_
+        || !ReadProcessMemory(GetCurrentProcess(), (const void*)params->r8_,
+                              &originalPoint, sizeof(originalPoint), &got)
+        || got != sizeof(originalPoint))
+        return;
+
+    // Aim along the movement input (world XY). When the player is not pushing
+    // anything, fall back to the wall normal cached by Hook A.
+    float dirX = 0.0f, dirY = 0.0f;
+    if (params->r9_)
+    {
+        __m128 movementVec;
+        got = 0;
+        if (ReadProcessMemory(GetCurrentProcess(), (const void*)params->r9_,
+                              &movementVec, sizeof(movementVec), &got)
+            && got == sizeof(movementVec))
+        {
+            const float* mv = reinterpret_cast<const float*>(&movementVec);
+            dirX = mv[0];
+            dirY = mv[1];
+        }
+    }
+    float len = sqrtf(dirX * dirX + dirY * dirY);
+    if (!(len > 1e-6f))
+    {
+        if (!plugin->m_HasWallNormal)
+            return;
+        dirX = plugin->m_WallNormalX;
+        dirY = plugin->m_WallNormalY;
+        len = 1.0f;
+    }
+    dirX /= len;
+    dirY /= len;
+
+    t_AimPoint = originalPoint;
+    float* p = reinterpret_cast<float*>(&t_AimPoint);
+    p[0] += dirX * plugin->m_AimDistance;
+    p[1] += dirY * plugin->m_AimDistance;
+
+    params->r8_ = reinterpret_cast<unsigned long long>(&t_AimPoint);
+    plugin->m_TelAimRewrites++;
+}
+
+struct SidehopAimHook : AutoAssemblerCodeHolder_Base
+{
+    SidehopAimHook()
+    {
+        PresetScript_CCodeInTheMiddle(
+            0x1401D1CF0, 5,
+            AimSidehopProbePoint_Cave, RETURN_TO_RIGHT_AFTER_STOLEN_BYTES, true);
+    }
+};
+
+AutoAssembleWrapper<SidehopAimHook>& GetAimHook()
+{
+    static AutoAssembleWrapper<SidehopAimHook> s_hook;
+    return s_hook;
+}
+
 // The only reliable install-time signature for "someone else owns this site":
 // the first bytes are their jmp cave (see ForcedSidehopPlugin::ActivateHook).
 bool IsSiteTaken(uintptr_t site)
@@ -343,7 +440,7 @@ void Sidehop360Plugin::OnUpdate()
         return;
     }
 
-    // -- Hook A: modes 1-2 (overrides + redirect), mode 3 (cache-only). -----
+    // -- Hook A: modes 1-2 (overrides + redirect), modes 3-4 (cache-only). --
     if (m_Mode != 0)
     {
         if (m_HookARefused && !IsSiteTaken(0x140148553))
@@ -365,8 +462,9 @@ void Sidehop360Plugin::OnUpdate()
         m_HookAInstalled = false;
     }
 
-    // -- Hook C: modes 1-2 only. --------------------------------------------
-    if (m_Mode == 1 || m_Mode == 2)
+    // -- Hook C: modes 1-2 and 4 (the aim needs the ranges widened so the
+    //    shifted probe point can pass). ---------------------------------------
+    if (m_Mode == 1 || m_Mode == 2 || m_Mode == 4)
     {
         if (m_HookCRefused && !IsSiteTaken(0x1401B5890))
             m_HookCRefused = false;
@@ -416,7 +514,31 @@ void Sidehop360Plugin::OnUpdate()
         m_HookBInstalled = false;
     }
 
-    m_HooksInstalled = m_HookAInstalled || m_HookBInstalled || m_HookCInstalled;
+    // -- Hook D: mode 4 only. Unlike Hook B's site, this one is not owned by
+    //    Freeform 2.0 (it hooks 0x140135230 / 0x140133B00) - the factory
+    //    wrapper is free, which is why the aim mode works with Freeform loaded.
+    if (m_Mode == 4)
+    {
+        if (m_HookDRefused && !IsSiteTaken(0x1401D1CF0))
+            m_HookDRefused = false;
+        if (!m_HookDInstalled && !m_HookDRefused)
+        {
+            if (IsSiteTaken(0x1401D1CF0))
+                m_HookDRefused = true;
+            else
+            {
+                GetAimHook().Activate();
+                m_HookDInstalled = true;
+            }
+        }
+    }
+    else if (m_HookDInstalled)
+    {
+        GetAimHook().Deactivate();
+        m_HookDInstalled = false;
+    }
+
+    m_HooksInstalled = m_HookAInstalled || m_HookBInstalled || m_HookCInstalled || m_HookDInstalled;
 }
 
 // ============================================================================
@@ -460,6 +582,7 @@ void Sidehop360Plugin::LoadSettings()
         ParseFloat("HopDistance=",      m_HopDistance);
         ParseInt  ("NudgeDirection=",   m_NudgeDirectionMode);
         ParseFloat("NudgeDistance=",    m_NudgeDistance);
+        ParseFloat("AimDistance=",      m_AimDistance);
     }
 }
 
@@ -479,6 +602,7 @@ void Sidehop360Plugin::SaveSettings()
         f << "HopDistance=" << m_HopDistance << "\n";
         f << "NudgeDirection=" << m_NudgeDirectionMode << "\n";
         f << "NudgeDistance=" << m_NudgeDistance << "\n";
+        f << "AimDistance=" << m_AimDistance << "\n";
     } catch (...) {}
 }
 
@@ -527,7 +651,7 @@ void Sidehop360Plugin::OnImGuiRender()
     ImGui::Text("Sidehop 360 (ACU 1.5.0)");
     ImGui::Separator();
 
-    static const char* modes[] = { "Off", "Angle widen (main)", "Redirect", "Nudge" };
+    static const char* modes[] = { "Off", "Angle widen (main)", "Redirect", "Nudge", "Aim (creation)" };
     ImGui::SetNextItemWidth(240);
     if (ImGui::Combo("Mode##s360", &m_Mode, modes, IM_ARRAYSIZE(modes)))
         SaveSettings();
@@ -552,13 +676,16 @@ void Sidehop360Plugin::OnImGuiRender()
         };
         HookLine("Hook A - set-ranges (0x140148553)", m_HookARefused, m_HookAInstalled, m_Mode != 0,
             "REFUSED - site patched by another plugin");
-        HookLine("Hook C - quick-check ranges (0x1401B5890)", m_HookCRefused, m_HookCInstalled, m_Mode == 1 || m_Mode == 2,
+        HookLine("Hook C - quick-check ranges (0x1401B5890)", m_HookCRefused, m_HookCInstalled,
+            m_Mode == 1 || m_Mode == 2 || m_Mode == 4,
             "REFUSED - site patched by another plugin");
         HookLine("Hook B - nudge (0x140135230)", m_HookBRefused, m_HookBInstalled, m_Mode == 3,
             "REFUSED - owned by Freeform 2.0 (it hooks the same scan call site). "
             "Disable Freeform 2.0 in the loader and this installs on its own "
             "(no restart needed). Re-enabling Freeform 2.0 while the nudge is "
             "installed would break Freeform's hook.");
+        HookLine("Hook D - creation factory (0x1401D1CF0)", m_HookDRefused, m_HookDInstalled, m_Mode == 4,
+            "REFUSED - site patched by another plugin");
         ImGui::Unindent();
     }
 
@@ -580,6 +707,15 @@ void Sidehop360Plugin::OnImGuiRender()
             ImGui::Text("Redirects applied: %lld (sub-mode %d)", m_TelRedirects, m_RedirectSubMode);
         if (m_Mode == 3)
             ImGui::Text("Nudge: %lld calls, %lld sidehops created", m_TelNudgeCalls, m_TelNudgeCreated);
+        if (m_Mode == 4)
+        {
+            ImGui::Text("Sidehop creations seen: %lld", m_TelAimCreateCalls);
+            ImGui::Text("Probe points aimed: %lld", m_TelAimRewrites);
+            ImGui::Text("Aimed candidates reaching QuickCheck: %lld", m_TelQuickCheckOverrides);
+            ImGui::TextDisabled("If 'creations seen' climbs but 'aimed candidates reaching "
+                                "QuickCheck' stays 0, the shifted point was rejected while the "
+                                "action was being built - the next lever is the type-39 ctor.");
+        }
         ImGui::Unindent();
     }
 
@@ -664,6 +800,31 @@ void Sidehop360Plugin::OnImGuiRender()
                 SaveSettings();
             ImGui::TextDisabled("Creates ONE extra sidehop candidate from a point "
                                 "moved off the wall or along/against the movement input.");
+        }
+
+        if (m_Mode == 4)
+        {
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Aim distance##s360", &m_AimDistance, 0.0f, 6.0f, "%.2f m"))
+                SaveSettings();
+            ImGui::TextDisabled("Pushes each sidehop probe point along your movement input "
+                                "before the action is built, so the hop is created toward the "
+                                "direction you steer (wall normal when the stick is centred). "
+                                "0.0 m = vanilla points. Works with Freeform 2.0 loaded: this "
+                                "seam is the factory wrapper, not Freeform's scan site.");
+
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("minCosAngle##s360aim", &m_MinCosAngle, -1.0f, 1.0f, "%.3f"))
+                SaveSettings();
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Allowed height min##s360aim", &m_HeightDiffMin, -30.0f, 0.0f, "%.1f m"))
+                SaveSettings();
+            ImGui::SetNextItemWidth(240);
+            if (ImGui::SliderFloat("Allowed height max##s360aim", &m_HeightDiffMax, 0.0f, 30.0f, "%.1f m"))
+                SaveSettings();
+            ImGui::TextDisabled("Hook C still widens these ranges so the aimed point can pass "
+                                "the check (horizontal/distance to 30/40 m).");
         }
 
         ImGui::Unindent();

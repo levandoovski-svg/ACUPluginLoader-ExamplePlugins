@@ -254,3 +254,40 @@ Two lessons from the type-46 case: **one move can own several fancy vtables** (d
 contexts) — a slot swap must cover all of them or the move will still be rejected in the contexts you
 did not patch; and the tables of one move can even use **different set-ranges impls**, so the install
 check must validate per table, not per move.
+
+## 11. Creation-stage aim (the remaining lever for 360° targeting)
+
+Widen and redirect both act on candidates that already exist. The only way to choose a direction is to
+intervene where the candidate is **built**. Two facts discovered while looking for that seam:
+
+1. The `climbFacade` scan is not a plain function — it is a **tester object**
+   (`ParkourSystem_WhileOnWallSystem::climbFacade`, `+0x1F0`) with its own *fancy vtable*. ACUFixes'
+   `Request_Spindescent.cpp` swaps that tester's table between
+   `0x1439E08D0` (default) and `0x1439FA1A0` ("baseclass that has sidehop-to-swing") to add/remove
+   sidehop-related scanner behaviours. That is why the helper that actually creates the sidehop has no
+   static callers: it is dispatched through the tester's table.
+2. `CreateParkourActionForParkourPointIfFits` (`0x1401D1CF0`) is only a **wrapper**: it forwards to a
+   factory (`0x1401CC990`) that is a **jump table on the action type** (`ecx-2`, 122 cases, table at
+   `0x1401CF500`); each case allocates the type's object (0x290, 0x330, ...) and runs its constructor
+   with the probe point. The wrapper is called from **89 sites** and is **not owned by Freeform 2.0**
+   (which hooks `0x140135230` / `0x140133B00`), so it is a free seam.
+
+`Sidehop360Plugin` mode 4 "Aim (creation)" (v0.4.0) uses that wrapper: hook at `0x1401D1CF0`
+(5 stolen bytes `48 89 6C 24 10` = `mov [rsp+0x10], rbp`), and for type 39 while the hotkey is held,
+copy the probe point, shift its XY by `AimDistance` along the movement-input vector (r9), and repoint
+r8 at the copy. The vanilla factory then builds the aimed action and the scan appends it as usual.
+Nothing in the caller is mutated; both pointer reads go through `ReadProcessMemory` so a bad argument
+cannot crash the game.
+
+Telemetry is designed to localise the next failure instead of guessing:
+
+| Signal | Meaning |
+|--------|---------|
+| `Sidehop creations seen` | every type-39 call through the wrapper (hook is live) |
+| `Probe points aimed` | the substitution actually happened |
+| `Aimed candidates reaching QuickCheck` | the shifted point survived construction |
+
+If the last counter stays at 0 while the first climbs, the point is rejected **inside** the type-39
+constructor (before any range gate) — the next lever is that constructor, or the tester table swap in
+fact 1. If it climbs but the hop still does not appear where aimed, the remaining gate is the fit
+chain (`0x140149CC0`) or the sort (`0x140133B00`, owned by Freeform/ACUFixes).
