@@ -37,6 +37,10 @@ static void (__fastcall* SmallArray_POD__RemoveGeneric)(void*, int, unsigned int
 static uintptr_t g_SortAndSelectSite = 0;   // 1.5.0: 0x140133B00, 1.5.1: 0x140134940
 static uintptr_t g_FinalFilter1Site = 0;    // 1.5.0: 0x1401D4DE0, 1.5.1: 0x1401D4360
 
+// Console-only logger: DefaultLogger writes to g_LogFile, which this DLL never
+// opens (no MyLogFileLifetime), so using it here would dereference a null FILE*.
+static DEFINE_LOGGER_CONSOLE(FreeJumpLog, "[FreeJump]");
+
 
 
 namespace
@@ -1245,7 +1249,7 @@ static void ResolveVersionDependentAddresses()
             "48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 50 0F B6 84 24 B0 00 00 00");
 
     if (!SmallArray_POD__RemoveGeneric || !g_SortAndSelectSite || !g_FinalFilter1Site || !CreateParkourActionForParkourPointIfFits)
-        LOG_DEBUG(DefaultLogger, "%s", "[FreeJump] signature scan missed this ACU build; the affected features stay disabled.\n");
+        LOG_DEBUG(FreeJumpLog, "%s", "signature scan missed this ACU build; the affected features stay disabled.\n");
 }
 
 // ── Acceptance-range widening (ported from FailedWallRunPlugin) ──────

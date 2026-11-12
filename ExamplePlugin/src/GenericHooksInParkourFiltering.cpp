@@ -38,6 +38,10 @@ static uintptr_t g_CreateWrapperA = 0;   // 1.5.0: 0x1401D1CF0, 1.5.1: 0x1401D12
 static uintptr_t g_CreateWrapperB = 0;   // 1.5.0: 0x1401D1E50, 1.5.1: 0x1401D13C0
 static uintptr_t g_SortAndSelectSite = 0; // 1.5.0: 0x140133B00, 1.5.1: 0x140134940
 
+// Console-only logger: DefaultLogger writes to g_LogFile, which this DLL never
+// opens (no MyLogFileLifetime), so using it here would dereference a null FILE*.
+static DEFINE_LOGGER_CONSOLE(GphLog, "[GPH]");
+
 // Resolves every address the replacements call into. All-or-nothing: a partial
 // set would let a replacement call a null pointer the first time parkour runs.
 static bool ResolveParkourGameAddresses()
@@ -71,7 +75,7 @@ static bool ResolveParkourGameAddresses()
         && AvailableParkourAction__InitializePlayerRef && SmallArray_POD__RemoveGeneric
         && g_CreateWrapperA && g_CreateWrapperB && g_SortAndSelectSite;
     if (!ok)
-        LOG_DEBUG(DefaultLogger, "%s", "[GPH] signature scan missed this ACU build; parkour hooks stay disabled.\n");
+        LOG_DEBUG(GphLog, "%s", "signature scan missed this ACU build; parkour hooks stay disabled.\n");
     return ok;
 }
 
