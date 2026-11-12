@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "FreeJumpPlugin.h"
+#include "AcuPatternScan.h"
+#include "MyLog.h"
 #include "ACU/ACUPlayerCameraComponent.h"
 #include "ACU/Parkour_WhileOnWallSystem.h"
 #include "ACU/InputContainer.h"
@@ -29,8 +31,11 @@
 // in GenericHooksInParkourFiltering.cpp (compiled in this project). Do NOT
 // redefine it here — duplicate definitions break the link.
 
-// ACU 1.5.0 / ACUFixes-0.9.3 verified SmallArray POD-removal entry point.
-DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
+// ACU addresses that differ between builds are found by signature at activation
+// (the instructions are identical, only the addresses move).
+static void (__fastcall* SmallArray_POD__RemoveGeneric)(void*, int, unsigned int) = nullptr;
+static uintptr_t g_SortAndSelectSite = 0;   // 1.5.0: 0x140133B00, 1.5.1: 0x140134940
+static uintptr_t g_FinalFilter1Site = 0;    // 1.5.0: 0x1401D4DE0, 1.5.1: 0x1401D4360
 
 
 
@@ -931,10 +936,10 @@ namespace
     FreeJumpPlugin* g_WallToHangInstance = nullptr;
     class ParkourAction_Commonbase;
 
-    DEFINE_GAME_FUNCTION(CreateParkourActionForParkourPointIfFits, 0x1401D1CF0, char, __fastcall,
-        (EnumParkourAction a1, uint64 a2, __m128* a3, __m128* p_movementVecWorld_mb, float a5,
+    // Resolved by signature; 1.5.0 has it at 0x1401D1CF0, 1.5.1 at 0x1401D1260.
+    static char (__fastcall* CreateParkourActionForParkourPointIfFits)(EnumParkourAction a1, uint64 a2, __m128* a3, __m128* p_movementVecWorld_mb, float a5,
          int a6, char a7, uint64 a8, uint64 a9, uint64 p_currentLedge_mb,
-         ParkourAction_Commonbase** p_newAction_out, float a12, float p_epsilon_mb));
+         ParkourAction_Commonbase** p_newAction_out, float a12, float p_epsilon_mb) = nullptr;
 
     bool IsWallToHangSiteTaken(uintptr_t site)
     {
@@ -1149,8 +1154,10 @@ namespace
     {
         ParkourOverrideFallbackHook()
         {
-            DEFINE_ADDR_NAMED(finalFilter1, "ParkourOverrideFallback", 0x1401D4DE0);
-            ALLOC_NAMED(fallbackCave, "ParkourOverrideFallbackCave", 0x40, 0x1401D4DE0);
+            if (!g_FinalFilter1Site)
+                return;   // unknown build: leave the script empty, nothing is patched
+            DEFINE_ADDR_NAMED(finalFilter1, "ParkourOverrideFallback", g_FinalFilter1Site);
+            ALLOC_NAMED(fallbackCave, "ParkourOverrideFallbackCave", 0x40, g_FinalFilter1Site);
             // Direct rel32 call to the decision routine. DEFINE_ADDR takes a runtime
             // address, so this needs no intermediate pointer slot in the cave.
             DEFINE_ADDR_NAMED(decideFn, "ParkourOverrideFallbackDecideFn",
@@ -1184,7 +1191,9 @@ namespace
 
     bool IsParkourOverrideFallbackSitePatched()
     {
-        const uint8_t* site = reinterpret_cast<const uint8_t*>(0x1401D4DE0);
+        if (!g_FinalFilter1Site)
+            return true;   // site unknown for this build: never patch blindly
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(g_FinalFilter1Site);
         return !(site[0] == 0x48 && site[1] == 0x8B && site[2] == 0x41 && site[3] == 0x08
             && site[4] == 0x4C && site[5] == 0x8B && site[6] == 0x90
             && site[7] == 0xD0 && site[8] == 0x0E && site[9] == 0x00 && site[10] == 0x00
@@ -1210,6 +1219,33 @@ namespace
         return !(site[0] == 0x48 && site[1] == 0x8B && site[2] == 0x43 && site[3] == 0x58
             && site[4] == 0x48 && site[5] == 0x89 && site[6] == 0x43 && site[7] == 0x50);
     }
+}
+
+// ── Version-independent addresses ────────────────────────────────────
+// The instructions at these sites are identical in ACU 1.5.0 and 1.5.1 (only
+// their addresses move), so they are located by signature once, before any
+// hook is installed. A miss disables just the feature that needs that site.
+static void ResolveVersionDependentAddresses()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    if (!SmallArray_POD__RemoveGeneric)
+        SmallArray_POD__RemoveGeneric = (decltype(SmallArray_POD__RemoveGeneric))AcuScan::Find(
+            "48 89 5C 24 08 57 48 83 EC 20 0F B7 59 0A 8D 42 01 45 8B D8 44 8B D2");
+    if (!g_SortAndSelectSite)
+        g_SortAndSelectSite = AcuScan::Find(
+            "48 8B C4 48 89 58 18 48 89 68 20 48 89 50 10 56 57 41 54");
+    if (!g_FinalFilter1Site)
+        g_FinalFilter1Site = AcuScan::Find(
+            "48 8B 41 08 4C 8B 90 D0 0E 00 00 49 FF E2");
+    if (!CreateParkourActionForParkourPointIfFits)
+        CreateParkourActionForParkourPointIfFits = (decltype(CreateParkourActionForParkourPointIfFits))AcuScan::Find(
+            "48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 50 0F B6 84 24 B0 00 00 00");
+
+    if (!SmallArray_POD__RemoveGeneric || !g_SortAndSelectSite || !g_FinalFilter1Site || !CreateParkourActionForParkourPointIfFits)
+        LOG_DEBUG(DefaultLogger, "%s", "[FreeJump] signature scan missed this ACU build; the affected features stay disabled.\n");
 }
 
 // ── Acceptance-range widening (ported from FailedWallRunPlugin) ──────
@@ -1565,6 +1601,7 @@ static void Rotate2D(float& x, float& y, float angle)
 
 void FreeJumpPlugin::OnBeforeActivate()
 {
+    ResolveVersionDependentAddresses();
     LoadSettings();
 
     m_Callbacks.ChooseBeforeFiltering_fnp = [](void* userData, SmallArray<AvailableParkourAction*>& actions) -> AvailableParkourAction*
@@ -1668,6 +1705,13 @@ void FreeJumpPlugin::ApplyWallToHang(bool enable)
 {
     if (enable)
     {
+        if (!CreateParkourActionForParkourPointIfFits)
+        {
+            // Address not found on this build: leave the feature off instead of
+            // installing hooks that would call a null pointer.
+            m_WallToHangHooksActive = false;
+            return;
+        }
         g_WallToHangInstance = this;
         // All-or-nothing: a partial install (e.g. creation hooks without the
         // vtable swaps) would create candidates the game then discards, which
@@ -1900,7 +1944,9 @@ bool FreeJumpPlugin::IsSortAndSelectSiteAlreadyPatched() const
     // at this exact address. A second replacement would restore the other
     // plugin's bytes when either DLL unloads, leaving a dangling or vanilla
     // function under an active hook.
-    constexpr uintptr_t kSortAndSelectSite = 0x140133B00;
+    if (!g_SortAndSelectSite)
+        return true;   // address unknown for this build: refuse rather than patch blindly
+    const uintptr_t kSortAndSelectSite = g_SortAndSelectSite;
     const uint16_t firstBytes = *reinterpret_cast<const uint16_t*>(kSortAndSelectSite);
     return (firstBytes & 0x00FF) == 0x00E9  // near JMP rel32
         || firstBytes == 0x25FF              // JMP qword ptr [RIP+disp32]
@@ -2585,7 +2631,7 @@ AvailableParkourAction* FreeJumpPlugin::ChooseBeforeFiltering(SmallArray<Availab
         }
 
         // Remove actions whose type is not in the allowed set
-        if (shouldRemoveOthers)
+        if (shouldRemoveOthers && SmallArray_POD__RemoveGeneric)
         {
             for (int i = actions.size - 1; i >= 0; --i)
             {

@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "ParkourDebugging/GenericHooksInParkourFiltering.h"
+#include "AcuPatternScan.h"
+#include "MyLog.h"
 #include "ACU/basic_types.h"
 #include "ACU/Memory/ACUAllocs.h"
 #include "ParkourDebugging/AvailableParkourAction.h"
@@ -20,27 +22,58 @@ EnumParkourAction AvailableParkourAction::GetEnumParkourAction()
     return GET_AND_CAST_FANCY_FUNC(*this, ParkourActionKnownFancyVFuncs::GetEnumParkourAction)(this);
 }
 
-// All game addresses below are the ACUFixes-0.9.3 values, i.e. the set that
-// matches the user's ACU 1.5.0 Steam build.
-//
-// Evidence (2026-10-28): a constant scan of the two plugins that demonstrably
-// work on this install (ACUFixes.dll and ACU_ParkourPatches.dll in
-// ACUFixes\plugins) finds exactly this address set in both, and finds NONE of
-// the ACUFixes-1.5.1 addresses (0x1401D4360 / 0x1401D2580 / 0x1401CBF00 /
-// 0x1401D1530 / 0x140159940 / 0x142726000 / 0x14013493E / 0x140134940).
-// FailedWallRunPlugin.cpp additionally dump-verifies 0x1401D1CF0 and
-// 0x1401CC990 against the runtime dump (MODLOG/scripts/ACU_dumped_pe.exe).
-//
-// The previous version of this file used the 1.5.1 addresses and installed a
-// 7-stolen-byte mid-function hook at 0x14013493E, which lands on unrelated
-// code in the 1.5.0 binary: any parkour sort&select execution after enabling
-// the plugin instantly crashed the game (see PROGRESS.md).
-DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter1, 0x1401D4DE0, bool, __fastcall, (AvailableParkourAction*, __m128*, uint64, Entity*));
-DEFINE_GAME_FUNCTION(AvailableParkourAction__FinalFilter2, 0x1401D3000, bool, __fastcall, (AvailableParkourAction*, Entity*, __int64));
-DEFINE_GAME_FUNCTION(ConstructParkourAction_A, 0x1401CC990, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, AvailableParkourAction*));
-DEFINE_GAME_FUNCTION(ConstructParkourAction_B, 0x1401D1FC0, AvailableParkourAction*, __fastcall, (EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, __int64, Entity*, AvailableParkourAction*));
-DEFINE_GAME_FUNCTION(AvailableParkourAction__InitializePlayerRef, 0x14015A570, void, __fastcall, (PlayerRefInParkourAction*, Entity*));
-DEFINE_GAME_FUNCTION(SmallArray_POD__RemoveGeneric, 0x142725F00, void, __fastcall, (void*, int, unsigned int));
+// These game addresses differ between ACU builds (1.5.0: 0x1401D4DE0 and
+// friends, 1.5.1: 0x1401D4360 and friends), but the instructions at them are
+// identical, so each site is found by byte signature at startup. A signature
+// that misses this build leaves every parkour hook uninstalled and logged,
+// instead of calling an address that moved.
+static bool (__fastcall* AvailableParkourAction__FinalFilter1)(AvailableParkourAction*, __m128*, uint64, Entity*) = nullptr;
+static bool (__fastcall* AvailableParkourAction__FinalFilter2)(AvailableParkourAction*, Entity*, __int64) = nullptr;
+static AvailableParkourAction* (__fastcall* ConstructParkourAction_A)(EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, AvailableParkourAction*) = nullptr;
+static AvailableParkourAction* (__fastcall* ConstructParkourAction_B)(EnumParkourAction, __m128*, __m128*, __m128*, int, char, __int64, __int64, Entity*, AvailableParkourAction*) = nullptr;
+static void (__fastcall* AvailableParkourAction__InitializePlayerRef)(PlayerRefInParkourAction*, Entity*) = nullptr;
+static void (__fastcall* SmallArray_POD__RemoveGeneric)(void*, int, unsigned int) = nullptr;
+
+static uintptr_t g_CreateWrapperA = 0;   // 1.5.0: 0x1401D1CF0, 1.5.1: 0x1401D1260
+static uintptr_t g_CreateWrapperB = 0;   // 1.5.0: 0x1401D1E50, 1.5.1: 0x1401D13C0
+static uintptr_t g_SortAndSelectSite = 0; // 1.5.0: 0x140133B00, 1.5.1: 0x140134940
+
+// Resolves every address the replacements call into. All-or-nothing: a partial
+// set would let a replacement call a null pointer the first time parkour runs.
+static bool ResolveParkourGameAddresses()
+{
+    static bool resolved = false;
+    static bool ok = false;
+    if (resolved) return ok;
+    resolved = true;
+
+    AvailableParkourAction__FinalFilter1 = (decltype(AvailableParkourAction__FinalFilter1))AcuScan::Find(
+        "48 8B 41 08 4C 8B 90 D0 0E 00 00 49 FF E2");
+    AvailableParkourAction__FinalFilter2 = (decltype(AvailableParkourAction__FinalFilter2))AcuScan::Find(
+        "48 8B 41 08 4C 8B 88 D0 09 00 00 49 FF E1");
+    ConstructParkourAction_A = (decltype(ConstructParkourAction_A))AcuScan::Find(
+        "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 4C 89 74 24 20 55 48 8B EC 48 83 EC 40 83 C1 FE");
+    ConstructParkourAction_B = (decltype(ConstructParkourAction_B))AcuScan::Find(
+        "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 50 83 C1 CD");
+    AvailableParkourAction__InitializePlayerRef = (decltype(AvailableParkourAction__InitializePlayerRef))AcuScan::Find(
+        "48 89 5C 24 18 48 89 6C 24 20 56 57 41 56 48 83 EC 20 48 8B EA 48 8B F9");
+    SmallArray_POD__RemoveGeneric = (decltype(SmallArray_POD__RemoveGeneric))AcuScan::Find(
+        "48 89 5C 24 08 57 48 83 EC 20 0F B7 59 0A 8D 42 01 45 8B D8 44 8B D2");
+    g_CreateWrapperA = AcuScan::Find(
+        "48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 50 0F B6 84 24 B0 00 00 00");
+    g_CreateWrapperB = AcuScan::Find(
+        "4C 8B DC 49 89 5B 08 49 89 6B 10 49 89 73 18 57 41 54 41 55 41 56 41 57 48 83 EC 50 48 8B 84 24 B8 00 00 00");
+    g_SortAndSelectSite = AcuScan::Find(
+        "48 8B C4 48 89 58 18 48 89 68 20 48 89 50 10 56 57 41 54");
+
+    ok = AvailableParkourAction__FinalFilter1 && AvailableParkourAction__FinalFilter2
+        && ConstructParkourAction_A && ConstructParkourAction_B
+        && AvailableParkourAction__InitializePlayerRef && SmallArray_POD__RemoveGeneric
+        && g_CreateWrapperA && g_CreateWrapperB && g_SortAndSelectSite;
+    if (!ok)
+        LOG_DEBUG(DefaultLogger, "%s", "[GPH] signature scan missed this ACU build; parkour hooks stay disabled.\n");
+    return ok;
+}
 
 class Entity;
 
@@ -223,7 +256,7 @@ int SortAndSelectBestMatchingAction_FullReplacement_inner(
             float fitness = GET_AND_CAST_FANCY_FUNC(*action, ParkourActionKnownFancyVFuncs::GetFitness)(action);
             bool isDiscarded_becauseFitnessWeightTooLow = fabsf(fitness) <= 0.0000099999997;
             currentCycle->LogActionBeforeFiltering(*action, fitness, isDiscarded_becauseFitnessWeightTooLow);
-            if (isDiscarded_becauseFitnessWeightTooLow)
+            if (isDiscarded_becauseFitnessWeightTooLow && SmallArray_POD__RemoveGeneric)
             {
                 SmallArray_POD__RemoveGeneric(&p_parkourSensorsResults, i--, 8u);
             }
@@ -322,27 +355,27 @@ int SortAndSelectBestMatchingAction_FullReplacement(
 
 GPH_Creation::GPH_Creation()
 {
-    // RE-ENABLED for FailedWallRunPlugin. Both addresses are the
-    // ACUFixes-0.9.3 / 1.5.0-verified set, confirmed present in the two
-    // reference DLLs that demonstrably work on this install (ACUFixes.dll and
-    // ACU_ParkourPatches.dll — see PROGRESS.md session 6 evidence), and
-    // FailedWallRunPlugin.cpp independently dump-verifies 0x1401D1CF0 against
-    // the runtime dump. The creation-stage replacement is what invokes
-    // OverrideCreationDiscard_fnp (keep-alive + 53->52 conversion).
+    // RE-ENABLED for FailedWallRunPlugin. The two creation wrappers are
+    // function-start replacements found by signature (see
+    // ResolveParkourGameAddresses); if this build's bytes are unknown nothing
+    // is installed, so the feature stays inert instead of crashing.
     // NOTE: like the sort&select start, these are function-start replacements;
     // do not let two plugins replace the same address simultaneously.
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D1CF0, (void*)&CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement);
-    PresetScript_ReplaceFunctionAtItsStart(0x1401D1E50, (void*)&CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement);
+    if (!ResolveParkourGameAddresses())
+        return;
+    PresetScript_ReplaceFunctionAtItsStart(g_CreateWrapperA, (void*)&CreateParkourActionAndPerformInitialTestIfFits_A_FullReplacement);
+    PresetScript_ReplaceFunctionAtItsStart(g_CreateWrapperB, (void*)&CreateParkourActionAndPerformInitialTestIfFits_B_FullReplacement);
 }
 
 GPH_SortAndSelect::GPH_SortAndSelect()
 {
-    // Function-start replacement of SortAndSelectBestMatchingAction.
-    // 0x140133B00 is the ACUFixes-0.9.3 / 1.5.0 value, confirmed by the
-    // constant scan of ACUFixes.dll and ACU_ParkourPatches.dll (both working
-    // on this install hook this exact address). A function-start replacement
-    // needs no stolen-byte relocation, unlike the previous mid-function hook.
-    PresetScript_ReplaceFunctionAtItsStart(0x140133B00, (void*)&SortAndSelectBestMatchingAction_FullReplacement);
+    // Function-start replacement of SortAndSelectBestMatchingAction, found by
+    // signature: 1.5.0 has it at 0x140133B00, 1.5.1 at 0x140134940. A
+    // function-start replacement needs no stolen-byte relocation, unlike the
+    // previous mid-function hook that split an instruction and crashed.
+    if (!ResolveParkourGameAddresses())
+        return;
+    PresetScript_ReplaceFunctionAtItsStart(g_SortAndSelectSite, (void*)&SortAndSelectBestMatchingAction_FullReplacement);
 }
 
 // ── SharedHookActivator ──────────────────────────────────────────────────────
