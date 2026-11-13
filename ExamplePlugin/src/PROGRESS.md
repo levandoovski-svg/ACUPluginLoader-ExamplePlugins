@@ -564,3 +564,18 @@ Checks primaryCallbackReceivers for any of 12 combat Enter addresses: Combat (0x
 | Validation | `clang++ -fsyntax-only -std=c++20`: 0 errors both sources; discovery logic already validated against the dump in session 31 (125 tables, one per enum value). |
 | Build/runtime status | CI `build-multiwiden.yml` (MSVC v142). NOT runtime-tested. |
 | Manual acceptance | 1) Tick two moves that are easy to trigger; confirm `Swapped slots` equals their table count (46 has 3). 2) With the hotkey released, `Checks through widened slots` must increment when those moves are evaluated (proves the shared thunk resolves the right original). 3) Hold F11: overrides increment and both moves should widen; unticked moves must be unchanged. 4) Untick one live: its slots return to vanilla immediately. 5) `table lookups failed` must stay 0. |
+
+## Session 33 - InterruptGrabPlugin_150: hold-to-drop for ACU 1.5.0 (2026-11-13)
+
+**User: "create a version of the interrupt grab mod inside the repo as its own plugin, then commit and push so GitHub Actions builds it."**
+
+| Item | Detail |
+|------|--------|
+| Design | Standalone port of the Puppet Native ASI (`D:\puppet-native-main\ac unity tab\PuppetNativeUnity.cpp`). No minhook, no dependency beyond the repo's existing plugin template. New folder `InterruptGrabPlugin_150/` + dedicated workflow `build-interruptgrab.yml`. |
+| Mechanism | Same as the ASI: a cave forces `r14d = 3` (`EPM_ParkourDown`) at the patch point `0x141A00157` (`movzx ebx,[rbp+0x350]`, bytes `0F B6 9D 50 03 00 00`, dump-verified 2026-11-13 against `MODLOG/scripts/ACU_dumped.bin`). The cave replays the stolen 7 bytes and jumps back to `0x141A0015E` (`4C 8D 4C 24 50`, verified). r14d is only consumed as the mode after the patch point (4 scanners at `0x141A3C050/0x141A3CEA0/0x141A3C4E0/0x141A3D0A0` + `0x141A944A0`), so forcing it there is coherent. ACU has no ASLR, fixed base 0x140000000. |
+| Install model | Cave built + signature-checked once in `InitStage_WhenCodePatchesAreSafeToApply`; the 7-byte jump at the site is installed only while the hotkey is held and reverted on key-up, in `EveryFrameEvenWhenMenuIsClosed`. Unsupported builds (site mismatch) refuse to patch and report it in the menu instead of corrupting memory. |
+| Inputs | Keyboard hotkey, rebindable, default `C` (`VK_C`), same capture semantics as the widen plugins. One gamepad button, default `B`, combo list (A/B/X/Y/LB/RB/LS/RS/Start/Back/D-Pad/LT/RT/NONE) persisted to the ini. LT/RT use trigger > 30. No key combos (the ASI had them; deliberately dropped). All 4 XInput slots polled. |
+| UI / INI | Panel: enable checkbox, keyboard rebind button, gamepad button combo, live HELD/installed indicators, activation counter, unsupported-build verdict. INI `Documents\Assassin's Creed Unity\InterruptGrab.ini` (`Enabled=`, `Hotkey=0x..`, `Pad=B`). |
+| Known tear risk | Same trade as the ASI: the 7-byte jump is written non-atomically, so a thread already inside the 7 bytes could see a torn jump. Patches flip only on key transitions. Known limit, upgrade path is a hook if it ever crashes. |
+| Validation | `clang++ -fsyntax-only -std=c++20`: 0 errors on all three TUs (LLVM-MinGW). Bytes at `0x141A00157` and `0x141A0015E` re-verified against `ACU_dumped.bin`. CI: `build-interruptgrab.yml` (MSVC v142, same shape as `build-multiwiden.yml`). NOT runtime-tested. |
+| Manual acceptance | 1) Menu shows `Ready. Hold the hotkey...` and the enable checkbox stays on. 2) Grab a ledge/hang: holding `C` must drop Arno; releasing must not. 3) Counter `Times activated` increments per press. 4) Force a wrong-signature build: panel shows `UNSUPPORTED BUILD` and nothing is patched. |
